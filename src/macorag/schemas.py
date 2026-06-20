@@ -11,6 +11,18 @@ def _loads_json(value: str | dict[str, Any]) -> dict[str, Any]:
     return value
 
 
+def _parse_bool(value: Any, *, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes"}:
+            return True
+        if normalized in {"false", "0", "no"}:
+            return False
+    raise ValueError(f"{field_name} must be a strict boolean value")
+
+
 @dataclass
 class SupportingFact:
     doc_id: str | None
@@ -96,8 +108,14 @@ class Example:
                 for item in data.get("evidence_chain", [])
             ],
             context_doc_ids=list(data.get("context_doc_ids", [])),
-            usable_for_sft=bool(data.get("usable_for_sft", False)),
-            usable_for_retrieval_eval=bool(data.get("usable_for_retrieval_eval", False)),
+            usable_for_sft=_parse_bool(
+                data.get("usable_for_sft", False),
+                field_name="usable_for_sft",
+            ),
+            usable_for_retrieval_eval=_parse_bool(
+                data.get("usable_for_retrieval_eval", False),
+                field_name="usable_for_retrieval_eval",
+            ),
             quality_flags=list(data.get("quality_flags", [])),
             metadata=dict(data.get("metadata", {})),
         )

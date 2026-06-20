@@ -1,3 +1,7 @@
+import json
+
+import pytest
+
 from macorag.schemas import CorpusDoc, Example, SupportingFact
 
 
@@ -47,3 +51,35 @@ def test_corpus_doc_chunk_text_includes_title():
     )
 
     assert doc.to_chunk_text() == "Document Title\nDocument body."
+
+
+def test_example_from_json_parses_boolean_strings_strictly():
+    payload = {
+        "qid": "q1",
+        "dataset": "2wiki",
+        "split": "train",
+        "question": "Who founded the company?",
+        "answer": "Alice",
+        "usable_for_sft": "false",
+        "usable_for_retrieval_eval": "0",
+    }
+
+    loaded = Example.from_json(json.dumps(payload))
+
+    assert loaded.usable_for_sft is False
+    assert loaded.usable_for_retrieval_eval is False
+
+
+def test_example_from_json_rejects_unknown_boolean_strings():
+    payload = {
+        "qid": "q1",
+        "dataset": "2wiki",
+        "split": "train",
+        "question": "Who founded the company?",
+        "answer": "Alice",
+        "usable_for_sft": "maybe",
+        "usable_for_retrieval_eval": False,
+    }
+
+    with pytest.raises(ValueError):
+        Example.from_json(payload)
