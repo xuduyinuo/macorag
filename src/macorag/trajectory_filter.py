@@ -95,18 +95,7 @@ def _valid_retrieval_observation(observation: Any) -> bool:
     if not isinstance(observation, dict) or not observation:
         return False
 
-    if "retrieved_chunks" in observation:
-        return _has_retrieved_chunks(observation["retrieved_chunks"])
-
-    for legacy_key in ("chunks", "results"):
-        if legacy_key in observation and _has_retrieved_chunks(observation[legacy_key]):
-            return True
-
-    for legacy_key in ("chunk_ids", "retrieved_chunk_ids"):
-        if legacy_key in observation and _has_retrieved_chunks(observation[legacy_key]):
-            return True
-
-    return False
+    return _has_retrieved_chunks(observation.get("retrieved_chunks"))
 
 
 def _evaluate_retrieval_steps(steps: list[dict[str, Any]]) -> tuple[int, list[str]]:
@@ -147,8 +136,7 @@ def _collect_retrieved_chunks(steps: list[dict[str, Any]]) -> set[str]:
         if not isinstance(observation, dict):
             continue
 
-        for key in ("retrieved_chunks", "chunks", "results", "chunk_ids", "retrieved_chunk_ids"):
-            retrieved_chunks.update(_chunk_ids_from_values(observation.get(key)))
+        retrieved_chunks.update(_chunk_ids_from_values(observation.get("retrieved_chunks")))
     return retrieved_chunks
 
 
