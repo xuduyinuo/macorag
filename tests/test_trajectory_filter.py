@@ -1,3 +1,5 @@
+import pytest
+
 from pytest import approx
 
 from macorag.trajectory_filter import evaluate_trajectory
@@ -173,6 +175,36 @@ def test_evaluate_trajectory_rejects_legacy_retrieval_results_observation():
 def test_evaluate_trajectory_rejects_retrieved_chunk_id_alias():
     trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
     trajectory["trajectory"][0]["observation"] = {"retrieved_chunks": [{"id": "c1"}]}
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        trajectory,
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1"}},
+    )
+
+    assert result.accepted is False
+    assert "invalid_retrieval_observation" in result.reasons
+    assert result.retrieval_count == 0
+
+
+@pytest.mark.parametrize(
+    "retrieved_chunks",
+    [
+        [{"chunk_id": "c1"}, "c2"],
+        [{"chunk_id": "c1"}, {}],
+        [{"chunk_id": "c1"}, {"id": "c2"}],
+    ],
+)
+def test_evaluate_trajectory_rejects_any_invalid_retrieved_chunk_item(
+    retrieved_chunks,
+):
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    trajectory["trajectory"][0]["observation"] = {
+        "retrieved_chunks": retrieved_chunks,
+    }
     qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
     answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
 

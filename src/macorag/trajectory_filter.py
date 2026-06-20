@@ -81,7 +81,11 @@ def _chunk_ids_from_values(values: Any) -> set[str]:
 
 
 def _has_retrieved_chunks(value: Any) -> bool:
-    return isinstance(value, list) and any(_has_chunk_identifier(item) for item in value)
+    return (
+        isinstance(value, list)
+        and len(value) > 0
+        and all(_has_chunk_identifier(item) for item in value)
+    )
 
 
 def _valid_retrieval_observation(observation: Any) -> bool:
@@ -126,7 +130,7 @@ def _collect_retrieved_chunks(steps: list[dict[str, Any]]) -> set[str]:
             continue
 
         observation = step.get("observation")
-        if not isinstance(observation, dict):
+        if not _valid_retrieval_observation(observation):
             continue
 
         retrieved_chunks.update(_chunk_ids_from_values(observation.get("retrieved_chunks")))
