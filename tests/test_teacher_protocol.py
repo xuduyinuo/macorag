@@ -41,3 +41,72 @@ def test_parse_teacher_message_requires_closed_update_evidence_tag():
 
     with pytest.raises(ProtocolError):
         parse_teacher_message(message)
+
+
+def test_parse_teacher_message_allows_natural_language_outside_tags():
+    message = """
+I will solve this by planning, retrieving, updating evidence, and answering.
+<plan>{"step": "plan"}</plan>
+The retrieval request follows.
+<retrieval>{"query": "Example Co founder"}</retrieval>
+Evidence update:
+<update-evidence>{"doc_id": "d1"}</update-evidence>
+Final response:
+<answer>{"text": "Alice"}</answer>
+"""
+
+    parsed = parse_teacher_message(message)
+
+    assert parsed["plan"] == {"step": "plan"}
+    assert parsed["retrieval"] == {"query": "Example Co founder"}
+    assert parsed["update-evidence"] == {"doc_id": "d1"}
+    assert parsed["answer"] == {"text": "Alice"}
+
+
+def test_parse_teacher_message_rejects_missing_required_tag():
+    message = """
+<plan>{}</plan>
+<retrieval>{}</retrieval>
+<answer>{}</answer>
+"""
+
+    with pytest.raises(ProtocolError):
+        parse_teacher_message(message)
+
+
+def test_parse_teacher_message_rejects_duplicate_tag():
+    message = """
+<plan>{"first": true}</plan>
+<plan>{"second": true}</plan>
+<retrieval>{}</retrieval>
+<update-evidence>{}</update-evidence>
+<answer>{}</answer>
+"""
+
+    with pytest.raises(ProtocolError):
+        parse_teacher_message(message)
+
+
+@pytest.mark.parametrize("payload", ['["not", "object"]', '"not object"'])
+def test_parse_teacher_message_rejects_non_object_payload(payload):
+    message = f"""
+<plan>{payload}</plan>
+<retrieval>{{}}</retrieval>
+<update-evidence>{{}}</update-evidence>
+<answer>{{}}</answer>
+"""
+
+    with pytest.raises(ProtocolError):
+        parse_teacher_message(message)
+
+
+def test_parse_teacher_message_rejects_invalid_json():
+    message = """
+<plan>{"missing": "brace"</plan>
+<retrieval>{}</retrieval>
+<update-evidence>{}</update-evidence>
+<answer>{}</answer>
+"""
+
+    with pytest.raises(ProtocolError):
+        parse_teacher_message(message)

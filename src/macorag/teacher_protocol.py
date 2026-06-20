@@ -14,11 +14,13 @@ TAG_NAMES = ("plan", "retrieval", "update-evidence", "answer")
 
 def _extract_tag(text: str, tag: str) -> dict[str, Any]:
     pattern = rf"<{re.escape(tag)}>(.*?)</{re.escape(tag)}>"
-    match = re.search(pattern, text, flags=re.DOTALL)
-    if match is None:
+    matches = re.findall(pattern, text, flags=re.DOTALL)
+    if not matches:
         raise ProtocolError(f"missing closed <{tag}> tag")
+    if len(matches) > 1:
+        raise ProtocolError(f"duplicate <{tag}> tags")
 
-    raw_payload = match.group(1).strip()
+    raw_payload = matches[0].strip()
     try:
         payload = json.loads(raw_payload)
     except json.JSONDecodeError as exc:
