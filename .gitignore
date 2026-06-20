@@ -1,0 +1,8 @@
+.codex/
+.agents/
+data/
+linearrag_dataset/
+trajectories/
+.pytest_cache/
+__pycache__/
+*.pyc
