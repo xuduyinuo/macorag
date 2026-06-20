@@ -1,7 +1,86 @@
+from pytest import approx
+
 from macorag.trajectory_filter import evaluate_trajectory
 
 
-def test_evaluate_trajectory_accepts_grounded_answer():
+def _trajectory(
+    *,
+    accepted_chunk_ids: list[str],
+    supporting_chunk_ids: list[str],
+    retrieval_budget: int | None = None,
+) -> dict:
+    value = {
+        "qid": "q1",
+        "dataset": "hotpotqa",
+        "trajectory": [
+            {
+                "action": {
+                    "type": "retrieval",
+                    "query": "Paris",
+                },
+                "observation": {
+                    "chunk_ids": accepted_chunk_ids,
+                },
+            },
+            {
+                "action": {
+                    "type": "update_evidence",
+                    "accepted_chunk_ids": accepted_chunk_ids,
+                }
+            },
+            {
+                "action": {
+                    "type": "final_answer",
+                    "answer": "Paris",
+                    "supporting_chunk_ids": supporting_chunk_ids,
+                }
+            },
+        ],
+    }
+    if retrieval_budget is not None:
+        value["metadata"] = {"retrieval_budget": retrieval_budget}
+    return value
+
+
+def test_evaluate_trajectory_accepts_grounded_answer_with_metrics():
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(
+            accepted_chunk_ids=["c1"],
+            supporting_chunk_ids=["c1"],
+            retrieval_budget=2,
+        ),
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1"}},
+    )
+
+    assert result.accepted is True
+    assert result.reasons == []
+    assert result.evidence_coverage == approx(1.0)
+    assert result.retrieval_efficiency == approx(1.0)
+    assert result.gold_evidence_count == 1
+    assert result.covered_gold_evidence_count == 1
+    assert result.retrieval_count == 1
+
+
+def test_evaluate_trajectory_rejects_ungrounded_answer():
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c2"], supporting_chunk_ids=["c2"]),
+        qrels_by_qid,
+        answers_by_qid,
+    )
+
+    assert result.accepted is False
+    assert "no_gold_evidence_overlap" in result.reasons
+
+
+def test_evaluate_trajectory_rejects_missing_retrieval():
     trajectory = {
         "qid": "q1",
         "dataset": "hotpotqa",
@@ -26,34 +105,77 @@ def test_evaluate_trajectory_accepts_grounded_answer():
 
     result = evaluate_trajectory(trajectory, qrels_by_qid, answers_by_qid)
 
-    assert result.accepted is True
-    assert result.reasons == []
+    assert result.accepted is False
+    assert "missing_retrieval" in result.reasons
 
 
-def test_evaluate_trajectory_rejects_ungrounded_answer():
-    trajectory = {
-        "qid": "q1",
-        "dataset": "hotpotqa",
-        "trajectory": [
-            {
-                "action": {
-                    "type": "update_evidence",
-                    "accepted_chunk_ids": ["c2"],
-                }
-            },
-            {
-                "action": {
-                    "type": "final_answer",
-                    "answer": "Paris",
-                    "supporting_chunk_ids": ["c2"],
-                }
-            },
-        ],
-    }
+def test_evaluate_trajectory_rejects_retrieval_budget_exceeded():
+    trajectory = _trajectory(
+        accepted_chunk_ids=["c1"],
+        supporting_chunk_ids=["c1"],
+        retrieval_budget=0,
+    )
     qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
     answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
 
     result = evaluate_trajectory(trajectory, qrels_by_qid, answers_by_qid)
 
     assert result.accepted is False
-    assert "no_gold_evidence_overlap" in result.reasons
+    assert "retrieval_budget_exceeded" in result.reasons
+
+
+def test_evaluate_trajectory_rejects_supporting_chunks_that_are_not_gold():
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c1", "c2"], supporting_chunk_ids=["c2"]),
+        qrels_by_qid,
+        answers_by_qid,
+    )
+
+    assert result.accepted is False
+    assert "supporting_chunks_not_gold" in result.reasons
+
+
+def test_evaluate_trajectory_rejects_missing_chunk_meta_mapping():
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"]),
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={},
+    )
+
+    assert result.accepted is False
+    assert "missing_chunk_meta" in result.reasons
+
+
+def test_evaluate_trajectory_accepts_gold_doc_and_title_matches_from_chunk_meta():
+    qrels_by_qid = {
+        "q1": {
+            "gold_doc_ids": ["doc-paris"],
+            "gold_titles": ["Paris"],
+            "gold_chunk_ids": [],
+        }
+    }
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"]),
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={
+            "c1": {
+                "chunk_id": "c1",
+                "doc_id": "doc-paris",
+                "title": "Paris",
+            }
+        },
+    )
+
+    assert result.accepted is True
+    assert result.reasons == []
+    assert result.evidence_coverage == approx(1.0)
