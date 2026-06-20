@@ -49,18 +49,71 @@ def _find_final_answer(steps: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
-def _count_retrieval_steps(steps: list[dict[str, Any]]) -> int:
+def _is_positive_int(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return int(value) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _has_chunk_identifier(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        chunk_id = value.get("chunk_id", value.get("id"))
+        return chunk_id is not None and str(chunk_id).strip() != ""
+    return False
+
+
+def _has_retrieved_chunks(value: Any) -> bool:
+    return isinstance(value, list) and any(_has_chunk_identifier(item) for item in value)
+
+
+def _valid_retrieval_observation(observation: Any) -> bool:
+    if not isinstance(observation, dict) or not observation:
+        return False
+
+    if "retrieved_chunks" in observation:
+        return _has_retrieved_chunks(observation["retrieved_chunks"])
+
+    for legacy_key in ("chunks", "results"):
+        if legacy_key in observation and _has_retrieved_chunks(observation[legacy_key]):
+            return True
+
+    for legacy_key in ("chunk_ids", "retrieved_chunk_ids"):
+        if legacy_key in observation and _has_retrieved_chunks(observation[legacy_key]):
+            return True
+
+    return False
+
+
+def _evaluate_retrieval_steps(steps: list[dict[str, Any]]) -> tuple[int, list[str]]:
     retrieval_count = 0
+    reasons: list[str] = []
     for step in steps:
-        action_type = step.get("action", {}).get("type")
-        observation = step.get("observation")
-        has_retrieval_observation = isinstance(observation, dict) and any(
-            key in observation
-            for key in ("chunk_ids", "retrieved_chunk_ids", "results", "chunks")
+        action = step.get("action", {})
+        action_type = action.get("type")
+        if action_type not in {"retrieval", "retrieve"}:
+            continue
+
+        valid_action = (
+            bool(str(action.get("query", "")).strip())
+            and "top_k" in action
+            and _is_positive_int(action.get("top_k"))
         )
-        if action_type in {"retrieval", "retrieve"} or has_retrieval_observation:
+        if not valid_action and "invalid_retrieval_action" not in reasons:
+            reasons.append("invalid_retrieval_action")
+
+        observation = step.get("observation")
+        valid_observation = _valid_retrieval_observation(observation)
+        if not valid_observation and "invalid_retrieval_observation" not in reasons:
+            reasons.append("invalid_retrieval_observation")
+
+        if valid_action and valid_observation:
             retrieval_count += 1
-    return retrieval_count
+    return retrieval_count, reasons
 
 
 def _get_retrieval_budget(
@@ -140,7 +193,8 @@ def evaluate_trajectory(
     if not steps:
         reasons.append("empty_trajectory")
 
-    retrieval_count = _count_retrieval_steps(steps)
+    retrieval_count, retrieval_reasons = _evaluate_retrieval_steps(steps)
+    reasons.extend(retrieval_reasons)
     if retrieval_count == 0:
         reasons.append("missing_retrieval")
 

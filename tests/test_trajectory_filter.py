@@ -17,9 +17,12 @@ def _trajectory(
                 "action": {
                     "type": "retrieval",
                     "query": "Paris",
+                    "top_k": len(accepted_chunk_ids),
                 },
                 "observation": {
-                    "chunk_ids": accepted_chunk_ids,
+                    "retrieved_chunks": [
+                        {"chunk_id": chunk_id} for chunk_id in accepted_chunk_ids
+                    ],
                 },
             },
             {
@@ -107,6 +110,46 @@ def test_evaluate_trajectory_rejects_missing_retrieval():
 
     assert result.accepted is False
     assert "missing_retrieval" in result.reasons
+
+
+def test_evaluate_trajectory_rejects_retrieval_action_missing_observation():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    del trajectory["trajectory"][0]["observation"]
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(trajectory, qrels_by_qid, answers_by_qid)
+
+    assert result.accepted is False
+    assert "invalid_retrieval_observation" in result.reasons
+    assert result.retrieval_count == 0
+
+
+def test_evaluate_trajectory_rejects_retrieval_action_empty_observation():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    trajectory["trajectory"][0]["observation"] = {"retrieved_chunks": []}
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(trajectory, qrels_by_qid, answers_by_qid)
+
+    assert result.accepted is False
+    assert "invalid_retrieval_observation" in result.reasons
+    assert result.retrieval_count == 0
+
+
+def test_evaluate_trajectory_rejects_invalid_retrieval_action():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    trajectory["trajectory"][0]["action"]["query"] = " "
+    trajectory["trajectory"][0]["action"]["top_k"] = 0
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(trajectory, qrels_by_qid, answers_by_qid)
+
+    assert result.accepted is False
+    assert "invalid_retrieval_action" in result.reasons
+    assert result.retrieval_count == 0
 
 
 def test_evaluate_trajectory_rejects_retrieval_budget_exceeded():
