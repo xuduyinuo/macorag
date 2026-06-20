@@ -67,6 +67,26 @@ def _has_chunk_identifier(value: Any) -> bool:
     return False
 
 
+def _chunk_id_from_value(value: Any) -> str | None:
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        chunk_id = value.get("chunk_id", value.get("id"))
+        if chunk_id is not None and str(chunk_id).strip():
+            return str(chunk_id)
+    return None
+
+
+def _chunk_ids_from_values(values: Any) -> set[str]:
+    if not isinstance(values, list):
+        return set()
+    return {
+        chunk_id
+        for value in values
+        if (chunk_id := _chunk_id_from_value(value)) is not None
+    }
+
+
 def _has_retrieved_chunks(value: Any) -> bool:
     return isinstance(value, list) and any(_has_chunk_identifier(item) for item in value)
 
@@ -114,6 +134,22 @@ def _evaluate_retrieval_steps(steps: list[dict[str, Any]]) -> tuple[int, list[st
         if valid_action and valid_observation:
             retrieval_count += 1
     return retrieval_count, reasons
+
+
+def _collect_retrieved_chunks(steps: list[dict[str, Any]]) -> set[str]:
+    retrieved_chunks: set[str] = set()
+    for step in steps:
+        action_type = step.get("action", {}).get("type")
+        if action_type not in {"retrieval", "retrieve"}:
+            continue
+
+        observation = step.get("observation")
+        if not isinstance(observation, dict):
+            continue
+
+        for key in ("retrieved_chunks", "chunks", "results", "chunk_ids", "retrieved_chunk_ids"):
+            retrieved_chunks.update(_chunk_ids_from_values(observation.get(key)))
+    return retrieved_chunks
 
 
 def _get_retrieval_budget(
@@ -174,7 +210,7 @@ def _find_missing_chunk_meta(
     chunk_meta_by_chunk_id: dict[str, dict[str, Any]] | None,
 ) -> set[str]:
     if chunk_meta_by_chunk_id is None:
-        return set()
+        return set(chunk_ids)
     return {chunk_id for chunk_id in chunk_ids if chunk_id not in chunk_meta_by_chunk_id}
 
 
@@ -203,6 +239,7 @@ def evaluate_trajectory(
         reasons.append("retrieval_budget_exceeded")
 
     accepted_chunks = _collect_accepted_chunks(steps)
+    retrieved_chunks = _collect_retrieved_chunks(steps)
     if not accepted_chunks:
         reasons.append("no_accepted_evidence")
 
@@ -235,7 +272,7 @@ def evaluate_trajectory(
         if not _contains_answer(prediction, gold_answer, aliases):
             reasons.append("answer_mismatch")
 
-    mapped_chunk_ids = accepted_chunks | supporting_chunks
+    mapped_chunk_ids = accepted_chunks | supporting_chunks | retrieved_chunks
     if _find_missing_chunk_meta(mapped_chunk_ids, chunk_meta_by_chunk_id):
         reasons.append("missing_chunk_meta")
 

@@ -69,6 +69,20 @@ def test_evaluate_trajectory_accepts_grounded_answer_with_metrics():
     assert result.retrieval_count == 1
 
 
+def test_evaluate_trajectory_rejects_missing_chunk_meta_index():
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"]),
+        qrels_by_qid,
+        answers_by_qid,
+    )
+
+    assert result.accepted is False
+    assert "missing_chunk_meta" in result.reasons
+
+
 def test_evaluate_trajectory_rejects_ungrounded_answer():
     qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
     answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
