@@ -33,10 +33,12 @@ class InMemoryRetrievalEnv:
         chunks: list[dict[str, Any]],
         retrieval_budget: int,
     ) -> None:
+        internal_questions = copy.deepcopy(questions)
+        self._chunks = copy.deepcopy(chunks)
         self._questions = {
-            question.get("qid", question.get("id")): question for question in questions
+            question.get("qid", question.get("id")): question
+            for question in internal_questions
         }
-        self._chunks = list(chunks)
         self._chunk_counters = [
             _tokens(f"{chunk.get('title', '')} {chunk.get('text', '')}")
             for chunk in self._chunks
