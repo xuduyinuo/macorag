@@ -23,7 +23,16 @@ def build_linearrag_dataset(
 
     write_json(
         output_dir / "questions.json",
-        [{"qid": example.qid, "question": example.question} for example in examples],
+        [
+            {
+                "id": example.qid,
+                "question": example.question,
+                "answer": example.answer,
+                "dataset": example.dataset,
+                "split": example.split,
+            }
+            for example in examples
+        ],
     )
     write_json(output_dir / "chunks.json", [doc.to_chunk_text() for doc in corpus])
     write_jsonl(

@@ -51,9 +51,15 @@ def test_build_linearrag_dataset_writes_questions_chunks_and_qrels(tmp_path):
     assert (output_dir / "chunk_meta.jsonl").is_file()
     assert (output_dir / "qrels.jsonl").is_file()
 
-    assert read_json(output_dir / "questions.json") == [
-        {"qid": "h1", "question": "Where was Alice born?"}
-    ]
+    questions = read_json(output_dir / "questions.json")
+    assert questions[0] == {
+        "id": "h1",
+        "question": "Where was Alice born?",
+        "answer": "Paris",
+        "dataset": "hotpotqa",
+        "split": "train",
+    }
+    assert "qid" not in questions[0]
     assert read_json(output_dir / "chunks.json") == ["Alice\nAlice was born in Paris."]
 
     chunk_meta = [
