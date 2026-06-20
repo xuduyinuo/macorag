@@ -52,10 +52,12 @@ def _find_final_answer(steps: list[dict[str, Any]]) -> dict[str, Any] | None:
 def _is_positive_int(value: Any) -> bool:
     if isinstance(value, bool):
         return False
-    try:
-        return int(value) > 0
-    except (TypeError, ValueError):
-        return False
+    if isinstance(value, int):
+        return value > 0
+    if isinstance(value, str):
+        stripped = value.strip()
+        return stripped.isdecimal() and int(stripped) > 0
+    return False
 
 
 def _has_chunk_identifier(value: Any) -> bool:
@@ -230,6 +232,8 @@ def evaluate_trajectory(
     retrieved_chunks = _collect_retrieved_chunks(steps)
     if not accepted_chunks:
         reasons.append("no_accepted_evidence")
+    elif not accepted_chunks.issubset(retrieved_chunks):
+        reasons.append("evidence_not_retrieved")
 
     gold_chunks = _gold_chunk_ids_from_qrels_and_meta(qrels, chunk_meta_by_chunk_id)
     gold_evidence_count = len(gold_chunks)
@@ -250,6 +254,9 @@ def evaluate_trajectory(
             reasons.append("missing_supporting_chunks")
         elif not supporting_chunks.issubset(accepted_chunks):
             reasons.append("supporting_chunks_not_accepted")
+
+        if supporting_chunks and not supporting_chunks.issubset(retrieved_chunks):
+            reasons.append("supporting_chunks_not_retrieved")
 
         if supporting_chunks and not supporting_chunks.issubset(gold_chunks):
             reasons.append("supporting_chunks_not_gold")
