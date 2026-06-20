@@ -91,6 +91,9 @@ def _has_retrieved_chunks(value: Any) -> bool:
 def _valid_retrieval_observation(observation: Any) -> bool:
     if not isinstance(observation, dict) or not observation:
         return False
+    legacy_keys = {"results", "chunks", "chunk_ids", "retrieved_chunk_ids"}
+    if legacy_keys & observation.keys():
+        return False
 
     return _has_retrieved_chunks(observation.get("retrieved_chunks"))
 

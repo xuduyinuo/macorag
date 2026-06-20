@@ -172,6 +172,27 @@ def test_evaluate_trajectory_rejects_legacy_retrieval_results_observation():
     assert result.retrieval_count == 0
 
 
+def test_evaluate_trajectory_rejects_mixed_retrieval_observation_formats():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    trajectory["trajectory"][0]["observation"] = {
+        "retrieved_chunks": [{"chunk_id": "c1"}],
+        "results": [{"chunk_id": "c1"}],
+    }
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        trajectory,
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1"}},
+    )
+
+    assert result.accepted is False
+    assert "invalid_retrieval_observation" in result.reasons
+    assert result.retrieval_count == 0
+
+
 def test_evaluate_trajectory_rejects_retrieved_chunk_id_alias():
     trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
     trajectory["trajectory"][0]["observation"] = {"retrieved_chunks": [{"id": "c1"}]}
