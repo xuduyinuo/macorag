@@ -20,6 +20,41 @@ def _dedupe_stable(values: list[str]) -> list[str]:
     return deduped
 
 
+def _chunk_record(dataset: str, index: int, doc: CorpusDoc) -> dict[str, object]:
+    return {
+        "chunk_id": _chunk_id(dataset, index),
+        "chunk_index": index,
+        "doc_id": doc.doc_id,
+        "title": doc.title,
+        "text": doc.text,
+        "dataset": dataset,
+        "source": doc.source,
+    }
+
+
+def _gold_sentences(example: Example) -> list[dict[str, object]]:
+    seen: set[tuple[str | None, int | None, str, str]] = set()
+    sentences: list[dict[str, object]] = []
+    for fact in example.supporting_facts:
+        if fact.text is None:
+            continue
+
+        key = (fact.doc_id, fact.sent_id, fact.title, fact.text)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        sentences.append(
+            {
+                "doc_id": fact.doc_id,
+                "sent_id": fact.sent_id,
+                "title": fact.title,
+                "text": fact.text,
+            }
+        )
+    return sentences
+
+
 def _build_qrel(
     example: Example,
     chunk_id_by_doc_id: dict[str, str],
@@ -53,9 +88,7 @@ def _build_qrel(
         "gold_doc_ids": gold_doc_ids,
         "gold_chunk_ids": gold_chunk_ids,
         "gold_titles": gold_titles,
-        "gold_sentences": [
-            fact.text for fact in example.supporting_facts if fact.text is not None
-        ],
+        "gold_sentences": _gold_sentences(example),
     }
 
 
@@ -83,7 +116,10 @@ def build_linearrag_dataset(
             for example in examples
         ],
     )
-    write_json(output_dir / "chunks.json", [doc.to_chunk_text() for doc in corpus])
+    chunk_records = [
+        _chunk_record(dataset, index, doc) for index, doc in enumerate(corpus)
+    ]
+    write_json(output_dir / "chunks.json", chunk_records)
     write_jsonl(
         output_dir / "chunk_meta.jsonl",
         [
