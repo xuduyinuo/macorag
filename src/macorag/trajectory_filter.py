@@ -144,11 +144,19 @@ def _get_retrieval_budget(
     trajectory: dict[str, Any],
     qrels: dict[str, Any],
 ) -> tuple[int | None, bool]:
+    trajectory_metadata = trajectory.get("metadata")
+    qrels_metadata = qrels.get("metadata")
+    invalid_metadata = (
+        ("metadata" in trajectory and not isinstance(trajectory_metadata, dict))
+        or ("metadata" in qrels and not isinstance(qrels_metadata, dict))
+    )
     candidates = (
         trajectory.get("retrieval_budget"),
-        trajectory.get("metadata", {}).get("retrieval_budget"),
+        trajectory_metadata.get("retrieval_budget")
+        if isinstance(trajectory_metadata, dict)
+        else None,
         qrels.get("retrieval_budget"),
-        qrels.get("metadata", {}).get("retrieval_budget"),
+        qrels_metadata.get("retrieval_budget") if isinstance(qrels_metadata, dict) else None,
     )
     for candidate in candidates:
         if candidate is not None:
@@ -157,7 +165,7 @@ def _get_retrieval_budget(
             if isinstance(candidate, int) and candidate >= 0:
                 return candidate, False
             return None, True
-    return None, False
+    return None, invalid_metadata
 
 
 def _safe_int(value: Any) -> int | None:
@@ -174,6 +182,12 @@ def _safe_int(value: Any) -> int | None:
 
 def _normalized_values(values: list[Any]) -> set[str]:
     return {normalize_key(str(value)) for value in values if str(value).strip()}
+
+
+def _sequence_values(value: Any) -> list[Any]:
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return []
 
 
 def _answer_aliases(answer_record: dict[str, Any]) -> list[str]:
@@ -200,9 +214,12 @@ def _gold_chunk_ids_from_qrels_and_meta(
     gold_doc_ids = {str(doc_id) for doc_id in qrels.get("gold_doc_ids", [])}
     gold_titles = _normalized_values(qrels.get("gold_titles", []))
     gold_sentences = _normalized_values(qrels.get("gold_sentences", []))
+    raw_gold_sentence_indices = qrels.get("gold_sentence_indices")
+    if raw_gold_sentence_indices is None:
+        raw_gold_sentence_indices = qrels.get("gold_sent_ids", [])
     gold_sentence_indices = {
         parsed_index
-        for index in qrels.get("gold_sentence_indices", qrels.get("gold_sent_ids", []))
+        for index in _sequence_values(raw_gold_sentence_indices)
         if (parsed_index := _safe_int(index)) is not None
     }
 

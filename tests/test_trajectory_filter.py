@@ -349,6 +349,23 @@ def test_evaluate_trajectory_rejects_invalid_retrieval_budget_without_crashing()
     assert "invalid_retrieval_budget" in result.reasons
 
 
+def test_evaluate_trajectory_rejects_invalid_metadata_without_crashing():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    trajectory["metadata"] = None
+    qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"], "metadata": None}}
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        trajectory,
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1"}},
+    )
+
+    assert result.accepted is False
+    assert "invalid_retrieval_budget" in result.reasons
+
+
 def test_evaluate_trajectory_rejects_supporting_chunks_that_are_not_gold():
     qrels_by_qid = {"q1": {"gold_chunk_ids": ["c1"]}}
     answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
@@ -398,6 +415,47 @@ def test_evaluate_trajectory_skips_invalid_sentence_indices_without_crashing():
 
     assert result.accepted is True
     assert result.reasons == []
+
+
+def test_evaluate_trajectory_allows_none_sentence_indices_without_crashing():
+    qrels_by_qid = {
+        "q1": {
+            "gold_chunk_ids": ["c1"],
+            "gold_sentence_indices": None,
+        }
+    }
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"]),
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1"}},
+    )
+
+    assert result.accepted is True
+    assert result.reasons == []
+
+
+def test_evaluate_trajectory_does_not_iterate_string_sentence_indices():
+    trajectory = _trajectory(accepted_chunk_ids=["c1"], supporting_chunk_ids=["c1"])
+    qrels_by_qid = {
+        "q1": {
+            "gold_chunk_ids": [],
+            "gold_sentence_indices": "12",
+        }
+    }
+    answers_by_qid = {"q1": {"answer": "Paris", "aliases": []}}
+
+    result = evaluate_trajectory(
+        trajectory,
+        qrels_by_qid,
+        answers_by_qid,
+        chunk_meta_by_chunk_id={"c1": {"chunk_id": "c1", "doc_id": "d1", "sent_id": 1}},
+    )
+
+    assert result.accepted is False
+    assert "supporting_chunks_not_gold" in result.reasons
 
 
 def test_evaluate_trajectory_allows_none_aliases_without_crashing():
