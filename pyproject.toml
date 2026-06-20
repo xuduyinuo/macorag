@@ -8,8 +8,10 @@ version = "0.1.0"
 requires-python = ">=3.10"
 dependencies = [
   "pyarrow>=14",
-  "pytest>=8",
 ]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
 
 [project.scripts]
 macorag = "macorag.cli:main"
