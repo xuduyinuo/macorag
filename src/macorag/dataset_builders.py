@@ -122,11 +122,17 @@ def build_musique_canonical_from_rows(
 
         paragraphs = list(row.get("paragraphs", []))
         paragraph_doc_ids: list[str] = []
+        doc_ids_by_idx: dict[int, str] = {}
+        paragraphs_by_idx = {
+            int(paragraph["idx"]): paragraph for paragraph in paragraphs
+        }
         for paragraph in paragraphs:
             title = _paragraph_title(paragraph)
             text = _paragraph_text(paragraph)
             doc_id = _musique_doc_id(title, text)
             paragraph_doc_ids.append(doc_id)
+            if "idx" in paragraph:
+                doc_ids_by_idx[int(paragraph["idx"])] = doc_id
             if doc_id not in corpus_by_doc_id:
                 corpus_by_doc_id[doc_id] = CorpusDoc(
                     doc_id=doc_id,
@@ -147,9 +153,10 @@ def build_musique_canonical_from_rows(
             support_idx = decomposition.get("paragraph_support_idx")
             support_doc_id = None
             support_title = None
-            if isinstance(support_idx, int) and 0 <= support_idx < len(paragraphs):
-                paragraph = paragraphs[support_idx]
-                support_doc_id = paragraph_doc_ids[support_idx]
+            if support_idx is not None and int(support_idx) in paragraphs_by_idx:
+                support_key = int(support_idx)
+                paragraph = paragraphs_by_idx[support_key]
+                support_doc_id = doc_ids_by_idx[support_key]
                 support_title = _paragraph_title(paragraph)
                 supporting_facts.append(
                     SupportingFact(

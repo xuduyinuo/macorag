@@ -13,28 +13,31 @@ def test_musique_answerable_rows_build_examples_and_corpus():
         "answerable": True,
         "paragraphs": [
             {
+                "idx": 0,
                 "title": "Alice",
                 "paragraph_text": "Alice was born in Paris.",
             },
             {
+                "idx": 5,
                 "title": "Paris",
                 "paragraph_text": "Paris is the capital of France.",
             },
             {
-                "title": "Extra",
-                "paragraph_text": "Extra context.",
+                "idx": 10,
+                "title": "France",
+                "paragraph_text": "France was founded over many centuries.",
             },
         ],
         "question_decomposition": [
             {
-                "question": "Where was Alice born?",
-                "answer": "Paris",
-                "paragraph_support_idx": 0,
+                "question": "Where was Alice's birthplace founded?",
+                "answer": "France",
+                "paragraph_support_idx": 10,
             },
             {
                 "question": "Where is Paris?",
                 "answer": "France",
-                "paragraph_support_idx": 1,
+                "paragraph_support_idx": 5,
             },
         ],
     }
@@ -48,6 +51,7 @@ def test_musique_answerable_rows_build_examples_and_corpus():
     assert len(report["examples"][0].supporting_facts) == 2
     assert len(report["examples"][0].evidence_chain) == 2
     assert len(report["corpus"]) == 3
+    assert report["examples"][0].usable_for_sft is True
 
 
 def test_hotpot_row_maps_supporting_facts():
