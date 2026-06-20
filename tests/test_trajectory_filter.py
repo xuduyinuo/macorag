@@ -4,7 +4,8 @@ from macorag.trajectory_filter import evaluate_trajectory
 def test_evaluate_trajectory_accepts_grounded_answer():
     trajectory = {
         "qid": "q1",
-        "steps": [
+        "dataset": "hotpotqa",
+        "trajectory": [
             {
                 "action": {
                     "type": "update_evidence",
@@ -32,7 +33,8 @@ def test_evaluate_trajectory_accepts_grounded_answer():
 def test_evaluate_trajectory_rejects_ungrounded_answer():
     trajectory = {
         "qid": "q1",
-        "steps": [
+        "dataset": "hotpotqa",
+        "trajectory": [
             {
                 "action": {
                     "type": "update_evidence",

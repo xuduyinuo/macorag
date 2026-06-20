@@ -48,7 +48,7 @@ def evaluate_trajectory(
     answers_by_qid: dict[str, dict[str, Any]],
 ) -> FilterResult:
     qid = trajectory.get("qid")
-    steps = list(trajectory.get("steps", []))
+    steps = list(trajectory.get("trajectory", []))
     qrels = qrels_by_qid.get(qid, {})
     answer_record = answers_by_qid.get(qid, {})
 
