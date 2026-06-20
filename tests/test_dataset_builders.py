@@ -88,3 +88,21 @@ def test_2wiki_row_maps_evidences_to_chain():
     assert example.dataset == "2wiki"
     assert example.evidence_chain[0].sub_question == "Bob sibling ?"
     assert example.evidence_chain[0].answer == "Alice"
+
+
+def test_2wiki_evidence_only_row_is_usable():
+    row = {
+        "id": "w2",
+        "question": "Who is related to Bob?",
+        "answer": "Alice",
+        "type": "inference",
+        "evidences": [["Bob", "sibling", "Alice"]],
+        "supporting_facts": {"title": [], "sent_id": []},
+        "context": {"title": [], "sentences": []},
+    }
+
+    example = build_2wiki_example_from_row(row, split="train")
+
+    assert len(example.evidence_chain) == 1
+    assert example.usable_for_sft is True
+    assert example.usable_for_retrieval_eval is True

@@ -232,6 +232,7 @@ def build_hotpot_example_from_row(row: dict[str, Any], *, split: str) -> Example
 
 
 def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
+    answer = normalize_text(str(row.get("answer") or ""))
     supporting_facts = _build_supporting_facts(
         dataset="2wiki",
         supporting_facts=row.get("supporting_facts", []),
@@ -249,7 +250,7 @@ def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
         for step, evidence in enumerate(row.get("evidences", []), start=1)
         if len(evidence) >= 3
     ]
-    is_usable = bool(row.get("answer") and supporting_facts)
+    is_usable = bool(answer and (supporting_facts or evidence_chain))
     return Example(
         qid=str(row.get("id") or row.get("_id") or row.get("qid")),
         dataset="2wiki",
