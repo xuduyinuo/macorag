@@ -559,6 +559,70 @@ MuSiQue: question_decomposition 中 paragraph_support_idx 对应的支持段落
 
 `raw_teacher_trajectories.jsonl` 保存所有格式可解析的教师输出。`filtered_sft_trajectories.jsonl` 只保存通过质量过滤的轨迹。
 
+### SFT v1 数据规模
+
+第一阶段采用全 API 教师轨迹构造，不使用规则模板轨迹或弱教师轨迹。
+
+目标规模：
+
+```text
+filtered_sft_trajectories 总量: 3,000
+HotpotQA: 1,000
+2Wiki: 1,000
+MuSiQue: 1,000
+```
+
+该规模用于训练 Qwen2.5-7B 的第一版多智能体 RAG 行为克隆模型。目标不是训练出最终最优检索策略，而是让模型稳定学会：
+
+```text
+固定标签格式
+多轮检索动作
+证据更新动作
+基于已接受证据生成答案
+不直接依赖模型内部知识回答
+```
+
+3K 高质量轨迹足够作为 Qwen2.5-7B 的 SFT warm-up baseline。若后续评估显示检索探索策略不足，再通过失败样本挖掘、增量 SFT 或 RL 扩展数据。
+
+为保证过滤后仍有 3K 可用样本，原始 API 生成量应略高于目标量：
+
+```text
+raw_teacher_trajectories 建议生成: 3,600-4,500
+每个数据集 raw 生成: 1,200-1,500
+过滤后每个数据集保留: 1,000
+```
+
+如果某个数据集过滤后不足 1,000，不硬凑低质量样本；优先追加该数据集的 API 生成样本，直到满足质量标准。
+
+### SFT v1 抽样策略
+
+每个数据集内部做分层抽样，避免 1K 样本集中在过于简单的问题上。
+
+推荐比例：
+
+```text
+简单 2-hop / direct bridge: 40%
+compositional / bridge / inference: 40%
+comparison / multi-entity / hard cases: 20%
+```
+
+数据集特定策略：
+
+```text
+HotpotQA: 按 type、level、supporting_facts title 数量分层。
+2Wiki: 按 type、evidences 数量、comparison/bridge-comparison 类型分层。
+MuSiQue: 按 hop_count 和 question_decomposition 长度分层。
+```
+
+轨迹长度控制：
+
+```text
+每条轨迹检索轮数: 2-4
+每轮 top_k: 5
+单条样本总长度: 尽量控制在 8K tokens 内
+超过检索预算仍不能得到充分证据的样本丢弃或重新生成
+```
+
 Verifier 需要检查四类条件：
 
 ```text
