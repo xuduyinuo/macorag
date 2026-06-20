@@ -1,24 +1,24 @@
-# RAG Agent Data Processing Design
+# RAG 多智能体数据处理设计
 
-Date: 2026-06-20
+日期：2026-06-20
 
-## Goal
+## 目标
 
-Build a unified data processing layer for HotpotQA, 2Wiki, and MuSiQue so the retrieval environment, teacher trajectory generation, SFT, and later RL optimization all share the same input and output contracts.
+为 HotpotQA、2Wiki 和 MuSiQue 构建统一的数据处理层，使检索环境、教师轨迹构造、SFT 训练以及后续 RL 协同优化共享一致的输入输出契约。
 
-The retrieval environment will use the LinearRAG approach from `https://github.com/DEEP-PolyU/LinearRAG`. LinearRAG expects each dataset to provide `questions.json` and `chunks.json` under a dataset-specific directory. This design keeps that compatibility as an adapter layer instead of making LinearRAG's minimal format the canonical data format.
+检索环境采用 LinearRAG 方案：`https://github.com/DEEP-PolyU/LinearRAG`。LinearRAG 当前期望每个数据集在独立目录中提供 `questions.json` 和 `chunks.json`。本设计将该格式作为适配层，而不是把 LinearRAG 的最小输入格式作为项目的规范数据格式。
 
-MuSiQue will use the answerable subset only: `musique_ans_v1.0_train.jsonl` and `musique_ans_v1.0_dev.jsonl`.
+MuSiQue 只使用 answerable 子集：`musique_ans_v1.0_train.jsonl` 和 `musique_ans_v1.0_dev.jsonl`。
 
-## Chosen Approach
+## 选定方案
 
-Use a canonical schema plus a LinearRAG adapter layer.
+采用“统一规范层 + LinearRAG 适配层”。
 
-The canonical layer preserves question, answer, facts, evidence chains, corpus documents, split metadata, and quality flags. The LinearRAG adapter derives `questions.json` and `chunks.json` from canonical data and keeps sidecar metadata files for mapping retrieved chunks back to evidence.
+规范层保留问题、答案、事实证据、推理证据链、语料文档、数据划分和质量标记。LinearRAG 适配层从规范数据派生 `questions.json` 和 `chunks.json`，并额外保留 sidecar 元数据文件，用于将检索返回的 chunk 映射回规范语料和 gold evidence。
 
-This avoids binding the whole project to one retrieval implementation while still making the first retrieval environment easy to run.
+这样既能快速跑通第一版检索环境，也不会把后续教师轨迹、SFT 和 RL 训练绑定死在某个检索实现上。
 
-## Output Layout
+## 输出目录
 
 ```text
 data/processed/
@@ -65,9 +65,9 @@ linearrag_dataset/
     qrels.jsonl
 ```
 
-## Canonical Example Schema
+## 统一样本 Schema
 
-Each normalized QA sample is written as one JSON object per line:
+每条规范化 QA 样本写成一行 JSON：
 
 ```json
 {
@@ -106,14 +106,14 @@ Each normalized QA sample is written as one JSON object per line:
 }
 ```
 
-The schema separates two evidence concepts:
+统一样本中保留两类证据：
 
-- `supporting_facts`: text evidence that can be cited, used for retrieval evaluation and grounded answer generation.
-- `evidence_chain`: ordered reasoning or decomposition steps, used for teacher trajectory construction and agent action supervision.
+- `supporting_facts`：可引用的文本证据，主要用于检索评估和基于证据的答案生成。
+- `evidence_chain`：有顺序的推理步骤或问题分解，主要用于教师轨迹构造和智能体动作监督。
 
-## Canonical Corpus Schema
+## 统一语料 Schema
 
-Each corpus document or chunk is written as one JSON object per line:
+每条语料文档或 chunk 写成一行 JSON：
 
 ```json
 {
@@ -127,16 +127,16 @@ Each corpus document or chunk is written as one JSON object per line:
 }
 ```
 
-## Dataset Mapping
+## 数据集映射
 
 ### HotpotQA
 
-Sources:
+来源：
 
-- QA: `data/hotpotqa/fullwiki/*.parquet`
-- Corpus: `data/hotpotqa/beir_corpus/corpus/*.parquet`
+- QA：`data/hotpotqa/fullwiki/*.parquet`
+- 语料：`data/hotpotqa/beir_corpus/corpus/*.parquet`
 
-Example mapping:
+样本映射：
 
 ```text
 qid              <- id
@@ -148,30 +148,30 @@ answer_aliases   <- []
 question_type    <- type
 hop_count         <- 2
 supporting_facts <- supporting_facts.title + supporting_facts.sent_id
-context_doc_ids  <- matched from context.title or BEIR title when possible
+context_doc_ids  <- 尽量由 context.title 或 BEIR title 匹配得到
 metadata.level   <- level
 ```
 
-Corpus mapping:
+语料映射：
 
 ```text
 doc_id    <- BEIR _id
 title     <- title
 text      <- text
-sentences <- [text] in the first version
+sentences <- 第一版使用 [text]
 source    <- "beir"
 ```
 
-HotpotQA fullwiki QA includes local `context`, but the retrieval environment should use BEIR corpus as the main corpus. The QA context is used for gold-support text recovery and alignment checks.
+HotpotQA fullwiki QA 自带局部 `context`，但检索环境应以 BEIR corpus 作为主语料。QA context 只用于恢复 gold supporting text 和做对齐检查。
 
 ### 2Wiki
 
-Sources:
+来源：
 
-- QA: `data/2wiki/qa/*.parquet`
-- Corpus: `data/2wiki/corpus/2wiki_corpus.jsonl`
+- QA：`data/2wiki/qa/*.parquet`
+- 语料：`data/2wiki/corpus/2wiki_corpus.jsonl`
 
-Example mapping:
+样本映射：
 
 ```text
 qid                 <- id
@@ -181,34 +181,34 @@ question            <- question
 answer              <- answer
 answer_aliases      <- []
 question_type       <- type
-hop_count            <- inferred from evidences or type, default 2
+hop_count            <- 根据 evidences 或 type 推断，默认 2
 supporting_facts    <- supporting_facts.title + supporting_facts.sent_id
-evidence_chain      <- evidences converted to ordered steps
-context_doc_ids     <- matched from context.title to corpus title
-metadata.evidences  <- original evidences
+evidence_chain      <- evidences 转成有序步骤
+context_doc_ids     <- 由 context.title 匹配 corpus title
+metadata.evidences  <- 原始 evidences
 ```
 
-Corpus mapping:
+语料映射：
 
 ```text
 doc_id            <- id
 title             <- title
-text              <- sentences joined with spaces
+text              <- sentences 用空格拼接
 sentences         <- sentences
 source            <- "para_with_hyperlink"
 metadata.mentions <- mentions
 ```
 
-2Wiki has both sentence-level supporting facts and relation-level `evidences`; the relation evidence should seed teacher planning trajectories.
+2Wiki 同时有句级 `supporting_facts` 和关系级 `evidences`；关系级证据应作为教师规划轨迹的种子。
 
 ### MuSiQue
 
-Sources:
+来源：
 
-- QA and context: `data/musique/musique_ans_v1.0_train.jsonl`
-- QA and context: `data/musique/musique_ans_v1.0_dev.jsonl`
+- QA 和上下文：`data/musique/musique_ans_v1.0_train.jsonl`
+- QA 和上下文：`data/musique/musique_ans_v1.0_dev.jsonl`
 
-Example mapping:
+样本映射：
 
 ```text
 qid                 <- id
@@ -217,15 +217,15 @@ split               <- train / dev
 question            <- question
 answer              <- answer
 answer_aliases      <- answer_aliases
-question_type       <- inferred from id or question_decomposition
+question_type       <- 由 id 或 question_decomposition 推断
 hop_count            <- len(question_decomposition)
-supporting_facts    <- paragraph referenced by paragraph_support_idx
-evidence_chain      <- question_decomposition in order
-context_doc_ids     <- generated paragraph doc ids
+supporting_facts    <- paragraph_support_idx 指向的 paragraph
+evidence_chain      <- question_decomposition 按顺序转换
+context_doc_ids     <- 生成的 paragraph doc_id
 metadata.answerable <- true
 ```
 
-Corpus mapping:
+语料映射：
 
 ```text
 doc_id    <- musique:{dedup_hash}
@@ -233,45 +233,45 @@ title     <- paragraphs[*].title
 text      <- paragraphs[*].paragraph_text
 sentences <- [paragraph_text]
 source    <- "musique_context"
-metadata.linked_qids <- qids that include the paragraph
+metadata.linked_qids <- 包含该 paragraph 的 qid 列表
 ```
 
-MuSiQue has no separate global corpus in the downloaded files, so its corpus is reconstructed by deduplicating all provided paragraphs from the answerable train/dev files.
+MuSiQue 下载文件中没有独立全局 corpus，因此语料从 answerable train/dev 的 `paragraphs` 去重重建。
 
-## Cleaning and Deduplication
+## 清洗与去重
 
-Text cleaning is conservative:
+文本清洗保持保守，只做不改变语义的处理：
 
 ```text
-1. Strip leading and trailing whitespace.
-2. Collapse consecutive whitespace.
-3. Preserve original casing, punctuation, and entity names.
-4. Drop corpus entries only when both title and text are empty.
-5. Keep test examples with answer=null, but exclude them from SFT trajectory generation.
+1. 去除首尾空白。
+2. 合并连续空白字符。
+3. 保留原始大小写、标点和实体名称。
+4. 只有 title 和 text 同时为空时才丢弃语料项。
+5. 保留 answer=null 的 test 样本，但不用于 SFT 轨迹构造。
 ```
 
-Sentence handling:
+句子处理策略：
 
 ```text
-Datasets with existing sentences keep their original sentence lists.
-Datasets with only paragraph_text/text use [text] initially.
+已有 sentences 的数据保留原始句子列表。
+只有 paragraph_text/text 的数据第一版使用 [text]。
 ```
 
-This prevents sentence-id drift in HotpotQA and 2Wiki. MuSiQue evidence is paragraph-level, so paragraph chunks are acceptable.
+这样可以避免 HotpotQA 和 2Wiki 的句子编号漂移。MuSiQue 的证据是段落级，因此段落粒度 chunk 是可接受的。
 
-Corpus deduplication happens within each dataset, not across datasets:
+语料只在数据集内部去重，不跨数据集去重：
 
 ```text
 dedup_key = normalize(title) + sha1(normalize(text))
 ```
 
-`normalize` lowercases text, collapses whitespace, and strips leading/trailing whitespace. When duplicates are merged, keep one `doc_id` and record all linked question ids in `metadata.linked_qids`.
+`normalize` 只做小写、空白合并和首尾空白去除。重复语料合并时保留一个 `doc_id`，并在 `metadata.linked_qids` 中记录所有引用它的问题。
 
-Do not deduplicate across datasets because Wikipedia versions, sentence segmentation, and evidence annotations differ.
+不做跨数据集去重，因为 HotpotQA、2Wiki、MuSiQue 的 Wikipedia 版本、句切方式和 evidence 标注不同。跨集合并会增加 gold evidence 对齐难度。
 
-## Split Policy
+## 数据划分策略
 
-Preserve original splits:
+保留原始 split，不重新划分：
 
 ```text
 HotpotQA: train / dev / test
@@ -279,13 +279,13 @@ HotpotQA: train / dev / test
 MuSiQue answerable: train / dev
 ```
 
-Teacher trajectory generation uses only samples from train/dev with non-empty answers and parseable gold evidence.
+教师轨迹构造只使用 train/dev 中 answer 非空且 gold evidence 可解析的样本。
 
-Test data is retained for evaluation, not SFT labels.
+test 数据保留用于评估，不生成 SFT 标签。
 
-## LinearRAG Adapter
+## LinearRAG 适配层
 
-LinearRAG-compatible `questions.json`:
+LinearRAG 兼容的 `questions.json`：
 
 ```json
 [
@@ -299,7 +299,7 @@ LinearRAG-compatible `questions.json`:
 ]
 ```
 
-LinearRAG-compatible `chunks.json`:
+LinearRAG 兼容的 `chunks.json`：
 
 ```json
 [
@@ -307,7 +307,7 @@ LinearRAG-compatible `chunks.json`:
 ]
 ```
 
-`chunk_meta.jsonl` maps LinearRAG chunk indices back to canonical documents:
+`chunk_meta.jsonl` 用于把 LinearRAG chunk index 映射回规范语料：
 
 ```json
 {
@@ -320,7 +320,7 @@ LinearRAG-compatible `chunks.json`:
 }
 ```
 
-`qrels.jsonl` records gold evidence for retrieval evaluation:
+`qrels.jsonl` 记录检索评估所需的 gold evidence：
 
 ```json
 {
@@ -337,17 +337,17 @@ LinearRAG-compatible `chunks.json`:
 }
 ```
 
-Initial chunking is document-level:
+第一版采用文档级 chunk：
 
 ```text
 chunk_text = title + "\n" + text
 ```
 
-Do not split long documents in the first version. Keeping one corpus item as one chunk makes gold evidence mapping simpler. Passage/window splitting can be added later if retrieval quality or memory requires it.
+第一版不切长文档。保持“一条语料对应一个 chunk”可以让 `doc_id`、`chunk_id` 和 gold evidence 的映射最简单。若后续检索质量或内存表现要求，再增加 passage/window 切分。
 
-## Teacher Trajectory Data
+## 教师轨迹数据
 
-Teacher input uses canonical examples and the retrieval environment:
+教师模型输入来自规范样本和检索环境：
 
 ```json
 {
@@ -362,7 +362,7 @@ Teacher input uses canonical examples and the retrieval environment:
 }
 ```
 
-Teacher output is a multi-agent trajectory:
+教师模型输出统一为多智能体轨迹：
 
 ```json
 {
@@ -431,17 +431,17 @@ Teacher output is a multi-agent trajectory:
 }
 ```
 
-Trajectory constraints:
+轨迹约束：
 
-- Every action has a `type`.
-- Every retrieval step records `query`, `top_k`, and `retrieved_chunks`.
-- `accepted_chunk_ids` and `supporting_chunk_ids` must resolve through `chunk_meta.jsonl`.
-- Final answers must cite supporting chunks.
-- MuSiQue answerable data does not produce refusal trajectories.
+- 每个 action 必须有 `type`。
+- 每轮检索必须记录 `query`、`top_k` 和 `retrieved_chunks`。
+- `accepted_chunk_ids` 和 `supporting_chunk_ids` 必须能通过 `chunk_meta.jsonl` 解析。
+- 最终答案必须引用 supporting chunks。
+- MuSiQue answerable 数据不生成拒答轨迹。
 
-## Quality Gates
+## 质量门禁
 
-Each conversion writes `stats.json`:
+每次转换写出 `stats.json`：
 
 ```json
 {
@@ -454,7 +454,7 @@ Each conversion writes `stats.json`:
 }
 ```
 
-Each conversion writes `validation_report.json`:
+每次转换写出 `validation_report.json`：
 
 ```json
 {
@@ -469,46 +469,46 @@ Each conversion writes `validation_report.json`:
 }
 ```
 
-Error severity:
+错误分级：
 
 ```text
-error: sample cannot be parsed, qid missing, question missing, corpus doc_id conflict
-warning: gold title not found in corpus, answer missing, evidence_chain incomplete
-info: duplicate corpus item merged, long text retained as a single chunk
+error: 样本无法解析、qid 缺失、question 缺失、corpus doc_id 冲突
+warning: gold title 匹配不到 corpus、answer 缺失、evidence_chain 不完整
+info: 重复语料被合并、长文本被保留为单 chunk
 ```
 
-Conversion stops on errors. Conversion continues on warnings and records them.
+转换遇到 error 时中断。遇到 warning 时继续，但必须记录到报告中。
 
-## SFT Filtering
+## SFT 过滤规则
 
-A sample is usable for SFT when all of the following hold:
+样本满足以下条件时可用于 SFT：
 
 ```text
-question is non-empty
-answer is non-empty
-at least one supporting_fact or evidence_chain exists
-qid is unique
-split is train or dev
+question 非空
+answer 非空
+至少存在一个 supporting_fact 或 evidence_chain
+qid 唯一
+split 属于 train 或 dev
 ```
 
-If gold evidence cannot be mapped to corpus but QA fields are usable:
+如果 QA 字段可用，但 gold evidence 无法映射到 corpus：
 
 ```text
 usable_for_sft = false
 usable_for_retrieval_eval = false
 ```
 
-The sample remains in canonical examples so data loss is explicit.
+样本仍保留在规范 examples 中，让数据损失显式可见。
 
-## Out of Scope
+## 不在第一版范围内
 
-The first version does not:
+第一版不做：
 
-- train agents,
-- generate teacher trajectories,
-- run RL,
-- change LinearRAG internals,
-- perform cross-dataset corpus deduplication,
-- do aggressive sentence segmentation or long-document windowing.
+- 智能体训练；
+- 教师轨迹实际生成；
+- RL 训练；
+- LinearRAG 内部改造；
+- 跨数据集语料去重；
+- 激进句切或长文档 window 切分。
 
-Those steps should be planned after the canonical data and LinearRAG adapter outputs are validated.
+这些工作应在规范数据和 LinearRAG 适配输出验证通过后再单独计划。
