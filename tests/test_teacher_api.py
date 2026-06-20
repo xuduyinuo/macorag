@@ -1,3 +1,6 @@
+import json
+import urllib.request
+
 import pytest
 
 from macorag.teacher_api import FakeTeacherClient, OpenAICompatibleClient
@@ -30,3 +33,50 @@ def test_openai_compatible_client_raises_when_api_key_env_missing(monkeypatch):
 
     with pytest.raises(RuntimeError, match="MISSING_TEACHER_API_KEY"):
         client.generate("prompt")
+
+
+def test_openai_compatible_client_posts_chat_completion_request(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return None
+
+        def read(self):
+            return b'{"choices":[{"message":{"content":"teacher reply"}}]}'
+
+    def fake_urlopen(request, timeout):
+        captured["request"] = request
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setenv("TEACHER_API_KEY", "secret-key")
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    client = OpenAICompatibleClient(
+        api_key_env="TEACHER_API_KEY",
+        base_url="https://example.com/v1/",
+        model="teacher-model",
+        temperature=0.4,
+        max_tokens=512,
+    )
+
+    result = client.generate("teacher prompt")
+
+    request = captured["request"]
+    body = json.loads(request.data.decode("utf-8"))
+    assert result == "teacher reply"
+    assert request.full_url == "https://example.com/v1/chat/completions"
+    assert request.get_method() == "POST"
+    assert request.get_header("Authorization") == "Bearer secret-key"
+    headers = {key.lower(): value for key, value in request.header_items()}
+    assert headers["content-type"] == "application/json"
+    assert body == {
+        "model": "teacher-model",
+        "messages": [{"role": "user", "content": "teacher prompt"}],
+        "temperature": 0.4,
+        "max_tokens": 512,
+    }
+    assert captured["timeout"] == 120
