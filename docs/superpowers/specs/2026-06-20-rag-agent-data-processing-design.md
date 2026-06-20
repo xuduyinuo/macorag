@@ -63,6 +63,22 @@ linearrag_dataset/
     chunks.json
     chunk_meta.jsonl
     qrels.jsonl
+
+trajectories/
+  hotpotqa/
+    raw_teacher_trajectories.jsonl
+    filtered_sft_trajectories.jsonl
+    trajectory_validation_report.json
+
+  2wiki/
+    raw_teacher_trajectories.jsonl
+    filtered_sft_trajectories.jsonl
+    trajectory_validation_report.json
+
+  musique/
+    raw_teacher_trajectories.jsonl
+    filtered_sft_trajectories.jsonl
+    trajectory_validation_report.json
 ```
 
 ## 统一样本 Schema
@@ -285,6 +301,11 @@ test 数据保留用于评估，不生成 SFT 标签。
 
 ## LinearRAG 适配层
 
+LinearRAG 适配层有两个职责：
+
+1. 为 LinearRAG 原始流程提供 `questions.json` 和 `chunks.json`。
+2. 将 LinearRAG 封装成多轮主动检索环境，让教师模型可以在每一轮生成子查询并接收检索观测。
+
 LinearRAG 兼容的 `questions.json`：
 
 ```json
@@ -345,24 +366,103 @@ chunk_text = title + "\n" + text
 
 第一版不切长文档。保持“一条语料对应一个 chunk”可以让 `doc_id`、`chunk_id` 和 gold evidence 的映射最简单。若后续检索质量或内存表现要求，再增加 passage/window 切分。
 
-## 教师轨迹数据
+### 多轮检索环境接口
 
-教师模型输入来自规范样本和检索环境：
+教师模型不直接调用 LinearRAG 的一次性问答接口，而是通过一个 step-wise 检索环境交互：
+
+```text
+reset(qid) -> initial_state
+step(query, top_k) -> observation
+get_state() -> current_state
+```
+
+`initial_state` 只包含模型可见信息：
 
 ```json
 {
   "qid": "string",
   "dataset": "2wiki",
   "question": "string",
-  "answer": "string",
-  "evidence_chain": [],
-  "supporting_facts": [],
+  "evidence": [],
+  "retrieval_history": [],
+  "retrieval_count": 0,
+  "retrieval_budget": 5
+}
+```
+
+`observation` 返回检索结果：
+
+```json
+{
+  "query": "string",
+  "top_k": 5,
+  "retrieved_chunks": [
+    {
+      "chunk_id": "string",
+      "rank": 1,
+      "score": 0.83,
+      "title": "string",
+      "text": "string"
+    }
+  ]
+}
+```
+
+环境负责记录每轮 `query/top_k/retrieved_chunks`，并通过 `chunk_meta.jsonl` 保证所有 `chunk_id` 可以回连到统一语料。
+
+## Gold Evidence 对齐与防泄漏
+
+正常进入教师轨迹构造的每个问题都必须先完成 gold evidence 到语料库 chunk 的对齐。对齐产物写入 `qrels.jsonl`，用于检索评估和轨迹过滤。
+
+Gold evidence 包括：
+
+```text
+HotpotQA: supporting_facts 对应的 gold title/sentence
+2Wiki: supporting_facts + evidences 对应的 gold title/sentence/relation
+MuSiQue: question_decomposition 中 paragraph_support_idx 对应的支持段落
+```
+
+关键约束：
+
+- `supporting_facts`、`evidence_chain`、`gold_doc_ids`、`gold_chunk_ids` 只能给 verifier/filter 使用。
+- 教师模型 prompt 中不能出现 gold answer、gold evidence、gold title 列表或 gold chunk id。
+- 教师模型只能看到原始问题、当前共享状态、历史检索结果、已接受证据和剩余检索预算。
+- 如果某个样本的 gold evidence 无法映射到 corpus/chunk，则该样本不进入教师轨迹构造。
+
+该约束避免教师模型学习“复述标注证据”，保证轨迹来自主动检索过程。
+
+## 教师主动检索轨迹数据
+
+教师模型输入来自检索环境状态，而不是来自带标签答案的规范样本：
+
+```json
+{
+  "qid": "string",
+  "dataset": "2wiki",
+  "question": "string",
+  "state": {
+    "sub_goal": null,
+    "evidence": [],
+    "retrieval_history": [],
+    "retrieval_count": 0
+  },
   "retrieval_budget": 5,
   "corpus_namespace": "2wiki"
 }
 ```
 
-教师模型输出统一为多智能体轨迹：
+教师模型按固定标签生成动作。每个标签内部必须是可解析 JSON：
+
+```xml
+<plan>{"sub_query": "string", "rationale": "string"}</plan>
+<retrieval>{"query": "string", "top_k": 5}</retrieval>
+<update-evidence>{"accepted_chunk_ids": ["string"], "rejected_chunk_ids": ["string"], "reason": "string"}</update-evidence>
+<answer>{"answer": "string", "supporting_chunk_ids": ["string"]}</answer>
+```
+
+允许模型在标签外输出少量自然语言思考，但最终进入 SFT 的样本必须被规范化为标签加 JSON 的结构化格式。`<update-evidence>` 必须使用闭合标签 `</update-evidence>`。
+
+解析后的教师轨迹统一表示为：
 
 ```json
 {
@@ -379,6 +479,7 @@ chunk_text = title + "\n" + text
         "retrieval_count": 0
       },
       "agent": "planner",
+      "raw_text": "<plan>{...}</plan>",
       "action": {
         "type": "plan_query",
         "sub_query": "string",
@@ -388,6 +489,7 @@ chunk_text = title + "\n" + text
     {
       "t": 1,
       "agent": "retriever",
+      "raw_text": "<retrieval>{...}</retrieval>",
       "action": {
         "type": "retrieve",
         "query": "string",
@@ -408,6 +510,7 @@ chunk_text = title + "\n" + text
     {
       "t": 2,
       "agent": "evidence_updater",
+      "raw_text": "<update-evidence>{...}</update-evidence>",
       "action": {
         "type": "update_evidence",
         "accepted_chunk_ids": ["string"],
@@ -421,6 +524,7 @@ chunk_text = title + "\n" + text
     {
       "t": 3,
       "agent": "answer_generator",
+      "raw_text": "<answer>{...}</answer>",
       "action": {
         "type": "final_answer",
         "answer": "string",
@@ -437,7 +541,46 @@ chunk_text = title + "\n" + text
 - 每轮检索必须记录 `query`、`top_k` 和 `retrieved_chunks`。
 - `accepted_chunk_ids` 和 `supporting_chunk_ids` 必须能通过 `chunk_meta.jsonl` 解析。
 - 最终答案必须引用 supporting chunks。
+- 最终答案必须基于已接受证据生成，不能只依赖模型内部知识。
 - MuSiQue answerable 数据不生成拒答轨迹。
+
+## 轨迹构造与过滤流程
+
+教师轨迹构造按如下流程执行：
+
+```text
+统一数据构造
+-> gold evidence 对齐到 corpus/chunk_id
+-> 构建 LinearRAG 多轮检索环境
+-> 教师模型按标签主动检索并生成轨迹
+-> verifier 使用 gold evidence 和 gold answer 检查轨迹
+-> 过滤得到高质量 SFT 数据
+```
+
+`raw_teacher_trajectories.jsonl` 保存所有格式可解析的教师输出。`filtered_sft_trajectories.jsonl` 只保存通过质量过滤的轨迹。
+
+Verifier 需要检查四类条件：
+
+```text
+格式正确：四类标签可解析，JSON 字段完整，动作类型合法。
+检索有效：检索查询产生观测，引用的 chunk_id 能映射到 chunk_meta。
+证据覆盖：accepted/supporting chunks 命中 qrels 中的 gold doc/title/sentence。
+答案 grounded：最终 answer 与 gold answer 匹配，并引用已接受证据。
+```
+
+只用最终答案是否正确不足以保留轨迹，因为教师可能依赖内部知识答对。只用 evidence 命中也不足以保留轨迹，因为模型可能没有完成最终推理。因此过滤必须同时检查证据覆盖和答案 groundedness。
+
+高质量轨迹的最低标准：
+
+```text
+所有标签格式合法。
+至少一次 retrieval 动作。
+至少一个 accepted_chunk_id。
+accepted_chunk_ids 至少命中一个 gold chunk/doc/title。
+final answer 与 gold answer 或 answer_aliases 匹配。
+supporting_chunk_ids 是 accepted_chunk_ids 的子集。
+没有超过 retrieval_budget。
+```
 
 ## 质量门禁
 
@@ -450,7 +593,8 @@ chunk_text = title + "\n" + text
   "num_questions_with_answer": 0,
   "num_questions_with_supporting_facts": 0,
   "num_questions_with_evidence_chain": 0,
-  "num_unmatched_gold_titles": 0
+  "num_unmatched_gold_titles": 0,
+  "num_questions_with_gold_chunk_alignment": 0
 }
 ```
 
@@ -473,7 +617,7 @@ chunk_text = title + "\n" + text
 
 ```text
 error: 样本无法解析、qid 缺失、question 缺失、corpus doc_id 冲突
-warning: gold title 匹配不到 corpus、answer 缺失、evidence_chain 不完整
+warning: gold title 匹配不到 corpus、answer 缺失、evidence_chain 不完整、gold evidence 无法映射到 chunk
 info: 重复语料被合并、长文本被保留为单 chunk
 ```
 
@@ -500,15 +644,25 @@ usable_for_retrieval_eval = false
 
 样本仍保留在规范 examples 中，让数据损失显式可见。
 
+轨迹级 SFT 过滤还必须满足：
+
+```text
+teacher prompt 未包含 gold answer 或 gold evidence
+轨迹格式可解析
+检索引用的 chunk_id 有效
+accepted evidence 与 gold evidence 有重叠
+final answer 与 gold answer 匹配
+final answer 引用的 supporting_chunk_ids 来自已接受证据
+```
+
 ## 不在第一版范围内
 
 第一版不做：
 
 - 智能体训练；
-- 教师轨迹实际生成；
 - RL 训练；
 - LinearRAG 内部改造；
 - 跨数据集语料去重；
 - 激进句切或长文档 window 切分。
 
-这些工作应在规范数据和 LinearRAG 适配输出验证通过后再单独计划。
+教师轨迹生成本身属于本方案的数据构造目标，但第一版只负责构造和过滤 SFT 轨迹，不训练智能体，也不进行 RL 协同优化。
