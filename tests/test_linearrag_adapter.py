@@ -88,3 +88,96 @@ def test_build_linearrag_dataset_writes_questions_chunks_and_qrels(tmp_path):
             "gold_sentences": ["Alice was born in Paris."],
         }
     ]
+
+
+def test_build_linearrag_dataset_deduplicates_and_filters_qrels(tmp_path):
+    example = Example(
+        qid="h2",
+        dataset="hotpotqa",
+        split="train",
+        question="Who is connected to Alice?",
+        answer="Bob",
+        answer_aliases=[],
+        question_type="bridge",
+        hop_count=2,
+        supporting_facts=[
+            SupportingFact(
+                doc_id="doc-a",
+                title="Alice",
+                sent_id=0,
+                text="Alice first sentence.",
+            ),
+            SupportingFact(
+                doc_id="doc-a",
+                title="Alice",
+                sent_id=1,
+                text="Alice duplicate doc sentence.",
+            ),
+            SupportingFact(
+                doc_id=None,
+                title="Missing Doc",
+                sent_id=2,
+                text="Fact without a doc id.",
+            ),
+            SupportingFact(
+                doc_id="doc-b",
+                title="",
+                sent_id=3,
+                text="Fact with an empty title.",
+            ),
+            SupportingFact(
+                doc_id="doc-missing",
+                title="Missing Corpus",
+                sent_id=4,
+                text="Fact with a doc outside corpus.",
+            ),
+        ],
+        evidence_chain=[],
+        context_doc_ids=["doc-a", "doc-b", "doc-missing"],
+        usable_for_sft=True,
+        usable_for_retrieval_eval=True,
+        quality_flags=[],
+        metadata={},
+    )
+    corpus = [
+        CorpusDoc(
+            doc_id="doc-a",
+            dataset="hotpotqa",
+            title="Alice",
+            text="Alice body.",
+            sentences=["Alice body."],
+            source="hotpot_context",
+            metadata={},
+        ),
+        CorpusDoc(
+            doc_id="doc-b",
+            dataset="hotpotqa",
+            title="Bob",
+            text="Bob body.",
+            sentences=["Bob body."],
+            source="hotpot_context",
+            metadata={},
+        ),
+    ]
+
+    build_linearrag_dataset("hotpotqa", [example], corpus, tmp_path)
+
+    qrels = [
+        json.loads(line)
+        for line in (tmp_path / "hotpotqa" / "qrels.jsonl").read_text().splitlines()
+    ]
+    assert qrels == [
+        {
+            "qid": "h2",
+            "gold_doc_ids": ["doc-a", "doc-b", "doc-missing"],
+            "gold_chunk_ids": ["hotpotqa:chunk:0", "hotpotqa:chunk:1"],
+            "gold_titles": ["Alice", "Missing Doc", "Missing Corpus"],
+            "gold_sentences": [
+                "Alice first sentence.",
+                "Alice duplicate doc sentence.",
+                "Fact without a doc id.",
+                "Fact with an empty title.",
+                "Fact with a doc outside corpus.",
+            ],
+        }
+    ]

@@ -10,6 +10,55 @@ def _chunk_id(dataset: str, index: int) -> str:
     return f"{dataset}:chunk:{index}"
 
 
+def _dedupe_stable(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
+
+
+def _build_qrel(
+    example: Example,
+    chunk_id_by_doc_id: dict[str, str],
+) -> dict[str, object]:
+    gold_doc_ids = _dedupe_stable(
+        [
+            fact.doc_id
+            for fact in example.supporting_facts
+            if fact.doc_id is not None and fact.doc_id != ""
+        ]
+    )
+    gold_chunk_ids = _dedupe_stable(
+        [
+            chunk_id_by_doc_id[fact.doc_id]
+            for fact in example.supporting_facts
+            if fact.doc_id is not None
+            and fact.doc_id != ""
+            and fact.doc_id in chunk_id_by_doc_id
+        ]
+    )
+    gold_titles = _dedupe_stable(
+        [
+            fact.title
+            for fact in example.supporting_facts
+            if fact.title is not None and fact.title != ""
+        ]
+    )
+
+    return {
+        "qid": example.qid,
+        "gold_doc_ids": gold_doc_ids,
+        "gold_chunk_ids": gold_chunk_ids,
+        "gold_titles": gold_titles,
+        "gold_sentences": [
+            fact.text for fact in example.supporting_facts if fact.text is not None
+        ],
+    }
+
+
 def build_linearrag_dataset(
     dataset: str,
     examples: list[Example],
@@ -51,26 +100,5 @@ def build_linearrag_dataset(
     )
     write_jsonl(
         output_dir / "qrels.jsonl",
-        [
-            {
-                "qid": example.qid,
-                "gold_doc_ids": [
-                    fact.doc_id
-                    for fact in example.supporting_facts
-                    if fact.doc_id is not None
-                ],
-                "gold_chunk_ids": [
-                    chunk_id_by_doc_id[fact.doc_id]
-                    for fact in example.supporting_facts
-                    if fact.doc_id is not None and fact.doc_id in chunk_id_by_doc_id
-                ],
-                "gold_titles": [fact.title for fact in example.supporting_facts],
-                "gold_sentences": [
-                    fact.text
-                    for fact in example.supporting_facts
-                    if fact.text is not None
-                ],
-            }
-            for example in examples
-        ],
+        [_build_qrel(example, chunk_id_by_doc_id) for example in examples],
     )
