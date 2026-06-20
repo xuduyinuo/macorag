@@ -143,7 +143,7 @@ def _collect_retrieved_chunks(steps: list[dict[str, Any]]) -> set[str]:
 def _get_retrieval_budget(
     trajectory: dict[str, Any],
     qrels: dict[str, Any],
-) -> int | None:
+) -> tuple[int | None, bool]:
     candidates = (
         trajectory.get("retrieval_budget"),
         trajectory.get("metadata", {}).get("retrieval_budget"),
@@ -152,12 +152,41 @@ def _get_retrieval_budget(
     )
     for candidate in candidates:
         if candidate is not None:
-            return int(candidate)
+            if isinstance(candidate, bool):
+                return None, True
+            if isinstance(candidate, int) and candidate >= 0:
+                return candidate, False
+            return None, True
+    return None, False
+
+
+def _safe_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdecimal():
+            return int(stripped)
     return None
 
 
 def _normalized_values(values: list[Any]) -> set[str]:
     return {normalize_key(str(value)) for value in values if str(value).strip()}
+
+
+def _answer_aliases(answer_record: dict[str, Any]) -> list[str]:
+    aliases = answer_record.get("aliases")
+    if aliases is None and "aliases" not in answer_record:
+        aliases = answer_record.get("answer_aliases")
+    if aliases is None:
+        return []
+    if isinstance(aliases, str):
+        return [aliases]
+    if isinstance(aliases, list):
+        return [str(alias) for alias in aliases if alias is not None]
+    return []
 
 
 def _gold_chunk_ids_from_qrels_and_meta(
@@ -172,8 +201,9 @@ def _gold_chunk_ids_from_qrels_and_meta(
     gold_titles = _normalized_values(qrels.get("gold_titles", []))
     gold_sentences = _normalized_values(qrels.get("gold_sentences", []))
     gold_sentence_indices = {
-        int(index)
+        parsed_index
         for index in qrels.get("gold_sentence_indices", qrels.get("gold_sent_ids", []))
+        if (parsed_index := _safe_int(index)) is not None
     }
 
     for chunk_id, meta in chunk_meta_by_chunk_id.items():
@@ -187,7 +217,8 @@ def _gold_chunk_ids_from_qrels_and_meta(
             gold_chunk_ids.add(str(chunk_id))
 
         sentence_index = meta.get("sentence_index", meta.get("sent_id"))
-        if sentence_index is not None and int(sentence_index) in gold_sentence_indices:
+        parsed_sentence_index = _safe_int(sentence_index)
+        if parsed_sentence_index is not None and parsed_sentence_index in gold_sentence_indices:
             gold_chunk_ids.add(str(chunk_id))
 
     return gold_chunk_ids
@@ -222,7 +253,9 @@ def evaluate_trajectory(
     if retrieval_count == 0:
         reasons.append("missing_retrieval")
 
-    retrieval_budget = _get_retrieval_budget(trajectory, qrels)
+    retrieval_budget, invalid_retrieval_budget = _get_retrieval_budget(trajectory, qrels)
+    if invalid_retrieval_budget:
+        reasons.append("invalid_retrieval_budget")
     if retrieval_budget is not None and retrieval_count > retrieval_budget:
         reasons.append("retrieval_budget_exceeded")
 
@@ -261,8 +294,7 @@ def evaluate_trajectory(
 
         prediction = final_answer.get("answer")
         gold_answer = answer_record.get("answer")
-        aliases = list(answer_record.get("aliases", answer_record.get("answer_aliases", [])))
-        if not _contains_answer(prediction, gold_answer, aliases):
+        if not _contains_answer(prediction, gold_answer, _answer_aliases(answer_record)):
             reasons.append("answer_mismatch")
 
     mapped_chunk_ids = accepted_chunks | supporting_chunks | retrieved_chunks
