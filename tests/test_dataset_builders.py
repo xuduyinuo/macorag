@@ -7,9 +7,10 @@ from macorag.dataset_builders import (
 
 def test_musique_answerable_rows_build_examples_and_corpus():
     row = {
-        "id": "m1",
+        "id": "2hop__1_2",
         "question": "Where was Alice's birthplace founded?",
         "answer": "France",
+        "answer_aliases": ["alias"],
         "answerable": True,
         "paragraphs": [
             {
@@ -46,11 +47,15 @@ def test_musique_answerable_rows_build_examples_and_corpus():
 
     assert report["errors"] == []
     assert len(report["examples"]) == 1
-    assert report["examples"][0].qid == "m1"
+    assert report["examples"][0].qid == "2hop__1_2"
     assert report["examples"][0].hop_count == 2
+    assert report["examples"][0].answer_aliases == ["alias"]
+    assert report["examples"][0].metadata["answerable"] is True
     assert len(report["examples"][0].supporting_facts) == 2
     assert len(report["examples"][0].evidence_chain) == 2
     assert len(report["corpus"]) == 3
+    assert all(doc.source == "musique_context" for doc in report["corpus"])
+    assert any("2hop__1_2" in doc.metadata["linked_qids"] for doc in report["corpus"])
     assert report["examples"][0].usable_for_sft is True
 
 

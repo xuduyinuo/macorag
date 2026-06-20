@@ -120,6 +120,7 @@ def build_musique_canonical_from_rows(
         if row.get("answerable") is False:
             continue
 
+        qid = str(row.get("id") or row.get("qid"))
         paragraphs = list(row.get("paragraphs", []))
         paragraph_doc_ids: list[str] = []
         doc_ids_by_idx: dict[int, str] = {}
@@ -140,9 +141,15 @@ def build_musique_canonical_from_rows(
                     title=title,
                     text=text,
                     sentences=[text] if text else [],
-                    source="musique",
-                    metadata={},
+                    source="musique_context",
+                    metadata={"linked_qids": []},
                 )
+            linked_qids = corpus_by_doc_id[doc_id].metadata.setdefault(
+                "linked_qids",
+                [],
+            )
+            if qid not in linked_qids:
+                linked_qids.append(qid)
 
         supporting_facts: list[SupportingFact] = []
         evidence_chain: list[EvidenceStep] = []
@@ -183,12 +190,12 @@ def build_musique_canonical_from_rows(
         is_usable = bool(answer and supporting_facts)
         report["examples"].append(
             Example(
-                qid=str(row.get("id") or row.get("qid")),
+                qid=qid,
                 dataset="musique",
                 split=split,
                 question=str(row.get("question") or ""),
                 answer=answer,
-                answer_aliases=[],
+                answer_aliases=list(row.get("answer_aliases", [])),
                 question_type=row.get("type"),
                 hop_count=len(evidence_chain),
                 supporting_facts=supporting_facts,
@@ -197,7 +204,7 @@ def build_musique_canonical_from_rows(
                 usable_for_sft=is_usable,
                 usable_for_retrieval_eval=is_usable,
                 quality_flags=[],
-                metadata={},
+                metadata={"answerable": True},
             )
         )
 
