@@ -52,28 +52,19 @@ def _find_final_answer(steps: list[dict[str, Any]]) -> dict[str, Any] | None:
 def _is_positive_int(value: Any) -> bool:
     if isinstance(value, bool):
         return False
-    if isinstance(value, int):
-        return value > 0
-    if isinstance(value, str):
-        stripped = value.strip()
-        return stripped.isdecimal() and int(stripped) > 0
-    return False
+    return isinstance(value, int) and value > 0
 
 
 def _has_chunk_identifier(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
     if isinstance(value, dict):
-        chunk_id = value.get("chunk_id", value.get("id"))
+        chunk_id = value.get("chunk_id")
         return chunk_id is not None and str(chunk_id).strip() != ""
     return False
 
 
 def _chunk_id_from_value(value: Any) -> str | None:
-    if isinstance(value, str):
-        return value.strip() or None
     if isinstance(value, dict):
-        chunk_id = value.get("chunk_id", value.get("id"))
+        chunk_id = value.get("chunk_id")
         if chunk_id is not None and str(chunk_id).strip():
             return str(chunk_id)
     return None
