@@ -62,6 +62,9 @@ def _sequence_struct_to_pairs(value: Any) -> list[tuple[str, int]]:
     pairs: list[tuple[str, int]] = []
     for item in value or []:
         item = _to_py(item)
+        if isinstance(item, dict):
+            pairs.append((str(item.get("title") or ""), int(item["sent_id"])))
+            continue
         if len(item) >= 2:
             pairs.append((str(_to_py(item[0])), int(_to_py(item[1]))))
     return pairs
@@ -79,6 +82,13 @@ def _context_sentence_lookup(context: Any) -> dict[tuple[str, int], str]:
         return lookup
 
     for item in context or []:
+        item = _to_py(item)
+        if isinstance(item, dict):
+            title = item.get("title") or ""
+            sentences = item.get("sentences", [])
+            for sent_id, sentence in enumerate(sentences):
+                lookup[(str(title), sent_id)] = str(sentence)
+            continue
         if len(item) < 2:
             continue
         title, sentences = item[0], item[1]
@@ -122,7 +132,16 @@ def _context_doc_ids(dataset: str, context: Any) -> list[str]:
             strict=False,
         )
     else:
-        items = ((item[0], item[1]) for item in context or [] if len(item) >= 2)
+        items = (
+            (
+                item.get("title", ""),
+                item.get("sentences", []),
+            )
+            if isinstance(item, dict)
+            else (item[0], item[1])
+            for item in context or []
+            if isinstance(item, dict) or len(item) >= 2
+        )
 
     for title, sentences in items:
         text = normalize_text(" ".join(str(sentence) for sentence in sentences))

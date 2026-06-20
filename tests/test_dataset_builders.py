@@ -114,6 +114,45 @@ def test_hotpot_row_accepts_pyarrow_struct_scalars():
     assert example.supporting_facts[0].text == "Alice was born in Paris."
 
 
+def test_hotpot_row_accepts_pyarrow_list_struct_scalars():
+    pa = pytest.importorskip("pyarrow")
+    supporting_facts = pa.scalar(
+        [{"title": "Alice", "sent_id": 0}],
+        type=pa.list_(
+            pa.struct(
+                [
+                    ("title", pa.string()),
+                    ("sent_id", pa.int64()),
+                ]
+            )
+        ),
+    )
+    context = pa.scalar(
+        [{"title": "Alice", "sentences": ["Alice was born in Paris."]}],
+        type=pa.list_(
+            pa.struct(
+                [
+                    ("title", pa.string()),
+                    ("sentences", pa.list_(pa.string())),
+                ]
+            )
+        ),
+    )
+    row = {
+        "id": "h_arrow_list",
+        "question": "Where was Alice born?",
+        "answer": "Paris",
+        "type": "bridge",
+        "level": "easy",
+        "supporting_facts": supporting_facts,
+        "context": context,
+    }
+
+    example = build_hotpot_example_from_row(row, split="train")
+
+    assert example.supporting_facts[0].text == "Alice was born in Paris."
+
+
 def test_hotpot_blank_answer_is_not_usable():
     row = {
         "id": "h_blank",
