@@ -1,3 +1,5 @@
+import pytest
+
 from macorag.dataset_builders import (
     build_2wiki_example_from_row,
     build_hotpot_example_from_row,
@@ -75,6 +77,92 @@ def test_hotpot_row_maps_supporting_facts():
     assert example.dataset == "hotpotqa"
     assert example.supporting_facts[0].text == "Alice was born in Paris."
     assert example.metadata["level"] == "easy"
+
+
+def test_hotpot_row_accepts_pyarrow_struct_scalars():
+    pa = pytest.importorskip("pyarrow")
+    supporting_facts = pa.scalar(
+        {"title": ["Alice"], "sent_id": [0]},
+        type=pa.struct(
+            [
+                ("title", pa.list_(pa.string())),
+                ("sent_id", pa.list_(pa.int64())),
+            ]
+        ),
+    )
+    context = pa.scalar(
+        {"title": ["Alice"], "sentences": [["Alice was born in Paris."]]},
+        type=pa.struct(
+            [
+                ("title", pa.list_(pa.string())),
+                ("sentences", pa.list_(pa.list_(pa.string()))),
+            ]
+        ),
+    )
+    row = {
+        "id": "h_arrow",
+        "question": "Where was Alice born?",
+        "answer": "Paris",
+        "type": "bridge",
+        "level": "easy",
+        "supporting_facts": supporting_facts,
+        "context": context,
+    }
+
+    example = build_hotpot_example_from_row(row, split="train")
+
+    assert example.supporting_facts[0].text == "Alice was born in Paris."
+
+
+def test_hotpot_blank_answer_is_not_usable():
+    row = {
+        "id": "h_blank",
+        "question": "Where was Alice born?",
+        "answer": " \n\t ",
+        "type": "bridge",
+        "level": "easy",
+        "supporting_facts": {"title": ["Alice"], "sent_id": [0]},
+        "context": {"title": ["Alice"], "sentences": [["Alice was born in Paris."]]},
+    }
+
+    example = build_hotpot_example_from_row(row, split="train")
+
+    assert example.answer is None
+    assert example.usable_for_sft is False
+    assert example.usable_for_retrieval_eval is False
+
+
+def test_musique_duplicate_paragraph_keeps_linked_qids_unique():
+    row = {
+        "id": "2hop__1_2",
+        "question": "Where is Paris?",
+        "answer": "France",
+        "answerable": True,
+        "paragraphs": [
+            {
+                "idx": 5,
+                "title": "Paris",
+                "paragraph_text": "Paris is the capital of France.",
+            },
+            {
+                "idx": 6,
+                "title": "Paris",
+                "paragraph_text": "Paris is the capital of France.",
+            },
+        ],
+        "question_decomposition": [
+            {
+                "question": "Where is Paris?",
+                "answer": "France",
+                "paragraph_support_idx": 5,
+            }
+        ],
+    }
+
+    report = build_musique_canonical_from_rows([row], split="train")
+
+    assert len(report["corpus"]) == 1
+    assert report["corpus"][0].metadata["linked_qids"] == ["2hop__1_2"]
 
 
 def test_2wiki_row_maps_evidences_to_chain():

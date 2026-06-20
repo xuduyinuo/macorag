@@ -10,16 +10,35 @@ def _empty_report() -> dict[str, list[Any]]:
     return {"examples": [], "corpus": [], "errors": []}
 
 
+def _to_py(value: Any) -> Any:
+    if hasattr(value, "as_py"):
+        return _to_py(value.as_py())
+    if isinstance(value, dict):
+        return {key: _to_py(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_py(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_py(item) for item in value)
+    return value
+
+
+def _normalized_answer(value: Any) -> str | None:
+    normalized = normalize_text(str(_to_py(value) or ""))
+    return normalized or None
+
+
 def _musique_doc_id(title: str, text: str) -> str:
     key = f"{normalize_key(title)} {normalize_text(text)}"
     return f"musique:{sha1_text(key)}"
 
 
 def _paragraph_title(paragraph: dict[str, Any]) -> str:
+    paragraph = _to_py(paragraph)
     return str(paragraph.get("title") or "")
 
 
 def _paragraph_text(paragraph: dict[str, Any]) -> str:
+    paragraph = _to_py(paragraph)
     return normalize_text(
         str(paragraph.get("paragraph_text") or paragraph.get("text") or "")
     )
@@ -31,6 +50,7 @@ def _doc_id(dataset: str, title: str, text: str) -> str:
 
 
 def _sequence_struct_to_pairs(value: Any) -> list[tuple[str, int]]:
+    value = _to_py(value)
     if isinstance(value, dict):
         titles = value.get("title", [])
         sent_ids = value.get("sent_id", [])
@@ -41,12 +61,14 @@ def _sequence_struct_to_pairs(value: Any) -> list[tuple[str, int]]:
 
     pairs: list[tuple[str, int]] = []
     for item in value or []:
+        item = _to_py(item)
         if len(item) >= 2:
-            pairs.append((str(item[0]), int(item[1])))
+            pairs.append((str(_to_py(item[0])), int(_to_py(item[1]))))
     return pairs
 
 
 def _context_sentence_lookup(context: Any) -> dict[tuple[str, int], str]:
+    context = _to_py(context)
     lookup: dict[tuple[str, int], str] = {}
     if isinstance(context, dict):
         titles = context.get("title", [])
@@ -71,6 +93,8 @@ def _build_supporting_facts(
     supporting_facts: Any,
     context: Any,
 ) -> list[SupportingFact]:
+    supporting_facts = _to_py(supporting_facts)
+    context = _to_py(context)
     sentence_lookup = _context_sentence_lookup(context)
     facts: list[SupportingFact] = []
     for title, sent_id in _sequence_struct_to_pairs(supporting_facts):
@@ -88,6 +112,7 @@ def _build_supporting_facts(
 
 
 def _context_doc_ids(dataset: str, context: Any) -> list[str]:
+    context = _to_py(context)
     doc_ids: list[str] = []
     seen: set[str] = set()
     if isinstance(context, dict):
@@ -117,15 +142,17 @@ def build_musique_canonical_from_rows(
     corpus_by_doc_id: dict[str, CorpusDoc] = {}
 
     for row in rows:
-        if row.get("answerable") is False:
+        row = _to_py(row)
+        answerable = _to_py(row.get("answerable"))
+        if answerable is False:
             continue
 
         qid = str(row.get("id") or row.get("qid"))
-        paragraphs = list(row.get("paragraphs", []))
+        paragraphs = [_to_py(paragraph) for paragraph in row.get("paragraphs", [])]
         paragraph_doc_ids: list[str] = []
         doc_ids_by_idx: dict[int, str] = {}
         paragraphs_by_idx = {
-            int(paragraph["idx"]): paragraph for paragraph in paragraphs
+            int(_to_py(paragraph["idx"])): paragraph for paragraph in paragraphs
         }
         for paragraph in paragraphs:
             title = _paragraph_title(paragraph)
@@ -133,7 +160,7 @@ def build_musique_canonical_from_rows(
             doc_id = _musique_doc_id(title, text)
             paragraph_doc_ids.append(doc_id)
             if "idx" in paragraph:
-                doc_ids_by_idx[int(paragraph["idx"])] = doc_id
+                doc_ids_by_idx[int(_to_py(paragraph["idx"]))] = doc_id
             if doc_id not in corpus_by_doc_id:
                 corpus_by_doc_id[doc_id] = CorpusDoc(
                     doc_id=doc_id,
@@ -154,10 +181,10 @@ def build_musique_canonical_from_rows(
         supporting_facts: list[SupportingFact] = []
         evidence_chain: list[EvidenceStep] = []
         for step_index, decomposition in enumerate(
-            row.get("question_decomposition", []),
+            [_to_py(item) for item in row.get("question_decomposition", [])],
             start=1,
         ):
-            support_idx = decomposition.get("paragraph_support_idx")
+            support_idx = _to_py(decomposition.get("paragraph_support_idx"))
             support_doc_id = None
             support_title = None
             if support_idx is not None and int(support_idx) in paragraphs_by_idx:
@@ -186,7 +213,7 @@ def build_musique_canonical_from_rows(
                 )
             )
 
-        answer = row.get("answer")
+        answer = _normalized_answer(row.get("answer"))
         is_usable = bool(answer and supporting_facts)
         report["examples"].append(
             Example(
@@ -195,7 +222,7 @@ def build_musique_canonical_from_rows(
                 split=split,
                 question=str(row.get("question") or ""),
                 answer=answer,
-                answer_aliases=list(row.get("answer_aliases", [])),
+                answer_aliases=list(_to_py(row.get("answer_aliases", [])) or []),
                 question_type=row.get("type"),
                 hop_count=len(evidence_chain),
                 supporting_facts=supporting_facts,
@@ -213,19 +240,21 @@ def build_musique_canonical_from_rows(
 
 
 def build_hotpot_example_from_row(row: dict[str, Any], *, split: str) -> Example:
+    row = _to_py(row)
+    answer = _normalized_answer(row.get("answer"))
     supporting_facts = _build_supporting_facts(
         dataset="hotpotqa",
         supporting_facts=row.get("supporting_facts", []),
         context=row.get("context", []),
     )
-    is_usable = bool(row.get("answer") and supporting_facts)
+    is_usable = bool(answer and supporting_facts)
     return Example(
         qid=str(row.get("id") or row.get("_id") or row.get("qid")),
         dataset="hotpotqa",
         split=split,
         question=str(row.get("question") or ""),
-        answer=row.get("answer"),
-        answer_aliases=list(row.get("answer_aliases", [])),
+        answer=answer,
+        answer_aliases=list(_to_py(row.get("answer_aliases", [])) or []),
         question_type=row.get("type"),
         hop_count=2,
         supporting_facts=supporting_facts,
@@ -239,7 +268,8 @@ def build_hotpot_example_from_row(row: dict[str, Any], *, split: str) -> Example
 
 
 def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
-    answer = normalize_text(str(row.get("answer") or ""))
+    row = _to_py(row)
+    answer = _normalized_answer(row.get("answer"))
     supporting_facts = _build_supporting_facts(
         dataset="2wiki",
         supporting_facts=row.get("supporting_facts", []),
@@ -248,13 +278,13 @@ def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
     evidence_chain = [
         EvidenceStep(
             step=step,
-            sub_question=f"{evidence[0]} {evidence[1]} ?",
-            answer=str(evidence[2]),
+            sub_question=f"{_to_py(evidence[0])} {_to_py(evidence[1])} ?",
+            answer=str(_to_py(evidence[2])),
             support_doc_id=None,
-            support_title=str(evidence[0]),
+            support_title=str(_to_py(evidence[0])),
             support_sent_ids=[],
         )
-        for step, evidence in enumerate(row.get("evidences", []), start=1)
+        for step, evidence in enumerate(_to_py(row.get("evidences", [])), start=1)
         if len(evidence) >= 3
     ]
     is_usable = bool(answer and (supporting_facts or evidence_chain))
@@ -263,8 +293,8 @@ def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
         dataset="2wiki",
         split=split,
         question=str(row.get("question") or ""),
-        answer=row.get("answer"),
-        answer_aliases=list(row.get("answer_aliases", [])),
+        answer=answer,
+        answer_aliases=list(_to_py(row.get("answer_aliases", [])) or []),
         question_type=row.get("type"),
         hop_count=2,
         supporting_facts=supporting_facts,
@@ -273,5 +303,5 @@ def build_2wiki_example_from_row(row: dict[str, Any], *, split: str) -> Example:
         usable_for_sft=is_usable,
         usable_for_retrieval_eval=is_usable,
         quality_flags=[],
-        metadata={"evidences": row.get("evidences", [])},
+        metadata={"evidences": _to_py(row.get("evidences", []))},
     )
