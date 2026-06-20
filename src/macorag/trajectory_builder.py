@@ -19,6 +19,10 @@ VISIBLE_STATE_KEYS = (
 )
 
 
+class TrajectoryBuildError(ValueError):
+    pass
+
+
 def _prompt_from_state(state: dict[str, Any]) -> str:
     visible_state = {
         key: state[key] for key in VISIBLE_STATE_KEYS if key in state
@@ -40,6 +44,25 @@ def _raw_tag(tag: str, payload: dict[str, Any]) -> str:
     return f"<{tag}>{json.dumps(payload, ensure_ascii=False, sort_keys=True)}</{tag}>"
 
 
+def _retrieval_top_k(retrieval_action: dict[str, Any]) -> int:
+    if "top_k" not in retrieval_action:
+        return 5
+
+    top_k = retrieval_action["top_k"]
+    if isinstance(top_k, bool) or not isinstance(top_k, int):
+        raise TrajectoryBuildError("retrieval top_k must be a positive integer")
+    if top_k <= 0:
+        raise TrajectoryBuildError("retrieval top_k must be greater than 0")
+    return top_k
+
+
+def _copy_list_field(payload: dict[str, Any], key: str) -> Any:
+    value = payload.get(key, [])
+    if isinstance(value, list):
+        return list(value)
+    return value
+
+
 def build_one_trajectory(
     qid: str,
     env: InMemoryRetrievalEnv,
@@ -51,11 +74,19 @@ def build_one_trajectory(
 
     retrieval_action = parsed["retrieval"]
     query = str(retrieval_action["query"])
-    top_k = int(retrieval_action.get("top_k", 5))
+    top_k = _retrieval_top_k(retrieval_action)
     observation_list = env.step(query, top_k=top_k)
 
     update_action = parsed["update-evidence"]
     answer_action = parsed["answer"]
+    accepted_chunk_ids = _copy_list_field(update_action, "accepted_chunk_ids")
+    rejected_chunk_ids = _copy_list_field(update_action, "rejected_chunk_ids")
+    added_evidence = (
+        list(accepted_chunk_ids)
+        if isinstance(accepted_chunk_ids, list)
+        else accepted_chunk_ids
+    )
+    supporting_chunk_ids = _copy_list_field(answer_action, "supporting_chunk_ids")
 
     return {
         "qid": qid,
@@ -91,18 +122,12 @@ def build_one_trajectory(
                 "raw_text": _raw_tag("update-evidence", update_action),
                 "action": {
                     "type": "update_evidence",
-                    "accepted_chunk_ids": update_action.get(
-                        "accepted_chunk_ids", []
-                    ),
-                    "rejected_chunk_ids": update_action.get(
-                        "rejected_chunk_ids", []
-                    ),
+                    "accepted_chunk_ids": accepted_chunk_ids,
+                    "rejected_chunk_ids": rejected_chunk_ids,
                     "reason": update_action.get("reason"),
                 },
                 "state_delta": {
-                    "added_evidence": update_action.get(
-                        "accepted_chunk_ids", []
-                    ),
+                    "added_evidence": added_evidence,
                 },
             },
             {
@@ -112,9 +137,7 @@ def build_one_trajectory(
                 "action": {
                     "type": "final_answer",
                     "answer": answer_action.get("answer"),
-                    "supporting_chunk_ids": answer_action.get(
-                        "supporting_chunk_ids", []
-                    ),
+                    "supporting_chunk_ids": supporting_chunk_ids,
                 },
             },
         ],
