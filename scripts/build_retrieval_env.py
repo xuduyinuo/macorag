@@ -13,8 +13,8 @@ if str(SRC_ROOT) not in sys.path:
 
 from data_processing.process_datasets import DATASETS as PROCESS_DATASETS
 from retrieval_env import (
+    RETRIEVAL_DEFAULT_ROOT,
     RETRIEVAL_DEFAULT_SPLITS,
-    PROCESSED_DATASETS,
     build_linearrag_assets,
     build_linear_rag_index,
     query_linear_rag,
@@ -31,18 +31,19 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--processed-root",
         default="data/processed",
-        help="Processed directory containing corpus.jsonl and examples.*.jsonl.",
+        help="Processed directory containing corpus.jsonl and split files "
+        "(examples.<split>.jsonl or <dataset>_<split>.jsonl).",
     )
     build.add_argument(
         "--retrieval-root",
-        default="linearrag_dataset",
+        default=RETRIEVAL_DEFAULT_ROOT,
         help="Output directory for linearrag-style files and index cache.",
     )
     build.add_argument(
         "--datasets",
         nargs="+",
         choices=PROCESS_DATASETS,
-        default=list(PROCESSED_DATASETS),
+        default=list(PROCESS_DATASETS),
         help="Datasets to process.",
     )
     build.add_argument(
@@ -65,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     query.add_argument("--dataset", choices=PROCESS_DATASETS, required=True)
     query.add_argument(
         "--retrieval-root",
-        default="linearrag_dataset",
+        default=RETRIEVAL_DEFAULT_ROOT,
         help="Directory where linearrag-style files and index were built.",
     )
     query.add_argument("--embedding-model", default="sentence-transformers/all-mpnet-base-v2")

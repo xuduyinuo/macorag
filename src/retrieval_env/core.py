@@ -11,6 +11,7 @@ from data_processing.io_utils import read_jsonl, write_json, write_jsonl
 
 PROCESSED_DATASETS = ("2wiki", "hotpotqa", "musique")
 RETRIEVAL_DEFAULT_SPLITS = ("train", "dev")
+RETRIEVAL_DEFAULT_ROOT = "data/retrieval_env"
 
 
 @dataclass(frozen=True)
@@ -29,6 +30,43 @@ def _retrieval_dataset_dir(retrieval_root: str | Path, dataset: str) -> Path:
     return Path(retrieval_root) / dataset
 
 
+def _candidate_example_paths(dataset_dir: Path, dataset: str, split: str) -> list[Path]:
+    candidates = [
+        dataset_dir / f"examples.{split}.jsonl",
+        dataset_dir / f"{dataset}_{split}.jsonl",
+    ]
+    # Backward-compatible fallback if someone renames split file as just `<split>.jsonl`.
+    candidates.append(dataset_dir / f"{split}.jsonl")
+    return candidates
+
+
+def _resolve_example_path(dataset_dir: Path, dataset: str, split: str) -> Path:
+    for path in _candidate_example_paths(dataset_dir, dataset, split):
+        if path.exists():
+            return path
+    expected = [str(path) for path in _candidate_example_paths(dataset_dir, dataset, split)]
+    raise FileNotFoundError(
+        f"Could not find split file for {dataset}/{split}. Tried: {', '.join(expected)}"
+    )
+
+
+def _chunk_text_from_row(row: dict[str, Any]) -> str:
+    chunk_text = str(row.get("text", "")).strip()
+    if chunk_text:
+        return chunk_text
+
+    sentences = row.get("sentences", [])
+    if isinstance(sentences, list):
+        sent_texts = [
+            str(item.get("text", "")).strip()
+            for item in sentences
+            if isinstance(item, dict) and item.get("text") is not None
+        ]
+        if sent_texts:
+            return "\n".join(sent_texts)
+    return ""
+
+
 def build_linearrag_assets(
     *,
     processed_root: str | Path,
@@ -36,12 +74,7 @@ def build_linearrag_assets(
     datasets: list[str],
     splits: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Build LinearRAG-style `questions.json` and `chunks.json` from processed data.
-
-    Args:
-        processed_root: Directory containing `data/processed/<dataset>/...`.
-        retrieval_root: Directory for generated compatibility files.
-    """
+    """Build LinearRAG-style `questions.json` and `chunks.json` from processed data."""
     summary: dict[str, dict[str, Any]] = {}
     for dataset in datasets:
         source_dir = _dataset_dir(processed_root, dataset)
@@ -52,7 +85,7 @@ def build_linearrag_assets(
         chunks: list[str] = []
         chunk_metadata: list[dict[str, Any]] = []
         for chunk_idx, row in enumerate(corpus_records):
-            chunk_text = str(row.get("text", "")).strip()
+            chunk_text = _chunk_text_from_row(row)
             title = str(row.get("title") or "").strip()
             chunk = f"{title}\n{chunk_text}" if title else chunk_text
             chunks.append(chunk)
@@ -68,7 +101,7 @@ def build_linearrag_assets(
 
         questions: list[dict[str, Any]] = []
         for split in splits:
-            example_path = source_dir / f"examples.{split}.jsonl"
+            example_path = _resolve_example_path(source_dir, dataset, split)
             for example in read_jsonl(example_path):
                 questions.append(
                     {
@@ -90,6 +123,9 @@ def build_linearrag_assets(
             "questions": len(questions),
             "chunks": len(chunks),
             "chunk_metadata": str(target_dir / "chunk_metadata.jsonl"),
+            "example_files_used": [
+                str(_resolve_example_path(source_dir, dataset, split)) for split in splits
+            ],
         }
 
     return summary
@@ -120,7 +156,7 @@ def _load_linearrag_modules() -> tuple[Any, Any]:
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Cannot import LinearRAG modules. Please install LinearRAG dependencies "
-                "in this environment, e.g. pip install -r LinearRAG/requirements.txt. "
+                "in this environment, e.g. pip install -r LinearRAG/requirements.txt."
             ) from exc
 
         return LinearRAGConfig, LinearRAG
