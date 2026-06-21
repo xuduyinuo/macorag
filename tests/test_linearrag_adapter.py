@@ -68,6 +68,7 @@ def test_build_linearrag_dataset_writes_questions_chunks_and_qrels(tmp_path):
             "doc_id": "doc-a",
             "title": "Alice",
             "text": "Alice was born in Paris.",
+            "sentences": [{"sent_id": 0, "text": "Alice was born in Paris."}],
             "dataset": "hotpotqa",
             "source": "hotpot_context",
         }

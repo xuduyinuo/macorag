@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -13,7 +14,6 @@ from macorag.dataset_builders import (
 )
 from macorag.io_utils import normalize_key, normalize_text, sha1_text, write_json, write_jsonl
 from macorag.linearrag_adapter import build_linearrag_dataset
-from macorag.sampling import sample_examples
 from macorag.schemas import CorpusDoc, Example
 
 
@@ -28,6 +28,24 @@ class DatasetProcessingError(RuntimeError):
 def _doc_id(dataset: str, title: str, text: str) -> str:
     key = f"{normalize_key(title)} {normalize_text(text)}"
     return f"{dataset}:{sha1_text(key)}"
+
+
+def _sentence_records(sentences: list[str]) -> list[dict[str, Any]]:
+    return [
+        {"sent_id": sent_id, "text": sentence}
+        for sent_id, sentence in enumerate(sentences)
+    ]
+
+
+def _corpus_record(dataset: str, index: int, doc: CorpusDoc) -> dict[str, Any]:
+    return {
+        "chunk_id": f"{dataset}:chunk:{index}",
+        "doc_id": doc.doc_id,
+        "dataset": doc.dataset,
+        "title": doc.title,
+        "text": doc.text,
+        "sentences": _sentence_records(doc.sentences),
+    }
 
 
 def _jsonl_rows(path: Path) -> list[dict[str, Any]]:
@@ -146,6 +164,33 @@ def _context_corpus(dataset: str, rows: list[dict[str, Any]]) -> list[CorpusDoc]
     return list(corpus_by_doc_id.values())
 
 
+def _supporting_fact_pairs(row: dict[str, Any]) -> list[tuple[str, int]]:
+    supporting_facts = row.get("supporting_facts") or {}
+    if isinstance(supporting_facts, dict):
+        return [
+            (str(title), int(sent_id))
+            for title, sent_id in zip(
+                supporting_facts.get("title", []) or [],
+                supporting_facts.get("sent_id", []) or [],
+                strict=False,
+            )
+            if str(title).strip()
+        ]
+
+    pairs: list[tuple[str, int]] = []
+    for item in supporting_facts or []:
+        if isinstance(item, dict):
+            title = str(item.get("title") or "")
+            sent_id = item.get("sent_id")
+            if title.strip() and sent_id is not None:
+                pairs.append((title, int(sent_id)))
+        elif len(item) >= 2:
+            title = str(item[0])
+            if title.strip():
+                pairs.append((title, int(item[1])))
+    return pairs
+
+
 def _needed_context_titles(rows: list[dict[str, Any]]) -> set[str]:
     titles: set[str] = set()
     for row in rows:
@@ -153,6 +198,8 @@ def _needed_context_titles(rows: list[dict[str, Any]]) -> set[str]:
         for title in context.get("title", []) or []:
             if str(title).strip():
                 titles.add(str(title))
+        for title, _sent_id in _supporting_fact_pairs(row):
+            titles.add(title)
     return titles
 
 
@@ -198,8 +245,20 @@ def _hotpot_beir_corpus_by_title(data_root: Path, titles: set[str]) -> dict[str,
         title = str(row.title or "")
         if title in titles and title not in by_title:
             text = normalize_text(str(row.text or ""))
-            by_title[title] = [text] if text else []
+            by_title[title] = _split_sentences(text)
     return by_title
+
+
+def _split_sentences(text: str) -> list[str]:
+    text = normalize_text(text)
+    if not text:
+        return []
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", text)
+        if sentence.strip()
+    ]
+    return sentences or [text]
 
 
 def _fill_missing_context_sentences(
@@ -207,23 +266,57 @@ def _fill_missing_context_sentences(
     rows: list[dict[str, Any]],
     data_root: Path,
 ) -> None:
-    missing_rows = [
-        row
-        for row in rows
-        if (row.get("context") or {}).get("sentences") is None
-    ]
-    if not missing_rows:
+    rows_needing_external = []
+    for row in rows:
+        context = row.get("context") or {}
+        titles = [str(title) for title in context.get("title", []) or []]
+        title_set = set(titles)
+        missing_support_titles = [
+            title for title, _sent_id in _supporting_fact_pairs(row)
+            if title not in title_set
+        ]
+        if context.get("sentences") is None or missing_support_titles:
+            rows_needing_external.append(row)
+
+    if not rows_needing_external:
         return
 
     corpus_by_title = _external_corpus_by_title(
         dataset,
         data_root,
-        _needed_context_titles(missing_rows),
+        _needed_context_titles(rows_needing_external),
     )
-    for row in missing_rows:
+    for row in rows_needing_external:
         context = row.get("context") or {}
-        titles = context.get("title", []) or []
-        context["sentences"] = [corpus_by_title.get(str(title), []) for title in titles]
+        titles = [str(title) for title in context.get("title", []) or []]
+        sentence_groups = context.get("sentences")
+        if sentence_groups is None:
+            sentence_groups = [corpus_by_title.get(title, []) for title in titles]
+        else:
+            sentence_groups = [
+                [str(sentence) for sentence in sentences]
+                for sentences in sentence_groups
+            ]
+
+        while len(sentence_groups) < len(titles):
+            sentence_groups.append([])
+
+        for index, title in enumerate(titles):
+            if not sentence_groups[index] and title in corpus_by_title:
+                sentence_groups[index] = corpus_by_title[title]
+
+        existing_titles = set(titles)
+        for title, _sent_id in _supporting_fact_pairs(row):
+            if title in existing_titles:
+                continue
+            external_sentences = corpus_by_title.get(title)
+            if external_sentences:
+                titles.append(title)
+                sentence_groups.append(external_sentences)
+                existing_titles.add(title)
+
+        context["title"] = titles
+        context["sentences"] = sentence_groups
         row["context"] = context
 
     if rows and all(not (row.get("context") or {}).get("sentences") for row in rows):
@@ -253,7 +346,51 @@ def _write_canonical(
             dataset_dir / f"examples.{split}.jsonl",
             [example.to_dict() for example in examples],
         )
-    write_jsonl(dataset_dir / "corpus.jsonl", [doc.to_dict() for doc in corpus])
+    write_jsonl(
+        dataset_dir / "corpus.jsonl",
+        [_corpus_record(dataset, index, doc) for index, doc in enumerate(corpus)],
+    )
+
+
+def _align_examples_to_corpus(examples: list[Example], corpus: list[CorpusDoc]) -> None:
+    corpus_by_title: dict[str, CorpusDoc] = {}
+    corpus_ids = {doc.doc_id for doc in corpus}
+    for doc in corpus:
+        corpus_by_title.setdefault(doc.title, doc)
+
+    for example in examples:
+        quality_flags = set(example.quality_flags)
+        for fact in example.supporting_facts:
+            doc = corpus_by_title.get(fact.title)
+            if doc is None:
+                quality_flags.add("support_doc_not_in_corpus")
+                continue
+
+            fact.doc_id = doc.doc_id
+            if fact.sent_id is not None and fact.text is None:
+                if 0 <= fact.sent_id < len(doc.sentences):
+                    fact.text = doc.sentences[fact.sent_id]
+            if fact.text is None:
+                quality_flags.add("missing_supporting_fact_text")
+
+        doc_ids = [
+            doc.doc_id
+            for fact in example.supporting_facts
+            if (doc := corpus_by_title.get(fact.title)) is not None
+        ]
+        for doc_id in example.context_doc_ids:
+            if doc_id in corpus_ids and doc_id not in doc_ids:
+                doc_ids.append(doc_id)
+        example.context_doc_ids = list(dict.fromkeys(doc_ids))
+
+        has_complete_support = bool(example.supporting_facts) and all(
+            fact.doc_id in corpus_ids and fact.text is not None
+            for fact in example.supporting_facts
+        )
+        is_usable = bool(example.answer and has_complete_support)
+        example.usable_for_sft = is_usable
+        example.usable_for_retrieval_eval = is_usable
+        example.quality_flags = sorted(quality_flags)
 
 
 def _process_musique(
@@ -335,8 +472,9 @@ def _process_qa_parquet_dataset(
             continue
         rows = [_normalize_qa_row(row) for row in _read_parquet_rows(paths, limit=limit)]
         _fill_missing_context_sentences(dataset, rows, data_root)
-        examples = [builder(row, split=split) for row in rows]
         corpus = _context_corpus(dataset, rows)
+        examples = [builder(row, split=split) for row in rows]
+        _align_examples_to_corpus(examples, corpus)
         examples_by_split[split] = examples
         all_corpus.extend(corpus)
         split_summary[split] = {
@@ -388,18 +526,9 @@ def _finalize_dataset(
     ]
     build_linearrag_dataset(dataset, all_examples, corpus, linearrag_root)
 
-    sampling_pool = [
-        example.to_dict()
-        for example in examples_by_split.get("train", all_examples)
-        if example.usable_for_sft
-    ]
-    sampled = sample_examples(sampling_pool, target_count=per_dataset, seed=seed)
-    write_jsonl(sample_root / f"{dataset}.train.{per_dataset}.jsonl", sampled)
-
     return {
         **split_summary,
         "corpus_total": len(corpus),
-        "sampled": len(sampled),
     }
 
 

@@ -27,6 +27,10 @@ def _chunk_record(dataset: str, index: int, doc: CorpusDoc) -> dict[str, object]
         "doc_id": doc.doc_id,
         "title": doc.title,
         "text": doc.text,
+        "sentences": [
+            {"sent_id": sent_id, "text": sentence}
+            for sent_id, sentence in enumerate(doc.sentences)
+        ],
         "dataset": dataset,
         "source": doc.source,
     }

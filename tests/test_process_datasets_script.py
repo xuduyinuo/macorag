@@ -16,7 +16,7 @@ def _load_script_module():
     return module
 
 
-def test_process_musique_dataset_builds_teacher_sampling_inputs(tmp_path):
+def test_process_musique_dataset_builds_processed_linear_rag_inputs(tmp_path):
     module = _load_script_module()
     data_root = tmp_path / "data"
     musique_root = data_root / "musique"
@@ -75,13 +75,33 @@ def test_process_musique_dataset_builds_teacher_sampling_inputs(tmp_path):
     corpus = list(read_jsonl(tmp_path / "processed" / "musique" / "corpus.jsonl"))
     questions = read_json(tmp_path / "linearrag" / "musique" / "questions.json")
     chunks = read_json(tmp_path / "linearrag" / "musique" / "chunks.json")
-    samples = list(read_jsonl(tmp_path / "samples" / "musique.train.1.jsonl"))
 
     assert examples[0]["qid"] == "2hop__1_2"
-    assert len(corpus) == 2
+    assert corpus == [
+        {
+            "chunk_id": "musique:chunk:0",
+            "doc_id": corpus[0]["doc_id"],
+            "dataset": "musique",
+            "title": "Miquette Giraudy",
+            "text": "Miquette Giraudy is the spouse.",
+            "sentences": [
+                {"sent_id": 0, "text": "Miquette Giraudy is the spouse."}
+            ],
+        },
+        {
+            "chunk_id": "musique:chunk:1",
+            "doc_id": corpus[1]["doc_id"],
+            "dataset": "musique",
+            "title": "Steve Hillage",
+            "text": "Steve Hillage performed with Green.",
+            "sentences": [
+                {"sent_id": 0, "text": "Steve Hillage performed with Green."}
+            ],
+        },
+    ]
     assert questions[0]["id"] == "2hop__1_2"
     assert chunks[0]["chunk_id"].startswith("musique:chunk:")
-    assert samples[0]["qid"] == "2hop__1_2"
+    assert not (tmp_path / "samples" / "musique.train.1.jsonl").exists()
 
 
 def test_process_qa_dataset_fills_missing_context_sentences_from_external_corpus(
@@ -127,9 +147,82 @@ def test_process_qa_dataset_fills_missing_context_sentences_from_external_corpus
 
     assert summary["hotpotqa"]["train"]["examples"] == 1
     examples = list(read_jsonl(tmp_path / "processed" / "hotpotqa" / "examples.train.jsonl"))
-    samples = list(read_jsonl(tmp_path / "samples" / "hotpotqa.train.1.jsonl"))
+    corpus = list(read_jsonl(tmp_path / "processed" / "hotpotqa" / "corpus.jsonl"))
     assert examples[0]["supporting_facts"][0]["text"] == "Alice was born in Paris."
-    assert samples[0]["qid"] == "q1"
+    assert examples[0]["supporting_facts"][0]["doc_id"] == corpus[0]["doc_id"]
+    assert corpus[0]["sentences"] == [
+        {"sent_id": 0, "text": "Alice was born in Paris."}
+    ]
+    assert not (tmp_path / "samples" / "hotpotqa.train.1.jsonl").exists()
+
+
+def test_process_qa_dataset_adds_missing_support_title_from_external_corpus(
+    tmp_path,
+    monkeypatch,
+):
+    module = _load_script_module()
+    source_dir = tmp_path / "data" / "hotpotqa" / "fullwiki"
+    source_dir.mkdir(parents=True)
+    (source_dir / "train-00000-of-00001.parquet").write_bytes(b"placeholder")
+
+    monkeypatch.setattr(
+        module,
+        "_read_parquet_rows",
+        lambda paths, limit: [
+            {
+                "id": "q1",
+                "question": "What office did Shirley hold?",
+                "answer": "Chief of Protocol",
+                "type": "bridge",
+                "level": "hard",
+                "supporting_facts": {"title": ["Kiss and Tell", "Shirley Temple"], "sent_id": [0, 1]},
+                "context": {"title": ["Kiss and Tell"], "sentences": None},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        module,
+        "_external_corpus_by_title",
+        lambda dataset, data_root, titles: {
+            "Kiss and Tell": ["Kiss and Tell starred Shirley Temple."],
+            "Shirley Temple": [
+                "Shirley Temple was an actor.",
+                "She served as Chief of Protocol.",
+            ],
+        },
+    )
+
+    module.process_datasets(
+        data_root=tmp_path / "data",
+        processed_root=tmp_path / "processed",
+        linearrag_root=tmp_path / "linearrag",
+        sample_root=tmp_path / "samples",
+        datasets=["hotpotqa"],
+        splits=["train"],
+        per_dataset=1,
+        seed=7,
+    )
+
+    examples = list(read_jsonl(tmp_path / "processed" / "hotpotqa" / "examples.train.jsonl"))
+    corpus = list(read_jsonl(tmp_path / "processed" / "hotpotqa" / "corpus.jsonl"))
+    corpus_ids = {doc["doc_id"] for doc in corpus}
+    assert examples[0]["supporting_facts"] == [
+        {
+            "doc_id": corpus[0]["doc_id"],
+            "title": "Kiss and Tell",
+            "sent_id": 0,
+            "text": "Kiss and Tell starred Shirley Temple.",
+            "source": "gold",
+        },
+        {
+            "doc_id": corpus[1]["doc_id"],
+            "title": "Shirley Temple",
+            "sent_id": 1,
+            "text": "She served as Chief of Protocol.",
+            "source": "gold",
+        },
+    ]
+    assert all(fact["doc_id"] in corpus_ids for fact in examples[0]["supporting_facts"])
 
 
 def test_process_2wiki_dataset_normalizes_missing_evidences(tmp_path, monkeypatch):
@@ -171,5 +264,7 @@ def test_process_2wiki_dataset_normalizes_missing_evidences(tmp_path, monkeypatc
     )
 
     examples = list(read_jsonl(tmp_path / "processed" / "2wiki" / "examples.train.jsonl"))
+    corpus = list(read_jsonl(tmp_path / "processed" / "2wiki" / "corpus.jsonl"))
     assert summary["2wiki"]["train"]["examples"] == 1
     assert examples[0]["metadata"]["evidences"] == []
+    assert examples[0]["supporting_facts"][0]["doc_id"] == corpus[0]["doc_id"]
