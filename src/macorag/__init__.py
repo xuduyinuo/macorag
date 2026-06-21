@@ -1,1 +1,0 @@
-"""MACORAG data processing package."""

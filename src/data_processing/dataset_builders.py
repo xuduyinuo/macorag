@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from macorag.io_utils import normalize_key, normalize_text, sha1_text
-from macorag.schemas import CorpusDoc, EvidenceStep, Example, SupportingFact
+from data_processing.io_utils import normalize_key, normalize_text, sha1_text
+from data_processing.schemas import CorpusDoc, EvidenceStep, Example, SupportingFact
 
 
 def _empty_report() -> dict[str, list[Any]]:

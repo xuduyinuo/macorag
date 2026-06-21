@@ -14,7 +14,7 @@ dependencies = [
 test = ["pytest>=8"]
 
 [project.scripts]
-macorag = "macorag.cli:main"
+process-datasets = "data_processing.process_datasets:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

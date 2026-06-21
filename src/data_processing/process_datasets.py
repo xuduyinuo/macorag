@@ -12,9 +12,8 @@ from data_processing.dataset_builders import (
     build_hotpot_example_from_row,
     build_musique_canonical_from_rows,
 )
-from macorag.io_utils import normalize_key, normalize_text, sha1_text, write_json, write_jsonl
-from macorag.linearrag_adapter import build_linearrag_dataset
-from macorag.schemas import CorpusDoc, Example
+from data_processing.io_utils import normalize_key, normalize_text, sha1_text, write_json, write_jsonl
+from data_processing.schemas import CorpusDoc, Example
 
 
 DATASETS = ("hotpotqa", "2wiki", "musique")
@@ -397,11 +396,7 @@ def _process_musique(
     *,
     data_root: Path,
     processed_root: Path,
-    linearrag_root: Path,
-    sample_root: Path,
     splits: list[str],
-    per_dataset: int,
-    seed: int,
     limit: int | None,
 ) -> dict[str, Any]:
     examples_by_split: dict[str, list[Example]] = {}
@@ -429,12 +424,8 @@ def _process_musique(
     return _finalize_dataset(
         dataset="musique",
         processed_root=processed_root,
-        linearrag_root=linearrag_root,
-        sample_root=sample_root,
         examples_by_split=examples_by_split,
         corpus=_dedupe_corpus(all_corpus),
-        per_dataset=per_dataset,
-        seed=seed,
         split_summary=split_summary,
     )
 
@@ -444,11 +435,7 @@ def _process_qa_parquet_dataset(
     dataset: str,
     data_root: Path,
     processed_root: Path,
-    linearrag_root: Path,
-    sample_root: Path,
     splits: list[str],
-    per_dataset: int,
-    seed: int,
     limit: int | None,
 ) -> dict[str, Any]:
     source_dir = data_root / ("hotpotqa/fullwiki" if dataset == "hotpotqa" else "2wiki/qa")
@@ -486,12 +473,8 @@ def _process_qa_parquet_dataset(
     return _finalize_dataset(
         dataset=dataset,
         processed_root=processed_root,
-        linearrag_root=linearrag_root,
-        sample_root=sample_root,
         examples_by_split=examples_by_split,
         corpus=_dedupe_corpus(all_corpus),
-        per_dataset=per_dataset,
-        seed=seed,
         split_summary=split_summary,
     )
 
@@ -500,12 +483,8 @@ def _finalize_dataset(
     *,
     dataset: str,
     processed_root: Path,
-    linearrag_root: Path,
-    sample_root: Path,
     examples_by_split: dict[str, list[Example]],
     corpus: list[CorpusDoc],
-    per_dataset: int,
-    seed: int,
     split_summary: dict[str, Any],
 ) -> dict[str, Any]:
     if not examples_by_split:
@@ -519,12 +498,6 @@ def _finalize_dataset(
         examples_by_split=examples_by_split,
         corpus=corpus,
     )
-    all_examples = [
-        example
-        for split in SPLITS
-        for example in examples_by_split.get(split, [])
-    ]
-    build_linearrag_dataset(dataset, all_examples, corpus, linearrag_root)
 
     return {
         **split_summary,
@@ -536,29 +509,19 @@ def process_datasets(
     *,
     data_root: str | Path,
     processed_root: str | Path,
-    linearrag_root: str | Path,
-    sample_root: str | Path,
     datasets: list[str],
     splits: list[str],
-    per_dataset: int,
-    seed: int,
     limit: int | None = None,
 ) -> dict[str, Any]:
     data_root = Path(data_root)
     processed_root = Path(processed_root)
-    linearrag_root = Path(linearrag_root)
-    sample_root = Path(sample_root)
     summary: dict[str, Any] = {}
     for dataset in datasets:
         if dataset == "musique":
             summary[dataset] = _process_musique(
                 data_root=data_root,
                 processed_root=processed_root,
-                linearrag_root=linearrag_root,
-                sample_root=sample_root,
                 splits=splits,
-                per_dataset=per_dataset,
-                seed=seed,
                 limit=limit,
             )
         elif dataset in {"hotpotqa", "2wiki"}:
@@ -566,11 +529,7 @@ def process_datasets(
                 dataset=dataset,
                 data_root=data_root,
                 processed_root=processed_root,
-                linearrag_root=linearrag_root,
-                sample_root=sample_root,
                 splits=splits,
-                per_dataset=per_dataset,
-                seed=seed,
                 limit=limit,
             )
         else:
@@ -582,16 +541,12 @@ def process_datasets(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build processed corpus/examples and LinearRAG retrieval inputs.",
+        description="Build processed corpus/examples.",
     )
     parser.add_argument("--data-root", default="data")
     parser.add_argument("--processed-root", default="data/processed")
-    parser.add_argument("--linearrag-root", default="linearrag_dataset")
-    parser.add_argument("--sample-root", default="trajectories/samples")
     parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
     parser.add_argument("--splits", nargs="+", choices=SPLITS, default=list(SPLITS))
-    parser.add_argument("--per-dataset", type=int, default=1000)
-    parser.add_argument("--seed", type=int, default=7)
     parser.add_argument(
         "--limit",
         type=int,
@@ -606,12 +561,8 @@ def main(argv: list[str] | None = None) -> int:
     summary = process_datasets(
         data_root=args.data_root,
         processed_root=args.processed_root,
-        linearrag_root=args.linearrag_root,
-        sample_root=args.sample_root,
         datasets=args.datasets,
         splits=args.splits,
-        per_dataset=args.per_dataset,
-        seed=args.seed,
         limit=args.limit,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))

@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from macorag.schemas import CorpusDoc, Example, SupportingFact
+from data_processing.schemas import CorpusDoc, Example, SupportingFact
 
 
 def test_example_to_json_roundtrip():

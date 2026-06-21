@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from macorag.io_utils import read_json, read_jsonl
+from data_processing.io_utils import read_jsonl
 
 
 def _load_script_module():
@@ -21,7 +21,7 @@ def _load_script_module():
     return module
 
 
-def test_process_musique_dataset_builds_processed_linear_rag_inputs(tmp_path):
+def test_process_musique_dataset_builds_processed_outputs(tmp_path):
     module = _load_script_module()
     data_root = tmp_path / "data"
     musique_root = data_root / "musique"
@@ -67,19 +67,13 @@ def test_process_musique_dataset_builds_processed_linear_rag_inputs(tmp_path):
     summary = module.process_datasets(
         data_root=data_root,
         processed_root=tmp_path / "processed",
-        linearrag_root=tmp_path / "linearrag",
-        sample_root=tmp_path / "samples",
         datasets=["musique"],
         splits=["train"],
-        per_dataset=1,
-        seed=7,
     )
 
     assert summary["musique"]["train"]["examples"] == 1
     examples = list(read_jsonl(tmp_path / "processed" / "musique" / "examples.train.jsonl"))
     corpus = list(read_jsonl(tmp_path / "processed" / "musique" / "corpus.jsonl"))
-    questions = read_json(tmp_path / "linearrag" / "musique" / "questions.json")
-    chunks = read_json(tmp_path / "linearrag" / "musique" / "chunks.json")
 
     assert examples[0]["qid"] == "2hop__1_2"
     assert corpus == [
@@ -104,8 +98,7 @@ def test_process_musique_dataset_builds_processed_linear_rag_inputs(tmp_path):
             ],
         },
     ]
-    assert questions[0]["id"] == "2hop__1_2"
-    assert chunks[0]["chunk_id"].startswith("musique:chunk:")
+    assert not (tmp_path / "linearrag").exists()
     assert not (tmp_path / "samples" / "musique.train.1.jsonl").exists()
 
 
@@ -142,12 +135,8 @@ def test_process_qa_dataset_fills_missing_context_sentences_from_external_corpus
     summary = module.process_datasets(
         data_root=tmp_path / "data",
         processed_root=tmp_path / "processed",
-        linearrag_root=tmp_path / "linearrag",
-        sample_root=tmp_path / "samples",
         datasets=["hotpotqa"],
         splits=["train"],
-        per_dataset=1,
-        seed=7,
     )
 
     assert summary["hotpotqa"]["train"]["examples"] == 1
@@ -200,12 +189,8 @@ def test_process_qa_dataset_adds_missing_support_title_from_external_corpus(
     module.process_datasets(
         data_root=tmp_path / "data",
         processed_root=tmp_path / "processed",
-        linearrag_root=tmp_path / "linearrag",
-        sample_root=tmp_path / "samples",
         datasets=["hotpotqa"],
         splits=["train"],
-        per_dataset=1,
-        seed=7,
     )
 
     examples = list(read_jsonl(tmp_path / "processed" / "hotpotqa" / "examples.train.jsonl"))
@@ -260,12 +245,8 @@ def test_process_2wiki_dataset_normalizes_missing_evidences(tmp_path, monkeypatc
     summary = module.process_datasets(
         data_root=tmp_path / "data",
         processed_root=tmp_path / "processed",
-        linearrag_root=tmp_path / "linearrag",
-        sample_root=tmp_path / "samples",
         datasets=["2wiki"],
         splits=["train"],
-        per_dataset=1,
-        seed=7,
     )
 
     examples = list(read_jsonl(tmp_path / "processed" / "2wiki" / "examples.train.jsonl"))

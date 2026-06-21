@@ -1,4 +1,4 @@
-from macorag.io_utils import normalize_text, sha1_text, read_jsonl, write_jsonl
+from data_processing.io_utils import normalize_text, sha1_text, read_jsonl, write_jsonl
 
 
 def test_normalize_text_collapses_whitespace_but_keeps_case():
