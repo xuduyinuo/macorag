@@ -156,7 +156,8 @@ def _load_linearrag_modules() -> tuple[Any, Any]:
         except ModuleNotFoundError as exc:
             raise RuntimeError(
                 "Cannot import LinearRAG modules. Please install LinearRAG dependencies "
-                "in this environment, e.g. pip install -r LinearRAG/requirements.txt."
+                "in this environment, e.g.:\n"
+                "  PIP_NO_BUILD_ISOLATION=1 python -m pip install -r LinearRAG/requirements.txt"
             ) from exc
 
         return LinearRAGConfig, LinearRAG
