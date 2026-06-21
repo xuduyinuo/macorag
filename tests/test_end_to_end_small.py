@@ -1,4 +1,4 @@
-from macorag.dataset_builders import build_musique_canonical_from_rows
+from macorag.data_processing.dataset_builders import build_musique_canonical_from_rows
 from macorag.io_utils import read_json, read_jsonl
 from macorag.linearrag_adapter import build_linearrag_dataset
 
