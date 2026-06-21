@@ -5,7 +5,7 @@ Multi-agent RAG data processing and teacher trajectory construction for HotpotQA
 ## First Milestone
 
 - Build canonical `data/processed/<dataset>/examples.*.jsonl` and `corpus.jsonl`.
-- Build LinearRAG-compatible `linearrag_dataset/<dataset>/questions.json` and `chunks.json`.
+- Build LinearRAG-compatible `data/retrieval_env/<dataset>/questions.json` and `chunks.json`.
 - Generate full-API teacher trajectories with fixed tags:
   `<plan>`, `<retrieval>`, `<update-evidence>`, `<answer>`.
 - Filter to 3K SFT trajectories for Qwen2.5-7B warm-up:
