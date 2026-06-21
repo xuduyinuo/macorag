@@ -11,11 +11,10 @@ def _load_script_module():
     script_path = (
         Path(__file__).resolve().parents[1]
         / "src"
-        / "macorag"
         / "data_processing"
         / "process_datasets.py"
     )
-    spec = importlib.util.spec_from_file_location("macorag.data_processing.process_datasets", script_path)
+    spec = importlib.util.spec_from_file_location("data_processing.process_datasets", script_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
