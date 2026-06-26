@@ -4,9 +4,9 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable, Iterator, TypeAlias
+from typing import Any, Iterable, Iterator, Union
 
-PathLike: TypeAlias = str | Path
+PathLike = Union[str, Path]
 
 
 def normalize_text(value: str) -> str:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from data_processing.io_utils import normalize_key, normalize_text, sha1_text
 from data_processing.schemas import CorpusDoc, EvidenceStep, Example, SupportingFact
@@ -22,7 +22,7 @@ def _to_py(value: Any) -> Any:
     return value
 
 
-def _normalized_answer(value: Any) -> str | None:
+def _normalized_answer(value: Any) -> Optional[str]:
     normalized = normalize_text(str(_to_py(value) or ""))
     return normalized or None
 

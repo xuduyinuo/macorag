@@ -1,0 +1,10 @@
+data_root: "data"
+processed_root: "data/processed"
+datasets:
+  - hotpotqa
+  - 2wiki
+  - musique
+splits:
+  - train
+  - dev
+limit: null

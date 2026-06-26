@@ -4,14 +4,57 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 from data_processing.io_utils import read_jsonl, write_json, write_jsonl
+
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
 
 
 PROCESSED_DATASETS = ("2wiki", "hotpotqa", "musique")
 RETRIEVAL_DEFAULT_SPLITS = ("train", "dev")
 RETRIEVAL_DEFAULT_ROOT = "data/retrieval_env"
+SPACY_FALLBACK_MODELS = ("en_core_web_sm", "en_core_web_md")
+REQUIRED_INDEX_FILES = (
+    "passage_embedding.parquet",
+    "entity_embedding.parquet",
+    "sentence_embedding.parquet",
+)
+
+
+def _resolve_spacy_model(preferred_model: Optional[str]) -> str:
+    """Return an installed spaCy model name, falling back to lightweight defaults."""
+    try:
+        import spacy
+    except Exception as exc:
+        raise RuntimeError("spaCy is required for retrieval_env. Install it with `python -m pip install spacy`.") from exc
+
+    candidates: list[str] = []
+    if preferred_model:
+        candidates.append(preferred_model)
+    candidates.extend(SPACY_FALLBACK_MODELS)
+
+    for model_name in candidates:
+        if not model_name:
+            continue
+        try:
+            nlp = spacy.load(model_name)
+            del nlp
+            return model_name
+        except OSError:
+            continue
+
+    installed = ", ".join(spacy.util.get_installed_models())
+    fallback_hint = ", ".join(SPACY_FALLBACK_MODELS)
+    raise RuntimeError(
+        "No usable spaCy NER model found. "
+        f"Preferred='{preferred_model}'. Installed models: [{installed if installed else 'none'}]. "
+        f"Install one with: python -m spacy download {fallback_hint}"
+    )
 
 
 @dataclass(frozen=True)
@@ -22,12 +65,99 @@ class RetrievalResult:
     scores: list[float]
 
 
-def _dataset_dir(processed_root: str | Path, dataset: str) -> Path:
+class LinearRAGQueryEngine:
+    def __init__(
+        self,
+        *,
+        retrieval_root: Union[str, Path],
+        dataset: str,
+        embedding_model: str,
+        spacy_model: str,
+        top_k: int = 5,
+        max_workers: int = 16,
+        batch_size: int = 128,
+        use_vectorized_retrieval: bool = False,
+    ) -> None:
+        LinearRAGConfig, LinearRAG = _load_linearrag_modules()
+
+        try:
+            from sentence_transformers import SentenceTransformer
+        except Exception as exc:  # pragma: no cover - optional dependency
+            raise RuntimeError(
+                "Install sentence-transformers to run retrieval: "
+                "pip install sentence-transformers"
+            ) from exc
+
+        working_dir, index_root = _resolve_retrieval_dataset_working_dir(retrieval_root, dataset)
+        candidate_index_dirs = [
+            _retrieval_dataset_dir(retrieval_root, dataset),
+            _retrieval_dataset_dir(retrieval_root, dataset) / dataset,
+        ]
+        missing = [str(path) for path in _missing_index_files(index_root)]
+        if missing:
+            raise RuntimeError(
+                "LinearRAG index files missing: "
+                + ", ".join(missing)
+                + ". Run build_linear_rag_index() first."
+                + " Checked directories: "
+                + ", ".join(str(path) for path in candidate_index_dirs)
+            )
+
+        model = SentenceTransformer(embedding_model)
+        resolved_spacy_model = _resolve_spacy_model(spacy_model)
+        config = LinearRAGConfig(
+            dataset_name=dataset,
+            embedding_model=model,
+            llm_model=None,
+            spacy_model=resolved_spacy_model,
+            working_dir=str(working_dir),
+            batch_size=batch_size,
+            max_workers=max_workers,
+            retrieval_top_k=top_k,
+            use_vectorized_retrieval=use_vectorized_retrieval,
+        )
+        self.dataset = dataset
+        self.engine = LinearRAG(config)
+
+    def query(self, query: str) -> RetrievalResult:
+        results = self.engine.retrieve([{"question": query}])[0]
+        return RetrievalResult(
+            dataset=self.dataset,
+            query=query,
+            passages=list(results["sorted_passage"]),
+            scores=[float(score) for score in results["sorted_passage_scores"]],
+        )
+
+
+def _dataset_dir(processed_root: Union[str, Path], dataset: str) -> Path:
     return Path(processed_root) / dataset
 
 
-def _retrieval_dataset_dir(retrieval_root: str | Path, dataset: str) -> Path:
+def _retrieval_dataset_dir(retrieval_root: Union[str, Path], dataset: str) -> Path:
     return Path(retrieval_root) / dataset
+
+
+def _resolve_retrieval_dataset_working_dir(retrieval_root: Union[str, Path], dataset: str) -> tuple[Path, Path]:
+    """Return:
+    - working_dir: directory passed to LinearRAGConfig. LinearRAG will append dataset name itself.
+    - index_dir: directory that must contain `<split>_embedding.parquet`.
+    """
+    dataset_root = _retrieval_dataset_dir(retrieval_root, dataset)
+    candidate_dirs = [
+        dataset_root,
+        dataset_root / dataset,
+    ]
+
+    for index_dir in candidate_dirs:
+        if all((index_dir / filename).exists() for filename in REQUIRED_INDEX_FILES):
+            working_dir = index_dir.parent
+            return working_dir, index_dir
+
+    return dataset_root.parent, dataset_root
+
+
+def _missing_index_files(index_dir: Path) -> list[Path]:
+    return [index_dir / filename for filename in REQUIRED_INDEX_FILES if not (index_dir / filename).exists()]
 
 
 def _candidate_example_paths(dataset_dir: Path, dataset: str, split: str) -> list[Path]:
@@ -69,14 +199,14 @@ def _chunk_text_from_row(row: dict[str, Any]) -> str:
 
 def build_linearrag_assets(
     *,
-    processed_root: str | Path,
-    retrieval_root: str | Path,
+    processed_root: Union[str, Path],
+    retrieval_root: Union[str, Path],
     datasets: list[str],
     splits: list[str],
 ) -> dict[str, dict[str, Any]]:
     """Build LinearRAG-style `questions.json` and `chunks.json` from processed data."""
     summary: dict[str, dict[str, Any]] = {}
-    for dataset in datasets:
+    for dataset in tqdm(datasets, desc="Building retrieval corpora", unit="dataset"):
         source_dir = _dataset_dir(processed_root, dataset)
         target_dir = _retrieval_dataset_dir(retrieval_root, dataset)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -84,7 +214,12 @@ def build_linearrag_assets(
         corpus_records = list(read_jsonl(source_dir / "corpus.jsonl"))
         chunks: list[str] = []
         chunk_metadata: list[dict[str, Any]] = []
-        for chunk_idx, row in enumerate(corpus_records):
+        for chunk_idx, row in tqdm(
+            enumerate(corpus_records),
+            total=len(corpus_records),
+            desc=f"{dataset} chunks",
+            unit="chunk",
+        ):
             chunk_text = _chunk_text_from_row(row)
             title = str(row.get("title") or "").strip()
             chunk = f"{title}\n{chunk_text}" if title else chunk_text
@@ -102,7 +237,11 @@ def build_linearrag_assets(
         questions: list[dict[str, Any]] = []
         for split in splits:
             example_path = _resolve_example_path(source_dir, dataset, split)
-            for example in read_jsonl(example_path):
+            for example in tqdm(
+                read_jsonl(example_path),
+                desc=f"{dataset} {split} questions",
+                unit="question",
+            ):
                 questions.append(
                     {
                         "qid": example.get("qid"),
@@ -133,7 +272,8 @@ def build_linearrag_assets(
 
 @contextmanager
 def _with_linearrag_pythonpath() -> Any:
-    root = Path(__file__).resolve().parents[1] / "LinearRAG"
+    # LinearRAG is vendored at repository root, alongside `src`.
+    root = Path(__file__).resolve().parents[2] / "LinearRAG"
     if not root.exists():
         raise FileNotFoundError(
             f"LinearRAG directory not found: {root}. "
@@ -165,7 +305,7 @@ def _load_linearrag_modules() -> tuple[Any, Any]:
 
 def build_linear_rag_index(
     *,
-    retrieval_root: str | Path,
+    retrieval_root: Union[str, Path],
     dataset: str,
     chunks: list[str],
     embedding_model: str,
@@ -174,6 +314,7 @@ def build_linear_rag_index(
     batch_size: int = 128,
     retrieval_top_k: int = 5,
     use_vectorized_retrieval: bool = False,
+    co_locate_index: bool = False,
 ) -> Path:
     """Build passage/entity/sentence embeddings and graph cache for one dataset."""
     LinearRAGConfig, LinearRAG = _load_linearrag_modules()
@@ -193,14 +334,21 @@ def build_linear_rag_index(
     except Exception:
         device = "cpu"
 
-    working_dir = Path(retrieval_root) / dataset
+    resolved_spacy_model = _resolve_spacy_model(spacy_model)
+    retrieval_root = Path(retrieval_root)
+    if co_locate_index:
+        working_dir = str(retrieval_root)
+        index_dir = retrieval_root / dataset
+    else:
+        working_dir = str(retrieval_root / dataset)
+        index_dir = Path(working_dir) / dataset
     model = SentenceTransformer(embedding_model, device=device)
     config = LinearRAGConfig(
         dataset_name=dataset,
         embedding_model=model,
         llm_model=None,
-        spacy_model=spacy_model,
-        working_dir=str(working_dir),
+        spacy_model=resolved_spacy_model,
+        working_dir=working_dir,
         batch_size=batch_size,
         max_workers=max_workers,
         retrieval_top_k=retrieval_top_k,
@@ -208,13 +356,15 @@ def build_linear_rag_index(
     )
 
     engine = LinearRAG(config)
-    engine.index(chunks)
-    return working_dir
+    with tqdm(total=1, desc=f"Indexing {dataset}", unit="stage") as pbar:
+        engine.index(chunks)
+        pbar.update(1)
+    return index_dir
 
 
 def query_linear_rag(
     *,
-    retrieval_root: str | Path,
+    retrieval_root: Union[str, Path],
     dataset: str,
     query: str,
     embedding_model: str,
@@ -225,47 +375,38 @@ def query_linear_rag(
     use_vectorized_retrieval: bool = False,
 ) -> RetrievalResult:
     """Query one processed LinearRAG index and return passages + scores."""
-    LinearRAGConfig, LinearRAG = _load_linearrag_modules()
-
-    try:
-        from sentence_transformers import SentenceTransformer
-    except Exception as exc:  # pragma: no cover - optional dependency
-        raise RuntimeError(
-            "Install sentence-transformers to run retrieval: "
-            "pip install sentence-transformers"
-        ) from exc
-
-    dataset_root = _retrieval_dataset_dir(retrieval_root, dataset)
-    required = [
-        dataset_root / "passage_embedding.parquet",
-        dataset_root / "entity_embedding.parquet",
-        dataset_root / "sentence_embedding.parquet",
-    ]
-    missing = [str(path) for path in required if not path.exists()]
-    if missing:
-        raise RuntimeError(
-            "LinearRAG index files missing: "
-            + ", ".join(missing)
-            + ". Run build_linear_rag_index() first."
-        )
-
-    model = SentenceTransformer(embedding_model)
-    config = LinearRAGConfig(
-        dataset_name=dataset,
-        embedding_model=model,
-        llm_model=None,
+    engine = create_linear_rag_query_engine(
+        retrieval_root=retrieval_root,
+        dataset=dataset,
+        embedding_model=embedding_model,
         spacy_model=spacy_model,
-        working_dir=str(dataset_root),
-        batch_size=batch_size,
+        top_k=top_k,
         max_workers=max_workers,
-        retrieval_top_k=top_k,
+        batch_size=batch_size,
         use_vectorized_retrieval=use_vectorized_retrieval,
     )
-    engine = LinearRAG(config)
-    results = engine.retrieve([{"question": query}])[0]
-    return RetrievalResult(
+    return engine.query(query)
+
+
+def create_linear_rag_query_engine(
+    *,
+    retrieval_root: Union[str, Path],
+    dataset: str,
+    embedding_model: str,
+    spacy_model: str,
+    top_k: int = 5,
+    max_workers: int = 16,
+    batch_size: int = 128,
+    use_vectorized_retrieval: bool = False,
+) -> LinearRAGQueryEngine:
+    """Create a reusable LinearRAG query engine for repeated queries to one dataset."""
+    return LinearRAGQueryEngine(
+        retrieval_root=retrieval_root,
         dataset=dataset,
-        query=query,
-        passages=list(results["sorted_passage"]),
-        scores=[float(score) for score in results["sorted_passage_scores"]],
+        embedding_model=embedding_model,
+        spacy_model=spacy_model,
+        top_k=top_k,
+        max_workers=max_workers,
+        batch_size=batch_size,
+        use_vectorized_retrieval=use_vectorized_retrieval,
     )

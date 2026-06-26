@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Optional, Union
 
 
-def _loads_json(value: str | dict[str, Any]) -> dict[str, Any]:
+def _loads_json(value: Union[str, dict[str, Any]]) -> dict[str, Any]:
     if isinstance(value, str):
         return json.loads(value)
     return value
@@ -25,10 +25,10 @@ def _parse_bool(value: Any, *, field_name: str) -> bool:
 
 @dataclass
 class SupportingFact:
-    doc_id: str | None
+    doc_id: Optional[str]
     title: str
-    sent_id: int | None
-    text: str | None
+    sent_id: Optional[int]
+    text: Optional[str]
     source: str = "gold"
 
     @classmethod
@@ -45,10 +45,10 @@ class SupportingFact:
 @dataclass
 class EvidenceStep:
     step: int
-    sub_question: str | None
-    answer: str | None
-    support_doc_id: str | None
-    support_title: str | None
+    sub_question: Optional[str]
+    answer: Optional[str]
+    support_doc_id: Optional[str]
+    support_title: Optional[str]
     support_sent_ids: list[int] = field(default_factory=list)
 
     @classmethod
@@ -69,9 +69,9 @@ class Example:
     dataset: str
     split: str
     question: str
-    answer: str | None
+    answer: Optional[str]
     answer_aliases: list[str]
-    question_type: str | None
+    question_type: Optional[str]
     hop_count: int
     supporting_facts: list[SupportingFact]
     evidence_chain: list[EvidenceStep]
@@ -88,7 +88,7 @@ class Example:
         return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_json(cls, value: str | dict[str, Any]) -> "Example":
+    def from_json(cls, value: Union[str, dict[str, Any]]) -> "Example":
         data = _loads_json(value)
         return cls(
             qid=data["qid"],
@@ -141,7 +141,7 @@ class CorpusDoc:
         return json.dumps(self.to_dict(), ensure_ascii=False)
 
     @classmethod
-    def from_json(cls, value: str | dict[str, Any]) -> "CorpusDoc":
+    def from_json(cls, value: Union[str, dict[str, Any]]) -> "CorpusDoc":
         data = _loads_json(value)
         return cls(
             doc_id=data["doc_id"],

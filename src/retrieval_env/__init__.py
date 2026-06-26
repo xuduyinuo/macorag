@@ -7,6 +7,7 @@ from .core import (
     RetrievalResult,
     build_linear_rag_index,
     build_linearrag_assets,
+    create_linear_rag_query_engine,
     query_linear_rag,
 )
 
@@ -17,5 +18,6 @@ __all__ = [
     "RetrievalResult",
     "build_linear_rag_index",
     "build_linearrag_assets",
+    "create_linear_rag_query_engine",
     "query_linear_rag",
 ]

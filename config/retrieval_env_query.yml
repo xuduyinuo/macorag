@@ -1,0 +1,10 @@
+command: query
+dataset: 2wiki
+retrieval_root: "data/trajectory_test_retrieval"
+query: "Who is the director of film The Tripper?"
+embedding_model: "sentence-transformers/all-mpnet-base-v2"
+spacy_model: "en_core_web_sm"
+top_k: 5
+max_workers: 16
+batch_size: 128
+use_vectorized_retrieval: true

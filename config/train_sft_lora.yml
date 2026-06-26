@@ -1,0 +1,50 @@
+model_path: "model/Qwen2.5-7B-Instruct"
+data_root: "data/sft/teacher_qwen_plus_trajectory_train"
+output_dir: "outputs/lora_qwen2.5-7b_trajectory"
+system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
+max_length: 5120
+max_samples: null
+seed: 42
+
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.05
+target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+  - up_proj
+  - down_proj
+  - gate_proj
+
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+num_train_epochs: 3.0
+learning_rate: 0.00002
+lr_scheduler_type: "cosine"
+warmup_ratio: 0.03
+weight_decay: 0.01
+logging_steps: 1
+save_steps: 100
+eval_steps: 20
+max_steps: 0
+save_total_limit: 3
+eval_split_ratio: 0.05
+validation_split: true
+early_stopping_patience: 3
+early_stopping_threshold: 0.0
+metric_for_best_model: "eval_loss"
+greater_is_better: false
+
+fp16: false
+bf16: false
+load_4bit: true
+disable_tqdm: false
+log_jsonl_path: "outputs/lora_qwen2.5-7b_trajectory/train_metrics.jsonl"
+gpu_index: 0
+gpu_indices: "0,1"
+
+check_only: false
+check_only_max_samples: 20
+train_test_seed: 777

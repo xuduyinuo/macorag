@@ -32,3 +32,43 @@ PIP_NO_BUILD_ISOLATION=1 python -m pip install -r LinearRAG/requirements.txt
 ```bash
 bash scripts/setup_macorag_env.sh
 ```
+
+## Qwen2.5-7B LoRA SFT（教师轨迹）
+
+项目已提供基于 `data/sft/teacher_qwen_plus_trajectory_train` 的训练入口：
+
+```bash
+bash scripts/run_train_sft_lora_gpu1.sh \
+  --check-only \
+  --max-samples 20
+```
+
+上面命令用于先做数据检查，不会开始训练。
+正式训练（固定 GPU1，默认不含 `state` 和 `observation`）：
+
+```bash
+bash scripts/run_train_sft_lora_gpu1.sh \
+  --model-path model/Qwen2.5-7B-Instruct \
+  --data-root data/sft/teacher_qwen_plus_trajectory_train \
+  --output-dir outputs/lora_qwen2.5-7b_trajectory \
+  --per-device-train-batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --num-train-epochs 3.0 \
+  --lora-r 16 \
+  --lora-alpha 32 \
+  --lora-dropout 0.05 \
+  --max-length 4096 \
+  --bf16 \
+  --save-steps 100
+```
+
+首次运行前请先补齐依赖（示例）：
+
+```bash
+PIP_NO_BUILD_ISOLATION=1 /data/conda/envs/macorag/bin/pip install \
+  torch torchvision torchaudio \
+  transformers peft datasets accelerate trl bitsandbytes
+```
+
+默认脚本会把每轮轨迹转换为 `<plan> / <retrieval> / <update-evidence> / <answer>`，
+并在转换时**丢弃 `state` 与 `observation` 字段**，避免模型学习维护状态文本。

@@ -1,0 +1,17 @@
+command: build
+processed_root: "data/trajectory_train"
+retrieval_root: "data/trajectory_train_retrieval"
+datasets:
+  - hotpotqa
+  - 2wiki
+  - musique
+splits:
+  - train
+build_index: true
+embedding_model: "sentence-transformers/all-mpnet-base-v2"
+spacy_model: "en_core_web_sm"
+max_workers: 16
+batch_size: 128
+retrieval_top_k: 5
+use_vectorized_retrieval: true
+co_locate_index: true

@@ -5,7 +5,7 @@ import argparse
 import json
 import re
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional, Union
 
 from data_processing.dataset_builders import (
     build_2wiki_example_from_row,
@@ -19,6 +19,62 @@ from data_processing.schemas import CorpusDoc, Example
 DATASETS = ("hotpotqa", "2wiki", "musique")
 SPLITS = ("train", "dev")
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover - optional dependency
+    def tqdm(iterable, *args, **kwargs):
+        return iterable
+
+
+def _resolve_repo_root() -> Path:
+    current = Path(__file__).resolve()
+    for candidate in [current, *current.parents]:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    return current.parents[2]
+
+
+REPO_ROOT = _resolve_repo_root()
+DEFAULT_PROCESSING_CONFIG = REPO_ROOT / "config" / "process_datasets.yml"
+
+
+def _load_yaml_config(path: Union[str, Path]) -> dict[str, Any]:
+    config_path = Path(path)
+    if not config_path.exists():
+        return {}
+    if config_path.suffix.lower() not in {".yml", ".yaml"}:
+        raise ValueError(f"Unsupported config type: {config_path.suffix}")
+
+    try:
+        import yaml
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "PyYAML is required to load .yml/.yaml config. Install it with `pip install PyYAML`."
+        ) from exc
+
+    with config_path.open("r", encoding="utf-8") as file:
+        data = yaml.safe_load(file)
+    if data is None:
+        return {}
+    if not isinstance(data, dict):
+        raise ValueError(f"Invalid config format at {config_path}: expected mapping.")
+    return {key.replace("-", "_"): value for key, value in data.items()}
+
+
+def _coerce_list(value: Any, *, fallback: list[str], name: str) -> list[str]:
+    if value is None:
+        return list(fallback)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    raise TypeError(f"{name} must be a list; got {type(value)}")
+
+
+def _coalesce(value: Any, fallback: Any) -> Any:
+    return fallback if value is None else value
 
 class DatasetProcessingError(RuntimeError):
     pass
@@ -99,10 +155,10 @@ def _normalize_qa_row(row: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _read_parquet_rows(paths: Iterable[Path], *, limit: int | None) -> list[dict[str, Any]]:
+def _read_parquet_rows(paths: Iterable[Path], *, limit: Optional[int]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     errors: list[str] = []
-    for path in paths:
+    for path in tqdm(tuple(paths), desc="Reading parquet shards", unit="file"):
         try:
             import pyarrow.parquet as pq
 
@@ -120,7 +176,7 @@ def _read_parquet_rows(paths: Iterable[Path], *, limit: int | None) -> list[dict
                 )
                 continue
 
-        for row in path_rows:
+        for row in tqdm(path_rows, desc=f"Normalize rows: {path.name}", unit="row", leave=False):
             rows.append(_normalize_qa_row(row))
             if limit is not None and len(rows) >= limit:
                 return rows
@@ -133,7 +189,7 @@ def _read_parquet_rows(paths: Iterable[Path], *, limit: int | None) -> list[dict
 def _context_corpus(dataset: str, rows: list[dict[str, Any]]) -> list[CorpusDoc]:
     corpus_by_doc_id: dict[str, CorpusDoc] = {}
     missing_context_sentences = 0
-    for row in rows:
+    for row in tqdm(rows, desc=f"{dataset} context corpus", unit="row"):
         context = row.get("context") or {}
         titles = context.get("title", [])
         sentence_groups = context.get("sentences")
@@ -192,7 +248,7 @@ def _supporting_fact_pairs(row: dict[str, Any]) -> list[tuple[str, int]]:
 
 def _needed_context_titles(rows: list[dict[str, Any]]) -> set[str]:
     titles: set[str] = set()
-    for row in rows:
+    for row in tqdm(rows, desc="Collecting context titles", unit="row"):
         context = row.get("context") or {}
         for title in context.get("title", []) or []:
             if str(title).strip():
@@ -222,7 +278,7 @@ def _two_wiki_corpus_by_title(data_root: Path, titles: set[str]) -> dict[str, li
         return {}
     by_title: dict[str, list[str]] = {}
     with source.open("r", encoding="utf-8") as file:
-        for line in file:
+        for line in tqdm(file, desc="Reading 2wiki corpus", unit="row"):
             if not line.strip():
                 continue
             row = json.loads(line)
@@ -240,7 +296,7 @@ def _hotpot_beir_corpus_by_title(data_root: Path, titles: set[str]) -> dict[str,
 
     frame = pd.read_parquet(source, engine="fastparquet", columns=["title", "text"])
     by_title: dict[str, list[str]] = {}
-    for row in frame.itertuples(index=False):
+    for row in tqdm(frame.itertuples(index=False), total=len(frame), desc="Reading BEIR corpus", unit="row"):
         title = str(row.title or "")
         if title in titles and title not in by_title:
             text = normalize_text(str(row.text or ""))
@@ -266,7 +322,7 @@ def _fill_missing_context_sentences(
     data_root: Path,
 ) -> None:
     rows_needing_external = []
-    for row in rows:
+    for row in tqdm(rows, desc="Identifying missing context", unit="row"):
         context = row.get("context") or {}
         titles = [str(title) for title in context.get("title", []) or []]
         title_set = set(titles)
@@ -285,7 +341,7 @@ def _fill_missing_context_sentences(
         data_root,
         _needed_context_titles(rows_needing_external),
     )
-    for row in rows_needing_external:
+    for row in tqdm(rows_needing_external, desc="Filling missing context", unit="row"):
         context = row.get("context") or {}
         titles = [str(title) for title in context.get("title", []) or []]
         sentence_groups = context.get("sentences")
@@ -357,7 +413,7 @@ def _align_examples_to_corpus(examples: list[Example], corpus: list[CorpusDoc]) 
     for doc in corpus:
         corpus_by_title.setdefault(doc.title, doc)
 
-    for example in examples:
+    for example in tqdm(examples, desc="Aligning examples", unit="item"):
         quality_flags = set(example.quality_flags)
         for fact in example.supporting_facts:
             doc = corpus_by_title.get(fact.title)
@@ -397,7 +453,7 @@ def _process_musique(
     data_root: Path,
     processed_root: Path,
     splits: list[str],
-    limit: int | None,
+    limit: Optional[int],
 ) -> dict[str, Any]:
     examples_by_split: dict[str, list[Example]] = {}
     all_corpus: list[CorpusDoc] = []
@@ -410,7 +466,14 @@ def _process_musique(
         if limit is not None:
             rows = rows[:limit]
         report = build_musique_canonical_from_rows(rows, split=split)
-        examples = report["examples"]
+        examples = [
+            example
+            for example in tqdm(
+                report["examples"],
+                desc=f"musique {split} examples",
+                unit="item",
+            )
+        ]
         corpus = report["corpus"]
         examples_by_split[split] = examples
         all_corpus.extend(corpus)
@@ -436,7 +499,7 @@ def _process_qa_parquet_dataset(
     data_root: Path,
     processed_root: Path,
     splits: list[str],
-    limit: int | None,
+    limit: Optional[int],
 ) -> dict[str, Any]:
     source_dir = data_root / ("hotpotqa/fullwiki" if dataset == "hotpotqa" else "2wiki/qa")
     builder = build_hotpot_example_from_row if dataset == "hotpotqa" else build_2wiki_example_from_row
@@ -460,7 +523,9 @@ def _process_qa_parquet_dataset(
         rows = [_normalize_qa_row(row) for row in _read_parquet_rows(paths, limit=limit)]
         _fill_missing_context_sentences(dataset, rows, data_root)
         corpus = _context_corpus(dataset, rows)
-        examples = [builder(row, split=split) for row in rows]
+        examples = []
+        for row in tqdm(rows, desc=f"{dataset} {split} examples", unit="item"):
+            examples.append(builder(row, split=split))
         _align_examples_to_corpus(examples, corpus)
         examples_by_split[split] = examples
         all_corpus.extend(corpus)
@@ -507,16 +572,16 @@ def _finalize_dataset(
 
 def process_datasets(
     *,
-    data_root: str | Path,
-    processed_root: str | Path,
+    data_root: Union[str, Path],
+    processed_root: Union[str, Path],
     datasets: list[str],
     splits: list[str],
-    limit: int | None = None,
+    limit: Optional[int] = None,
 ) -> dict[str, Any]:
     data_root = Path(data_root)
     processed_root = Path(processed_root)
     summary: dict[str, Any] = {}
-    for dataset in datasets:
+    for dataset in tqdm(datasets, desc="Processing datasets", unit="dataset"):
         if dataset == "musique":
             summary[dataset] = _process_musique(
                 data_root=data_root,
@@ -543,10 +608,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build processed corpus/examples.",
     )
-    parser.add_argument("--data-root", default="data")
-    parser.add_argument("--processed-root", default="data/processed")
-    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=list(DATASETS))
-    parser.add_argument("--splits", nargs="+", choices=SPLITS, default=list(SPLITS))
+    parser.add_argument("--config", default=str(DEFAULT_PROCESSING_CONFIG))
+    parser.add_argument("--data-root", default=None)
+    parser.add_argument("--processed-root", default=None)
+    parser.add_argument("--datasets", nargs="+", choices=DATASETS, default=None)
+    parser.add_argument("--splits", nargs="+", choices=SPLITS, default=None)
     parser.add_argument(
         "--limit",
         type=int,
@@ -556,14 +622,28 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+def main(argv: Optional[list[str]] = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    config = _load_yaml_config(args.config)
+
+    data_root = _coalesce(args.data_root, config.get("data_root", "data"))
+    processed_root = _coalesce(args.processed_root, config.get("processed_root", "data/processed"))
+    datasets = _coerce_list(args.datasets, fallback=_coalesce(config.get("datasets"), list(DATASETS)), name="datasets")
+    splits = _coerce_list(args.splits, fallback=_coalesce(config.get("splits"), list(SPLITS)), name="splits")
+    limit = _coalesce(
+        args.limit,
+        config.get("limit"),
+    )
+    if limit is not None:
+        limit = int(limit)
+
     summary = process_datasets(
-        data_root=args.data_root,
-        processed_root=args.processed_root,
-        datasets=args.datasets,
-        splits=args.splits,
-        limit=args.limit,
+        data_root=data_root,
+        processed_root=processed_root,
+        datasets=datasets,
+        splits=splits,
+        limit=limit,
     )
     print(json.dumps(summary, indent=2, ensure_ascii=False))
     return 0
