@@ -157,3 +157,35 @@ def test_load_eval_samples_stops_at_max_samples_before_later_missing_file(tmp_pa
     assert len(samples) == 1
     assert summary["loaded_samples"] == 1
     assert summary["source_files"] == [str(data_root / "hotpotqa" / "first.jsonl")]
+
+
+def test_explicit_data_files_skips_corpus_jsonl(tmp_path: Path) -> None:
+    data_root = tmp_path / "eval"
+    _write_jsonl(
+        data_root / "hotpotqa" / "corpus.jsonl",
+        [{"doc_id": "d1", "text": "should be skipped"}],
+    )
+    _write_jsonl(
+        data_root / "hotpotqa" / "hotpotqa_dev.jsonl",
+        [
+            {
+                "qid": "q4",
+                "dataset": "hotpotqa",
+                "question": "Who directed The Tripper?",
+                "answer": "David Arquette",
+                "supporting_facts": [{"title": "The Tripper", "text": "Directed by David Arquette."}],
+            }
+        ],
+    )
+
+    samples, summary = load_eval_samples(
+        data_root=data_root,
+        data_files=[
+            str(Path("hotpotqa") / "corpus.jsonl"),
+            str(Path("hotpotqa") / "hotpotqa_dev.jsonl"),
+        ],
+    )
+
+    assert len(samples) == 1
+    assert summary["loaded_samples"] == 1
+    assert summary["source_files"] == [str(data_root / "hotpotqa" / "hotpotqa_dev.jsonl")]
