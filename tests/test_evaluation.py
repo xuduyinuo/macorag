@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 import pytest
 
@@ -105,3 +105,55 @@ def test_load_eval_samples_skips_corpus_and_normalizes_gold_answer(tmp_path: Pat
     assert summary["loaded_samples"] == 1
     assert summary["skipped_samples"] == 1
     assert summary["source_files"] == [str(data_root / "hotpotqa" / "hotpotqa_dev.jsonl")]
+
+
+def test_load_eval_samples_uses_gold_answer_when_answer_is_null(tmp_path: Path) -> None:
+    data_root = tmp_path / "eval"
+    _write_jsonl(
+        data_root / "hotpotqa" / "hotpotqa_dev.jsonl",
+        [
+            {
+                "qid": "q2",
+                "dataset": "hotpotqa",
+                "question": "Who is the director?",
+                "answer": None,
+                "gold_answer": "David Arquette",
+                "answer_aliases": ["Arquette"],
+                "supporting_facts": [{"title": "The Tripper", "text": "Directed by David Arquette."}],
+            },
+        ],
+    )
+
+    samples, _ = load_eval_samples(data_root=data_root, data_files=[], max_samples=None)
+
+    assert len(samples) == 1
+    assert samples[0].answer == "David Arquette"
+
+
+def test_load_eval_samples_stops_at_max_samples_before_later_missing_file(tmp_path: Path) -> None:
+    data_root = tmp_path / "eval"
+    _write_jsonl(
+        data_root / "hotpotqa" / "first.jsonl",
+        [
+            {
+                "qid": "q3",
+                "dataset": "hotpotqa",
+                "question": "Director?",
+                "answer": "David Arquette",
+                "supporting_facts": [{"title": "The Tripper", "text": "Directed by David Arquette."}],
+            },
+        ],
+    )
+
+    samples, summary = load_eval_samples(
+        data_root=data_root,
+        data_files=[
+            str(data_root / "hotpotqa" / "first.jsonl"),
+            str(data_root / "hotpotqa" / "missing.jsonl"),
+        ],
+        max_samples=1,
+    )
+
+    assert len(samples) == 1
+    assert summary["loaded_samples"] == 1
+    assert summary["source_files"] == [str(data_root / "hotpotqa" / "first.jsonl")]

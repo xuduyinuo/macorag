@@ -49,7 +49,9 @@ def _build_sample(row: dict[str, Any], fallback_dataset: str) -> EvalSample | No
     qid = str(row.get("qid") or "").strip()
     dataset = str(row.get("dataset") or fallback_dataset or "").strip()
     question = str(row.get("question") or "").strip()
-    answer = str(row.get("answer", row.get("gold_answer")) or "").strip()
+    answer = str(row.get("answer") or "").strip()
+    if not answer:
+        answer = str(row.get("gold_answer") or "").strip()
     supporting_facts = row.get("supporting_facts")
     if not qid or not dataset or not question or not answer or not isinstance(supporting_facts, list):
         return None
@@ -86,6 +88,8 @@ def load_eval_samples(
     counts_by_dataset: dict[str, int] = {}
     source_files: list[str] = []
     for path in files:
+        if max_samples is not None and len(samples) >= max_samples:
+            break
         if not path.exists():
             raise FileNotFoundError(f"Evaluation data file not found: {path}")
         source_files.append(str(path))
@@ -98,6 +102,8 @@ def load_eval_samples(
             if max_samples is None or len(samples) < max_samples:
                 samples.append(sample)
                 counts_by_dataset[sample.dataset] = counts_by_dataset.get(sample.dataset, 0) + 1
+            if max_samples is not None and len(samples) >= max_samples:
+                break
 
     if not samples:
         raise ValueError(f"No valid evaluation samples found in {root}")
