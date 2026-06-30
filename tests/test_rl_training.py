@@ -17,6 +17,7 @@ from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _write_train_event
 from rl_training.trainer import compute_grpo_loss
+from rl_training.vllm_client import collect_trainable_named_parameters
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -137,6 +138,52 @@ def test_validate_vllm_gpu_placement_allows_separate_gpus() -> None:
     args = Namespace(use_vllm_generation=True, gpu_indices="1", gpu_index=1, vllm_gpu_indices="0")
 
     _validate_vllm_gpu_placement(args)
+
+
+class _TinyParamModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.frozen = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False)
+        self.lora_a = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=True)
+        self.lora_b = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True)
+
+
+def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
+    model = _TinyParamModel()
+
+    params = collect_trainable_named_parameters(model)
+
+    assert sorted(params) == ["lora_a", "lora_b"]
+    assert all(not tensor.requires_grad for tensor in params.values())
+    assert all(tensor.device.type == "cpu" for tensor in params.values())
+    assert params["lora_a"].item() == 2.0
+    assert params["lora_b"].item() == 3.0
+
+
+class _FakeTRLClient:
+    def __init__(self) -> None:
+        self.updated: list[tuple[str, torch.Tensor]] = []
+        self.health_checked = False
+
+    def check_server(self) -> None:
+        self.health_checked = True
+
+    def update_named_param(self, name: str, weights: torch.Tensor) -> None:
+        self.updated.append((name, weights))
+
+
+def test_vllm_generation_client_syncs_trainable_parameters() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    model = _TinyParamModel()
+
+    elapsed = client.sync_trainable_parameters(model)
+
+    assert elapsed >= 0.0
+    assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
+    assert all(tensor.device.type == "cpu" for _, tensor in backend.updated)
 
 
 def test_load_rl_samples_reads_existing_extracted_files(tmp_path: Path) -> None:
