@@ -13,6 +13,7 @@ from rl_training.policy import HFSharedPolicy
 from rl_training.policy import sequence_logprobs
 from rl_training.rewards import compute_answer_f1, compute_rl_rewards
 from rl_training.train_grpo_macorag import _parse_gpu_indices
+from rl_training.train_grpo_macorag import _build_policy
 from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _write_train_event
@@ -207,7 +208,7 @@ class _LogprobModel(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask=None, logits_to_keep=None):
         vocab_size = 128
-        logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], vocab_size, device=input_ids.device)
+        logits = self.weight * torch.zeros(input_ids.shape[0], input_ids.shape[1], vocab_size, device=input_ids.device)
         return type("Output", (), {"logits": logits})
 
 
@@ -253,6 +254,57 @@ def test_vllm_shared_policy_generates_and_records_trace() -> None:
     assert action.response == "decoded response"
     assert action.old_logprobs.shape == (2,)
     assert policy.timing["time_vllm_generate_seconds"] >= 0.0
+
+
+def test_build_policy_uses_hf_policy_when_vllm_disabled() -> None:
+    args = Namespace(
+        use_vllm_generation=False,
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    policy = _build_policy(args, _LogprobModel(), _FakeTokenizer())
+
+    assert isinstance(policy, HFSharedPolicy)
+
+
+def test_train_on_rollouts_reports_optimizer_step_flag() -> None:
+    model = _LogprobModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    args = type(
+        "Args",
+        (),
+        {"gradient_accumulation_steps": 1, "clip_epsilon": 0.2, "kl_beta": 0.0},
+    )()
+    action = type(
+        "Action",
+        (),
+        {
+            "prompt_ids": [1, 2],
+            "completion_ids": [3],
+            "old_logprobs": torch.zeros(1),
+        },
+    )()
+    rollouts = [{"advantage": 1.0, "actions": [action]}]
+
+    metrics = _train_on_rollouts(
+        rollouts=rollouts,
+        train_model=model,
+        raw_policy_model=model,
+        ref_model=model,
+        optimizer=optimizer,
+        args=args,
+        torch=torch,
+        device=torch.device("cpu"),
+        should_step=True,
+    )
+
+    assert metrics["did_optimizer_step"] is True
+    assert "time_optimizer_step_seconds" in metrics
 
 
 def test_load_rl_samples_reads_existing_extracted_files(tmp_path: Path) -> None:

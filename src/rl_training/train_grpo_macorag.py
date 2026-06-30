@@ -14,10 +14,11 @@ from sft_training.callbacks import _make_timestamped_output_dir
 
 from .config import parse_args
 from .data import RLSample, load_rl_samples
-from .policy import HFSharedPolicy, sequence_logprobs
+from .policy import HFSharedPolicy, VLLMSharedPolicy, sequence_logprobs
 from .retrieval import CachedLinearRAGRetrievalEnv
 from .rewards import compute_rl_rewards
 from .trainer import compute_grpo_loss, normalize_group_advantages
+from .vllm_client import VLLMGenerationClient
 
 
 def _configure_visible_gpus(args: Any) -> None:
@@ -243,6 +244,41 @@ def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
     )
 
 
+def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedPolicy:
+    common = {
+        "model": raw_policy_model,
+        "tokenizer": tokenizer,
+        "system_prompt": args.system_prompt,
+        "max_prompt_length": args.max_prompt_length,
+        "max_completion_length": args.max_completion_length,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+        "top_k": args.top_k,
+    }
+    if not args.use_vllm_generation:
+        return HFSharedPolicy(**common)
+    client = VLLMGenerationClient(
+        host=args.vllm_host,
+        port=args.vllm_port,
+        timeout_seconds=args.vllm_timeout_seconds,
+    )
+    client.check_server()
+    return VLLMSharedPolicy(vllm_client=client, **common)
+
+
+def _sync_vllm_after_optimizer_step(policy: Any, raw_policy_model: Any, args: Any) -> float:
+    if not getattr(args, "use_vllm_generation", False):
+        return 0.0
+    if not getattr(args, "vllm_sync_after_step", True):
+        return 0.0
+    if not _is_main_process():
+        return 0.0
+    client = getattr(policy, "vllm_client", None)
+    if client is None:
+        raise SystemExit("vLLM generation is enabled but policy has no vLLM client.")
+    return float(client.sync_trainable_parameters(raw_policy_model))
+
+
 def _rollout_group(
     *,
     args: Any,
@@ -257,6 +293,7 @@ def _rollout_group(
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     rollouts: list[dict[str, Any]] = []
     time_rollout_seconds = 0.0
+    time_vllm_generate_seconds = 0.0
     time_reward_seconds = 0.0
     for group_index in range(args.group_size):
         policy.reset_trace()
@@ -264,6 +301,9 @@ def _rollout_group(
         rollout_start = time.perf_counter()
         result = executor.run(question=sample.question, dataset=sample.dataset)
         time_rollout_seconds += time.perf_counter() - rollout_start
+        time_vllm_generate_seconds += float(
+            getattr(policy, "timing", {}).get("time_vllm_generate_seconds", 0.0)
+        )
         rollout = {
             "group_index": group_index,
             "result": result,
@@ -302,6 +342,7 @@ def _rollout_group(
     time_reward_seconds += time.perf_counter() - reward_start
     return rollouts, {
         "time_rollout_seconds": time_rollout_seconds,
+        "time_vllm_generate_seconds": time_vllm_generate_seconds,
         "time_reward_seconds": time_reward_seconds,
     }
 
@@ -317,7 +358,7 @@ def _train_on_rollouts(
     torch: Any,
     device: Any,
     should_step: bool,
-) -> dict[str, float]:
+) -> dict[str, Any]:
     del raw_policy_model
     trainable_actions = [
         (rollout, action)
@@ -330,6 +371,7 @@ def _train_on_rollouts(
             "loss": 0.0,
             "policy_loss": 0.0,
             "kl": 0.0,
+            "did_optimizer_step": False,
             "time_backward_seconds": 0.0,
             "time_optimizer_step_seconds": 0.0,
         }
@@ -338,6 +380,7 @@ def _train_on_rollouts(
     loss_total = 0.0
     time_backward_seconds = 0.0
     time_optimizer_step_seconds = 0.0
+    did_optimizer_step = False
     metrics_list: list[dict[str, float]] = []
     for rollout, action in trainable_actions:
         advantage = torch.tensor([float(rollout["advantage"])], dtype=torch.float32, device=device)
@@ -374,11 +417,13 @@ def _train_on_rollouts(
         optimizer_start = time.perf_counter()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        did_optimizer_step = True
         time_optimizer_step_seconds += time.perf_counter() - optimizer_start
     return {
         "loss": loss_total / len(metrics_list),
         "policy_loss": sum(item["policy_loss"] for item in metrics_list) / len(metrics_list),
         "kl": sum(item["kl"] for item in metrics_list) / len(metrics_list),
+        "did_optimizer_step": did_optimizer_step,
         "time_backward_seconds": time_backward_seconds,
         "time_optimizer_step_seconds": time_optimizer_step_seconds,
     }
@@ -441,16 +486,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     retrieval_env = _build_retrieval_env(args)
-    policy = HFSharedPolicy(
-        model=raw_policy_model,
-        tokenizer=tokenizer,
-        system_prompt=args.system_prompt,
-        max_prompt_length=args.max_prompt_length,
-        max_completion_length=args.max_completion_length,
-        temperature=args.temperature,
-        top_p=args.top_p,
-        top_k=args.top_k,
-    )
+    policy = _build_policy(args, raw_policy_model, tokenizer)
 
     base_output_dir = Path(args.output_dir)
     output_dir = _make_timestamped_output_dir(base_output_dir)
@@ -524,6 +560,9 @@ def main() -> None:
                     device=device,
                     should_step=(global_step + 1) % max(1, int(args.gradient_accumulation_steps)) == 0,
                 )
+                time_weight_sync_seconds = 0.0
+                if metrics.get("did_optimizer_step"):
+                    time_weight_sync_seconds = _sync_vllm_after_optimizer_step(policy, raw_policy_model, args)
                 time_total_seconds = time.perf_counter() - sample_start_time
                 global_step += 1
                 reward_totals = [item["rewards"]["total"] for item in rollouts]
@@ -559,9 +598,11 @@ def main() -> None:
                         "parse_errors": best_rollout["parse_errors"],
                         "learning_rate": args.learning_rate,
                         "time_rollout_seconds": rollout_timing["time_rollout_seconds"],
+                        "time_vllm_generate_seconds": rollout_timing.get("time_vllm_generate_seconds", 0.0),
                         "time_reward_seconds": rollout_timing["time_reward_seconds"],
                         "time_backward_seconds": metrics["time_backward_seconds"],
                         "time_optimizer_step_seconds": metrics["time_optimizer_step_seconds"],
+                        "time_weight_sync_seconds": time_weight_sync_seconds,
                         "time_total_seconds": time_total_seconds,
                     }
                     _append_jsonl(log_path, payload)
@@ -578,9 +619,11 @@ def main() -> None:
                         reward_total=payload["reward_total"],
                         kl=metrics["kl"],
                         time_rollout_seconds=payload["time_rollout_seconds"],
+                        time_vllm_generate_seconds=payload["time_vllm_generate_seconds"],
                         time_reward_seconds=payload["time_reward_seconds"],
                         time_backward_seconds=payload["time_backward_seconds"],
                         time_optimizer_step_seconds=payload["time_optimizer_step_seconds"],
+                        time_weight_sync_seconds=payload["time_weight_sync_seconds"],
                         time_total_seconds=payload["time_total_seconds"],
                     )
                     _append_jsonl(
@@ -607,6 +650,7 @@ def main() -> None:
     if global_step % max(1, int(args.gradient_accumulation_steps)) != 0:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
+        _sync_vllm_after_optimizer_step(policy, raw_policy_model, args)
 
     if _is_main_process():
         raw_policy_model.save_pretrained(output_dir / "adapter")
@@ -629,6 +673,12 @@ def main() -> None:
                 "log_jsonl_path": str(log_path),
                 "rollout_jsonl_path": str(rollout_path),
                 "event_jsonl_path": str(event_path),
+                "use_vllm_generation": args.use_vllm_generation,
+                "vllm_host": args.vllm_host,
+                "vllm_port": args.vllm_port,
+                "vllm_gpu_indices": args.vllm_gpu_indices,
+                "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
+                "vllm_max_model_len": args.vllm_max_model_len,
             },
         )
         print(f"GRPO training complete. Adapter saved to {output_dir / 'adapter'}.")
