@@ -36,7 +36,10 @@ def _peft_parameter_name_for_vllm(model: Any, name: str) -> str | None:
 
 
 def _move_tensor_for_sync(parameter: Any, *, device: Any | None) -> Any:
-    tensor = parameter.detach()
+    if parameter.__class__.__name__ == "Params4bit" and callable(getattr(parameter, "dequantize", None)):
+        tensor = parameter.dequantize().detach()
+    else:
+        tensor = parameter.detach()
     if device is not None:
         tensor = tensor.to(device=device)
     return tensor

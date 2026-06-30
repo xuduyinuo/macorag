@@ -181,6 +181,20 @@ class _TinyPeftModel(torch.nn.Module):
         yield from self._named_params
 
 
+class Params4bit:
+    def __init__(self) -> None:
+        self.packed = torch.zeros(1)
+        self.dense = torch.ones(2, 3)
+        self.dequantized = False
+
+    def detach(self) -> torch.Tensor:
+        return self.packed
+
+    def dequantize(self) -> torch.Tensor:
+        self.dequantized = True
+        return self.dense
+
+
 def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
     model = _TinyParamModel()
 
@@ -241,6 +255,18 @@ def test_vllm_generation_client_syncs_parameters_on_communicator_device() -> Non
 
     assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+
+
+def test_vllm_generation_client_dequantizes_4bit_weights_before_sync() -> None:
+    from rl_training.vllm_client import _move_tensor_for_sync
+
+    parameter = Params4bit()
+
+    tensor = _move_tensor_for_sync(parameter, device=None)
+
+    assert parameter.dequantized is True
+    assert tensor.shape == (2, 3)
+    assert tensor.device.type == "cpu"
 
 
 def test_vllm_generation_client_merges_peft_adapter_before_sync() -> None:
