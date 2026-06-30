@@ -40,7 +40,7 @@ vllm_sync_trainable_only: true
 vllm_timeout_seconds: 120
 
 retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
-retrieval_spacy_model: en_core_web_trf
+retrieval_spacy_model: en_core_web_sm
 retrieval_top_k: 5
 retrieval_max_workers: 4
 retrieval_batch_size: 32
