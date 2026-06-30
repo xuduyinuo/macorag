@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from types import SimpleNamespace
 from pathlib import Path
 import socket
@@ -9,10 +10,49 @@ import pytest
 
 from evaluation.config import parse_args
 from evaluation.data import EvalSample, load_eval_samples
-from evaluation.evaluate_rag_model import format_prediction, run_predictions
+from evaluation.evaluate_rag_model import (
+    _build_retrieval_env,
+    _configure_visible_gpus,
+    format_prediction,
+    run_predictions,
+)
 
 
 from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
+
+
+def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = SimpleNamespace(gpu_indices="1", gpu_index=0)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    _configure_visible_gpus(args)
+
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_evaluate_build_retrieval_env_uses_eval_retrieval_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeRetrievalEnv:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.CachedLinearRAGRetrievalEnv", FakeRetrievalEnv)
+    args = SimpleNamespace(
+        retrieval_root="data/eval_1000_retrieval",
+        retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
+        retrieval_spacy_model="en_core_web_trf",
+        retrieval_top_k=5,
+        retrieval_max_workers=4,
+        retrieval_batch_size=32,
+        use_vectorized_retrieval=True,
+    )
+
+    _build_retrieval_env(args)
+
+    assert captured["retrieval_root"] == "data/eval_1000_retrieval"
+    assert captured["embedding_model"] == "sentence-transformers/all-mpnet-base-v2"
+    assert captured["top_k"] == 5
 
 
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
