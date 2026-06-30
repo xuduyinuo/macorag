@@ -160,7 +160,7 @@ class VLLMSharedPolicy(HFSharedPolicy):
         prompt_ids = self._encode_prompt(prompt)
         generate_start = time.perf_counter()
         completion, response = self.vllm_client.generate(
-            prompt_ids,
+            self.tokenizer.decode(prompt_ids, skip_special_tokens=False),
             max_tokens=self.max_completion_length,
             temperature=self.temperature,
             top_p=self.top_p,

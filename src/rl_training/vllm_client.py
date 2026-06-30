@@ -25,6 +25,7 @@ class VLLMGenerationClient:
         self.port = port
         self.timeout_seconds = timeout_seconds
         self._backend = backend
+        self._communicator_initialized = False
 
     @property
     def backend(self) -> Any:
@@ -41,7 +42,11 @@ class VLLMGenerationClient:
                     "Installed TRL does not expose trl.extras.vllm_client.VLLMClient. "
                     "Install a TRL/vLLM combination with vLLM training support."
                 ) from exc
-            self._backend = VLLMClient(host=self.host, port=self.port, connection_timeout=self.timeout_seconds)
+            self._backend = VLLMClient(
+                host=self.host,
+                server_port=self.port,
+                connection_timeout=self.timeout_seconds,
+            )
         return self._backend
 
     def check_server(self) -> None:
@@ -52,7 +57,7 @@ class VLLMGenerationClient:
 
     def generate(
         self,
-        prompt_token_ids: list[int],
+        prompt: str,
         *,
         max_tokens: int,
         temperature: float,
@@ -63,7 +68,7 @@ class VLLMGenerationClient:
         if generator is None:
             raise SystemExit("TRL VLLMClient is missing generate(); installed TRL is incompatible.")
         outputs = generator(
-            prompts=[prompt_token_ids],
+            prompts=[prompt],
             n=1,
             repetition_penalty=1.0,
             temperature=temperature,
@@ -72,14 +77,20 @@ class VLLMGenerationClient:
             max_tokens=max_tokens,
         )
         first = outputs[0]
-        token_ids = list(getattr(first, "token_ids", None) or first.get("token_ids", []))
-        text = str(getattr(first, "text", None) or first.get("text", ""))
-        return token_ids, text
+        if first and isinstance(first[0], list):
+            first = first[0]
+        return list(first), ""
 
     def sync_trainable_parameters(self, model: Any) -> float:
         updater = getattr(self.backend, "update_named_param", None)
         if updater is None:
             raise SystemExit("TRL VLLMClient is missing update_named_param(); hot LoRA sync is unavailable.")
+        if not self._communicator_initialized:
+            initializer = getattr(self.backend, "init_communicator", None)
+            if initializer is None:
+                raise SystemExit("TRL VLLMClient is missing init_communicator(); hot LoRA sync is unavailable.")
+            initializer()
+            self._communicator_initialized = True
         start = time.perf_counter()
         for name, tensor in collect_trainable_named_parameters(model).items():
             updater(name, tensor)

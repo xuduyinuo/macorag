@@ -165,11 +165,16 @@ class _FakeTRLClient:
     def __init__(self) -> None:
         self.updated: list[tuple[str, torch.Tensor]] = []
         self.health_checked = False
+        self.communicator_initialized = False
 
     def check_server(self) -> None:
         self.health_checked = True
 
+    def init_communicator(self) -> None:
+        self.communicator_initialized = True
+
     def update_named_param(self, name: str, weights: torch.Tensor) -> None:
+        assert self.communicator_initialized is True
         self.updated.append((name, weights))
 
 
@@ -183,6 +188,7 @@ def test_vllm_generation_client_syncs_trainable_parameters() -> None:
     elapsed = client.sync_trainable_parameters(model)
 
     assert elapsed >= 0.0
+    assert backend.communicator_initialized is True
     assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
     assert all(tensor.device.type == "cpu" for _, tensor in backend.updated)
 
@@ -217,7 +223,8 @@ class _FakeVLLMClient:
         self.prompts: list[list[int]] = []
 
     def generate(self, prompt_token_ids, *, max_tokens, temperature, top_p, top_k):
-        self.prompts.append(list(prompt_token_ids))
+        assert isinstance(prompt_token_ids, str)
+        self.prompts.append([ord(char) for char in prompt_token_ids[:4]])
         return [10, 11], "decoded response"
 
 
