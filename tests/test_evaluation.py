@@ -785,3 +785,92 @@ def test_main_validates_retrieval_assets_before_loading_model(
 
     with pytest.raises(FileNotFoundError, match="sentence_embedding.parquet"):
         main([])
+
+
+def test_main_clears_stale_progress_before_startup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "eval_run"
+    output_dir.mkdir(parents=True)
+    stale_progress = output_dir / "predictions.jsonl"
+    stale_progress.write_text('{"qid": "stale"}\n', encoding="utf-8")
+    retrieval_root = tmp_path / "retrieval"
+    dataset_dir = retrieval_root / "hotpotqa"
+    dataset_dir.mkdir(parents=True)
+    for file_name in [
+        "passage_embedding.parquet",
+        "entity_embedding.parquet",
+        "sentence_embedding.parquet",
+        "LinearRAG.graphml",
+    ]:
+        (dataset_dir / file_name).write_text("ok", encoding="utf-8")
+
+    args = SimpleNamespace(
+        model_path="model/base",
+        adapter_path="outputs/grpo/adapter",
+        data_root="data/eval_1000",
+        data_files=[],
+        retrieval_root=str(retrieval_root),
+        output_dir=str(output_dir),
+        fixed_output_dir=True,
+        system_prompt="sys",
+        max_samples=None,
+        seed=42,
+        max_rounds=3,
+        max_prompt_length=128,
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        top_k=5,
+        bf16=False,
+        fp16=False,
+        load_4bit=False,
+        gpu_index=0,
+        gpu_indices="1",
+        disable_tqdm=True,
+        retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
+        retrieval_spacy_model="en_core_web_trf",
+        retrieval_top_k=5,
+        retrieval_max_workers=4,
+        retrieval_batch_size=32,
+        use_vectorized_retrieval=True,
+        skip_judge=True,
+        judge_model="qwen-plus",
+        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        judge_api_key_env="DASHSCOPE_API_KEY",
+        judge_temperature=0.0,
+        judge_max_tokens=8,
+        judge_timeout=120,
+        judge_retries=3,
+        judge_retry_sleep_seconds=2.0,
+        judge_workers=4,
+    )
+    samples = [
+        EvalSample(
+            qid="q1",
+            dataset="hotpotqa",
+            question="Question?",
+            answer="Answer",
+            answer_aliases=[],
+            supporting_facts=[],
+            metadata={},
+        )
+    ]
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._configure_visible_gpus", lambda parsed_args: None)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: output_dir)
+    monkeypatch.setattr(
+        "evaluation.evaluate_rag_model.load_eval_samples",
+        lambda **kwargs: (samples, {"loaded_samples": 1}),
+    )
+    monkeypatch.setattr(
+        "evaluation.evaluate_rag_model._load_policy",
+        lambda parsed_args: (_ for _ in ()).throw(RuntimeError("model load failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="model load failed"):
+        main([])
+
+    assert not stale_progress.exists()

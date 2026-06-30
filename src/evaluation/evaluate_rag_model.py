@@ -37,6 +37,13 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _clear_prediction_artifacts(output_dir: Path) -> None:
+    for file_name in ("predictions.jsonl", "predictions.json"):
+        path = output_dir / file_name
+        if path.exists():
+            path.unlink()
+
+
 def format_prediction(sample: EvalSample, result: Any, error: str | None = None) -> dict[str, Any]:
     prediction = {
         "qid": sample.qid,
@@ -254,6 +261,7 @@ def main(argv: list[str] | None = None) -> int:
     _configure_visible_gpus(args)
     random.seed(args.seed)
     output_dir = _resolved_output_dir(args)
+    _clear_prediction_artifacts(output_dir)
     _write_json(output_dir / "run_config.json", _args_to_jsonable(args))
 
     samples, sample_summary = load_eval_samples(
