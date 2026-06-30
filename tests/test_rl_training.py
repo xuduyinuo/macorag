@@ -385,6 +385,20 @@ def test_run_train_grpo_script_derives_gpu_visibility_from_yaml() -> None:
     assert "--nproc_per_node=${NPROC_PER_NODE}" in script
 
 
+def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
+    script = Path("scripts/run_grpo_vllm_server.sh").read_text(encoding="utf-8")
+
+    assert "CONFIG_PATH=" in script
+    assert "vllm_gpu_indices" in script
+    assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
+    assert "trl vllm-serve" in script
+    assert "--model" in script
+    assert "--host" in script
+    assert "--port" in script
+    assert "--tensor-parallel-size" in script
+    assert "--gpu-memory-utilization" in script
+
+
 def test_write_train_event_records_sample_progress(tmp_path: Path) -> None:
     event_path = tmp_path / "train_events.jsonl"
 
