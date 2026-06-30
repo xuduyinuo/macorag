@@ -54,6 +54,15 @@ def format_prediction(sample: EvalSample, result: Any, error: str | None = None)
     return prediction
 
 
+def _is_infrastructure_error(exc: Exception) -> bool:
+    if isinstance(exc, FileNotFoundError):
+        return True
+    if not isinstance(exc, RuntimeError):
+        return False
+    msg = str(exc).lower()
+    return ("index" in msg and ("not found" in msg or "missing" in msg or "no such file" in msg))
+
+
 def run_predictions(
     args: Any,
     samples: list[EvalSample],
@@ -73,6 +82,8 @@ def run_predictions(
             result = executor.run(question=sample.question, dataset=sample.dataset)
             prediction = format_prediction(sample, result)
         except Exception as exc:
+            if _is_infrastructure_error(exc):
+                raise
             prediction = format_prediction(sample, result=None, error=str(exc))
         predictions.append(prediction)
         _append_jsonl(progress_path, prediction)

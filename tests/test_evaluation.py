@@ -393,3 +393,23 @@ def test_run_predictions_flushes_jsonl_progress(tmp_path: Path, monkeypatch: pyt
     progress_lines = (tmp_path / "predictions.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(progress_lines) == 1
     assert json.loads(progress_lines[0])["qid"] == "q1"
+
+
+def test_run_predictions_re_raises_missing_index_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True)
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            raise FileNotFoundError("LinearRAG index not found")
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    with pytest.raises(FileNotFoundError):
+        run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert not (tmp_path / "predictions.jsonl").exists()
+    assert not (tmp_path / "predictions.json").exists()
