@@ -795,6 +795,10 @@ def test_main_clears_stale_progress_before_startup_failure(
     output_dir.mkdir(parents=True)
     stale_progress = output_dir / "predictions.jsonl"
     stale_progress.write_text('{"qid": "stale"}\n', encoding="utf-8")
+    stale_predictions = output_dir / "predictions.json"
+    stale_predictions.write_text('[{"qid": "stale"}]\n', encoding="utf-8")
+    stale_results = output_dir / "evaluation_results.json"
+    stale_results.write_text('{"llm_accuracy": 1.0}\n', encoding="utf-8")
     retrieval_root = tmp_path / "retrieval"
     dataset_dir = retrieval_root / "hotpotqa"
     dataset_dir.mkdir(parents=True)
@@ -874,3 +878,5 @@ def test_main_clears_stale_progress_before_startup_failure(
         main([])
 
     assert not stale_progress.exists()
+    assert not stale_predictions.exists()
+    assert not stale_results.exists()

@@ -38,7 +38,7 @@ def _write_json(path: Path, payload: Any) -> None:
 
 
 def _clear_prediction_artifacts(output_dir: Path) -> None:
-    for file_name in ("predictions.jsonl", "predictions.json"):
+    for file_name in ("predictions.jsonl", "predictions.json", "evaluation_results.json"):
         path = output_dir / file_name
         if path.exists():
             path.unlink()
