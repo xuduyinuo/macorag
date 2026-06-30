@@ -81,9 +81,15 @@ def load_eval_samples(
     max_samples: int | None = None,
 ) -> tuple[list[EvalSample], dict[str, Any]]:
     root = Path(data_root)
-    files = _resolve_files(root, tuple(data_files or ()))
+    explicit_files = tuple(data_files or ())
+    files = _resolve_files(root, explicit_files)
     if not files:
         raise FileNotFoundError(f"No evaluation jsonl files found under {root}")
+    if explicit_files:
+        missing_files = [path for path in files if not path.exists()]
+        if missing_files:
+            missing = ", ".join(str(path) for path in missing_files)
+            raise FileNotFoundError(f"Evaluation data file not found: {missing}")
 
     samples: list[EvalSample] = []
     skipped = 0
@@ -92,8 +98,6 @@ def load_eval_samples(
     for path in files:
         if max_samples is not None and len(samples) >= max_samples:
             break
-        if not path.exists():
-            raise FileNotFoundError(f"Evaluation data file not found: {path}")
         source_files.append(str(path))
         fallback_dataset = path.parent.name or path.stem.replace("_dev", "")
         for row in _read_jsonl(path):

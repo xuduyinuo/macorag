@@ -60,7 +60,28 @@ def _is_infrastructure_error(exc: Exception) -> bool:
     if not isinstance(exc, RuntimeError):
         return False
     msg = str(exc).lower()
-    return ("index" in msg and ("not found" in msg or "missing" in msg or "no such file" in msg))
+    infra_terms = (
+        "spacy",
+        "sentence-transformers",
+        "sentence_transformers",
+        "linearrag",
+        "retrieval",
+        "embedding",
+        "graphml",
+        "igraph",
+        "module",
+        "dependency",
+        "index",
+    )
+    fatal_terms = (
+        "missing",
+        "cannot import",
+        "install",
+        "not found",
+        "no such file",
+        "linearrag index files missing",
+    )
+    return any(term in msg for term in fatal_terms) and any(term in msg for term in infra_terms)
 
 
 def run_predictions(
@@ -72,6 +93,8 @@ def run_predictions(
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_path = output_dir / "predictions.jsonl"
+    if progress_path.exists():
+        progress_path.unlink()
     predictions: list[dict[str, Any]] = []
     iterator = tqdm(samples, desc="Evaluating RAG samples", unit="sample", disable=bool(args.disable_tqdm))
     for sample in iterator:
@@ -190,6 +213,26 @@ def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
     )
 
 
+def validate_retrieval_assets(retrieval_root: str | Path, datasets: list[str] | set[str] | tuple[str, ...]) -> None:
+    required_files = (
+        "passage_embedding.parquet",
+        "entity_embedding.parquet",
+        "sentence_embedding.parquet",
+        "LinearRAG.graphml",
+    )
+    root = Path(retrieval_root)
+    missing_paths: list[Path] = []
+    for dataset in sorted({str(dataset).strip() for dataset in datasets if str(dataset).strip()}):
+        dataset_root = root / dataset
+        for file_name in required_files:
+            path = dataset_root / file_name
+            if not path.exists():
+                missing_paths.append(path)
+    if missing_paths:
+        missing = ", ".join(str(path) for path in missing_paths)
+        raise FileNotFoundError(f"LinearRAG index files missing: {missing}")
+
+
 def _resolved_output_dir(args: Any) -> Path:
     output_dir = Path(args.output_dir)
     if args.fixed_output_dir:
@@ -219,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
         max_samples=args.max_samples,
     )
     _write_json(output_dir / "data_summary.json", sample_summary)
+    validate_retrieval_assets(args.retrieval_root, [sample.dataset for sample in samples])
     policy = _load_policy(args)
     retrieval_env = _build_retrieval_env(args)
     run_predictions(args, samples, policy, retrieval_env, output_dir)

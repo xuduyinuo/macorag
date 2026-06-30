@@ -13,20 +13,27 @@ cd "${REPO_ROOT}"
 
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/evaluate_rag_model.yml}"
 
-YAML_GPU_INDICES="$(
-  "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
+EFFECTIVE_GPU_INDICES="$(
+  "${PYTHON:-python}" - "${CONFIG_PATH}" "$@" <<'PY'
 import sys
-from pathlib import Path
 
-import yaml
+from evaluation.config import parse_args
 
-config_path = Path(sys.argv[1])
-config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-gpu_indices = str(config.get("gpu_indices") or config.get("gpu_index") or "0").strip()
-print(gpu_indices)
+config_path = sys.argv[1]
+args = parse_args(["--config", config_path, *sys.argv[2:]])
+gpu_indices = str(getattr(args, "gpu_indices", "") or "").strip()
+if gpu_indices:
+    print(gpu_indices)
+else:
+    print(getattr(args, "gpu_index", 0))
 PY
 )"
 
-export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"
+export CUDA_VISIBLE_DEVICES="${EFFECTIVE_GPU_INDICES}"
+
+if [[ "${MACORAG_EVAL_DRY_RUN:-0}" == "1" ]]; then
+  printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES}"
+  exit 0
+fi
 
 "${PYTHON:-python}" -m evaluation.evaluate_rag_model --config "${CONFIG_PATH}" "$@"

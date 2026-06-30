@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 from types import SimpleNamespace
 from pathlib import Path
@@ -25,14 +26,55 @@ from evaluation.evaluate_rag_model import (
 from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
 
 
+def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> str:
+    env = os.environ.copy()
+    env["CONFIG_PATH"] = str(config_path)
+    env["MACORAG_EVAL_DRY_RUN"] = "1"
+    result = subprocess.run(
+        ["bash", "scripts/evaluate_rag_model.sh", *extra_args],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+        env=env,
+    )
+    return result.stdout
+
+
 def test_evaluate_shell_script_derives_gpu_visibility_from_yaml() -> None:
     script = Path("scripts/evaluate_rag_model.sh").read_text(encoding="utf-8")
 
     assert "CONFIG_PATH=" in script
-    assert "yaml.safe_load" in script
-    assert 'export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"' in script
+    assert "parse_args" in script
+    assert 'export CUDA_VISIBLE_DEVICES="${EFFECTIVE_GPU_INDICES}"' in script
     assert 'export MACORAG_SILENT_RETRIEVAL="${MACORAG_SILENT_RETRIEVAL:-1}"' in script
     assert "-m evaluation.evaluate_rag_model --config" in script
+
+
+def test_evaluate_shell_script_uses_cli_config_override_for_cuda_visibility(tmp_path: Path) -> None:
+    default_config = tmp_path / "default.yml"
+    default_config.write_text('gpu_indices: "1"\n', encoding="utf-8")
+    override_config = tmp_path / "override.yml"
+    override_config.write_text('gpu_indices: "5"\n', encoding="utf-8")
+
+    output = _run_eval_launcher_dry_run(
+        config_path=default_config,
+        extra_args=["--config", str(override_config)],
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=5" in output
+
+
+def test_evaluate_shell_script_uses_cli_gpu_indices_override_for_cuda_visibility(tmp_path: Path) -> None:
+    config = tmp_path / "evaluate_rag_model.yml"
+    config.write_text('gpu_indices: "1"\n', encoding="utf-8")
+
+    output = _run_eval_launcher_dry_run(
+        config_path=config,
+        extra_args=["--gpu-indices", "7,8"],
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=7,8" in output
 
 
 def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -315,7 +357,7 @@ def test_load_eval_samples_uses_gold_answer_when_answer_is_null(tmp_path: Path) 
     assert samples[0].answer == "David Arquette"
 
 
-def test_load_eval_samples_stops_at_max_samples_before_later_missing_file(tmp_path: Path) -> None:
+def test_load_eval_samples_fails_fast_for_missing_explicit_file_even_after_max_samples(tmp_path: Path) -> None:
     data_root = tmp_path / "eval"
     _write_jsonl(
         data_root / "hotpotqa" / "first.jsonl",
@@ -330,18 +372,15 @@ def test_load_eval_samples_stops_at_max_samples_before_later_missing_file(tmp_pa
         ],
     )
 
-    samples, summary = load_eval_samples(
-        data_root=data_root,
-        data_files=[
-            str(data_root / "hotpotqa" / "first.jsonl"),
-            str(data_root / "hotpotqa" / "missing.jsonl"),
-        ],
-        max_samples=1,
-    )
-
-    assert len(samples) == 1
-    assert summary["loaded_samples"] == 1
-    assert summary["source_files"] == [str(data_root / "hotpotqa" / "first.jsonl")]
+    with pytest.raises(FileNotFoundError, match="missing.jsonl"):
+        load_eval_samples(
+            data_root=data_root,
+            data_files=[
+                str(data_root / "hotpotqa" / "first.jsonl"),
+                str(data_root / "hotpotqa" / "missing.jsonl"),
+            ],
+            max_samples=1,
+        )
 
 
 def test_explicit_data_files_skips_corpus_jsonl(tmp_path: Path) -> None:
@@ -574,6 +613,47 @@ def test_run_predictions_flushes_jsonl_progress(tmp_path: Path, monkeypatch: pyt
     assert json.loads(progress_lines[0])["qid"] == "q1"
 
 
+def test_run_predictions_truncates_stale_progress_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True)
+    progress_path = tmp_path / "predictions.jsonl"
+    progress_path.write_text('{"qid": "stale"}\n', encoding="utf-8")
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            return SimpleNamespace(
+                final_answer="Answer",
+                trajectory=[{"round": 0}],
+                parse_errors=[],
+                state=SimpleNamespace(retrieval_count=0),
+            )
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    progress_lines = progress_path.read_text(encoding="utf-8").strip().splitlines()
+    assert progress_lines == [
+        json.dumps(
+            {
+                "qid": "q1",
+                "dataset": "hotpotqa",
+                "question": "Question?",
+                "pred_answer": "Answer",
+                "gold_answer": "Answer",
+                "answer_aliases": [],
+                "trajectory": [{"round": 0}],
+                "parse_errors": [],
+                "retrieval_count": 0,
+            },
+            ensure_ascii=False,
+        )
+    ]
+
+
 def test_run_predictions_re_raises_missing_index_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
     args = SimpleNamespace(max_rounds=1, disable_tqdm=True)
@@ -592,3 +672,116 @@ def test_run_predictions_re_raises_missing_index_error(tmp_path: Path, monkeypat
 
     assert not (tmp_path / "predictions.jsonl").exists()
     assert not (tmp_path / "predictions.json").exists()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Missing spaCy model en_core_web_trf. Install it before retrieval startup.",
+        "Cannot import sentence_transformers. Install sentence-transformers first.",
+    ],
+)
+def test_run_predictions_re_raises_runtime_dependency_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    message: str,
+) -> None:
+    sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True)
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            raise RuntimeError(message)
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    with pytest.raises(RuntimeError, match=message):
+        run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert not (tmp_path / "predictions.jsonl").exists()
+
+
+def test_main_validates_retrieval_assets_before_loading_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    retrieval_root = tmp_path / "retrieval"
+    dataset_dir = retrieval_root / "hotpotqa"
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    for file_name in [
+        "passage_embedding.parquet",
+        "entity_embedding.parquet",
+        "LinearRAG.graphml",
+    ]:
+        (dataset_dir / file_name).write_text("ok", encoding="utf-8")
+
+    args = SimpleNamespace(
+        model_path="model/base",
+        adapter_path="outputs/grpo/adapter",
+        data_root="data/eval_1000",
+        data_files=[],
+        retrieval_root=str(retrieval_root),
+        output_dir=str(tmp_path / "outputs"),
+        fixed_output_dir=True,
+        system_prompt="sys",
+        max_samples=None,
+        seed=42,
+        max_rounds=3,
+        max_prompt_length=128,
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        top_k=5,
+        bf16=False,
+        fp16=False,
+        load_4bit=False,
+        gpu_index=0,
+        gpu_indices="1",
+        disable_tqdm=True,
+        retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
+        retrieval_spacy_model="en_core_web_trf",
+        retrieval_top_k=5,
+        retrieval_max_workers=4,
+        retrieval_batch_size=32,
+        use_vectorized_retrieval=True,
+        skip_judge=True,
+        judge_model="qwen-plus",
+        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        judge_api_key_env="DASHSCOPE_API_KEY",
+        judge_temperature=0.0,
+        judge_max_tokens=8,
+        judge_timeout=120,
+        judge_retries=3,
+        judge_retry_sleep_seconds=2.0,
+        judge_workers=4,
+    )
+    samples = [
+        EvalSample(
+            qid="q1",
+            dataset="hotpotqa",
+            question="Question?",
+            answer="Answer",
+            answer_aliases=[],
+            supporting_facts=[],
+            metadata={},
+        )
+    ]
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._configure_visible_gpus", lambda parsed_args: None)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: tmp_path / "eval_run")
+    monkeypatch.setattr(
+        "evaluation.evaluate_rag_model.load_eval_samples",
+        lambda **kwargs: (samples, {"loaded_samples": 1}),
+    )
+
+    def fail_load_policy(_parsed_args):
+        raise AssertionError("_load_policy should not run before retrieval asset preflight")
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model._load_policy", fail_load_policy)
+
+    with pytest.raises(FileNotFoundError, match="sentence_embedding.parquet"):
+        main([])
