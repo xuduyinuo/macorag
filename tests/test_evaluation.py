@@ -25,6 +25,16 @@ from evaluation.evaluate_rag_model import (
 from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
 
 
+def test_evaluate_shell_script_derives_gpu_visibility_from_yaml() -> None:
+    script = Path("scripts/evaluate_rag_model.sh").read_text(encoding="utf-8")
+
+    assert "CONFIG_PATH=" in script
+    assert "yaml.safe_load" in script
+    assert 'export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"' in script
+    assert 'export MACORAG_SILENT_RETRIEVAL="${MACORAG_SILENT_RETRIEVAL:-1}"' in script
+    assert "-m evaluation.evaluate_rag_model --config" in script
+
+
 def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     args = SimpleNamespace(gpu_indices="1", gpu_index=0)
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")

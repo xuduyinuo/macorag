@@ -1,0 +1,42 @@
+model_path: "model/Qwen2.5-3B-Instruct"
+adapter_path: "outputs/grpo_qwen2.5-3b/adapter"
+data_root: "data/eval_1000"
+data_files: []
+retrieval_root: "data/eval_1000_retrieval"
+output_dir: "outputs/eval_rag_model"
+fixed_output_dir: false
+system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
+max_samples: null
+seed: 42
+
+max_rounds: 3
+max_prompt_length: 4096
+max_completion_length: 256
+temperature: 0.0
+top_p: 0.95
+top_k: 5
+
+retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
+retrieval_spacy_model: en_core_web_trf
+retrieval_top_k: 5
+retrieval_max_workers: 4
+retrieval_batch_size: 32
+use_vectorized_retrieval: true
+
+skip_judge: false
+judge_model: "qwen-plus"
+judge_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+judge_api_key_env: "DASHSCOPE_API_KEY"
+judge_temperature: 0.0
+judge_max_tokens: 8
+judge_timeout: 120
+judge_retries: 3
+judge_retry_sleep_seconds: 2.0
+judge_workers: 4
+
+bf16: false
+fp16: false
+load_4bit: true
+gpu_index: 0
+gpu_indices: "1"
+disable_tqdm: false
