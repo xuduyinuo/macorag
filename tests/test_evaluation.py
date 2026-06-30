@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from pathlib import Path
 import socket
 
 import pytest
 
 from evaluation.config import parse_args
-from evaluation.data import load_eval_samples
+from evaluation.data import EvalSample, load_eval_samples
+from evaluation.evaluate_rag_model import format_prediction, run_predictions
 
 
 from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
@@ -326,3 +328,68 @@ def test_evaluate_predictions_includes_judge_metadata_when_provided(tmp_path: Pa
 
     assert summary["judge_metadata"] == metadata
     assert evaluation_results["judge_metadata"] == metadata
+
+
+def test_format_prediction_matches_linearrag_evaluator_schema() -> None:
+    sample = EvalSample(
+        qid="q1",
+        dataset="hotpotqa",
+        question="Who directed The Tripper?",
+        answer="David Arquette",
+        answer_aliases=["Arquette"],
+        supporting_facts=[],
+        metadata={"split": "dev"},
+    )
+    result = SimpleNamespace(
+        final_answer="David Arquette",
+        trajectory=[{"round": 0}],
+        parse_errors=[],
+        state=SimpleNamespace(retrieval_count=1),
+    )
+
+    prediction = format_prediction(sample, result)
+
+    assert prediction["qid"] == "q1"
+    assert prediction["dataset"] == "hotpotqa"
+    assert prediction["pred_answer"] == "David Arquette"
+    assert prediction["gold_answer"] == "David Arquette"
+    assert prediction["answer_aliases"] == ["Arquette"]
+    assert prediction["trajectory"] == [{"round": 0}]
+    assert prediction["parse_errors"] == []
+    assert prediction["retrieval_count"] == 1
+
+
+class FakePolicy:
+    pass
+
+
+class FakeRetrievalEnv:
+    def query(self, dataset: str, query: str) -> dict:
+        return {"query": query, "passages": []}
+
+
+def test_run_predictions_flushes_jsonl_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True)
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            return SimpleNamespace(
+                final_answer="Answer",
+                trajectory=[{"round": 0}],
+                parse_errors=[],
+                state=SimpleNamespace(retrieval_count=0),
+            )
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    predictions = run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert predictions[0]["pred_answer"] == "Answer"
+    assert json.loads((tmp_path / "predictions.json").read_text(encoding="utf-8"))[0]["qid"] == "q1"
+    progress_lines = (tmp_path / "predictions.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(progress_lines) == 1
+    assert json.loads(progress_lines[0])["qid"] == "q1"
