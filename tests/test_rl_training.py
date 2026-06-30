@@ -149,6 +149,38 @@ class _TinyParamModel(torch.nn.Module):
         self.lora_b = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True)
 
 
+class _TinyPeftModel(torch.nn.Module):
+    prefix = "lora_"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.merged = False
+        self.unmerged = False
+        self._named_params = [
+            (
+                "base_model.model.layers.0.q_proj.base_layer.weight",
+                torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False),
+            ),
+            (
+                "base_model.model.layers.0.q_proj.lora_A.default.weight",
+                torch.nn.Parameter(torch.tensor([2.0]), requires_grad=True),
+            ),
+            (
+                "base_model.model.layers.0.q_proj.lora_B.default.weight",
+                torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True),
+            ),
+        ]
+
+    def merge_adapter(self) -> None:
+        self.merged = True
+
+    def unmerge_adapter(self) -> None:
+        self.unmerged = True
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        yield from self._named_params
+
+
 def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
     model = _TinyParamModel()
 
@@ -162,19 +194,24 @@ def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors()
 
 
 class _FakeTRLClient:
-    def __init__(self) -> None:
+    def __init__(self, *, sync_device: torch.device | None = None) -> None:
         self.updated: list[tuple[str, torch.Tensor]] = []
         self.health_checked = False
         self.communicator_initialized = False
+        self.sync_device = sync_device
 
     def check_server(self) -> None:
         self.health_checked = True
 
     def init_communicator(self) -> None:
         self.communicator_initialized = True
+        if self.sync_device is not None:
+            self.pynccl_comm = type("FakeCommunicator", (), {"device": self.sync_device})()
 
     def update_named_param(self, name: str, weights: torch.Tensor) -> None:
         assert self.communicator_initialized is True
+        if self.sync_device is not None:
+            assert weights.device == self.sync_device
         self.updated.append((name, weights))
 
 
@@ -191,6 +228,34 @@ def test_vllm_generation_client_syncs_trainable_parameters() -> None:
     assert backend.communicator_initialized is True
     assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
     assert all(tensor.device.type == "cpu" for _, tensor in backend.updated)
+
+
+def test_vllm_generation_client_syncs_parameters_on_communicator_device() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient(sync_device=torch.device("meta"))
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    model = _TinyParamModel()
+
+    client.sync_trainable_parameters(model)
+
+    assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
+    assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+
+
+def test_vllm_generation_client_merges_peft_adapter_before_sync() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient(sync_device=torch.device("meta"))
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    model = _TinyPeftModel()
+
+    client.sync_trainable_parameters(model)
+
+    assert model.merged is True
+    assert model.unmerged is True
+    assert [name for name, _ in backend.updated] == ["layers.0.q_proj.weight"]
+    assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
 
 
 class _FakeTokenizer:
