@@ -13,7 +13,9 @@ from evaluation.data import EvalSample, load_eval_samples
 from evaluation.evaluate_rag_model import (
     _build_retrieval_env,
     _configure_visible_gpus,
+    _torch_dtype,
     format_prediction,
+    main,
     run_predictions,
 )
 
@@ -53,6 +55,106 @@ def test_evaluate_build_retrieval_env_uses_eval_retrieval_config(monkeypatch: py
     assert captured["retrieval_root"] == "data/eval_1000_retrieval"
     assert captured["embedding_model"] == "sentence-transformers/all-mpnet-base-v2"
     assert captured["top_k"] == 5
+
+
+def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeJudgeClient:
+        def __init__(self, **kwargs) -> None:
+            captured["judge_client_kwargs"] = kwargs
+
+    def fake_evaluate_predictions(predictions_path: Path, *, client, max_workers: int, judge_metadata=None):
+        captured["predictions_path"] = predictions_path
+        captured["client"] = client
+        captured["max_workers"] = max_workers
+        captured["judge_metadata"] = judge_metadata
+        return {
+            "llm_accuracy": 0.0,
+            "contain_accuracy": 0.0,
+            "num_samples": 0,
+            "judge_metadata": judge_metadata,
+        }
+
+    args = SimpleNamespace(
+        model_path="model/base",
+        adapter_path="outputs/grpo/adapter",
+        data_root="data/eval_1000",
+        data_files=[],
+        retrieval_root="data/eval_1000_retrieval",
+        output_dir=str(tmp_path / "outputs"),
+        fixed_output_dir=True,
+        system_prompt="sys",
+        max_samples=None,
+        seed=42,
+        max_rounds=3,
+        max_prompt_length=128,
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        top_k=5,
+        bf16=False,
+        fp16=False,
+        load_4bit=False,
+        gpu_index=0,
+        gpu_indices="1",
+        disable_tqdm=True,
+        retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
+        retrieval_spacy_model="en_core_web_trf",
+        retrieval_top_k=5,
+        retrieval_max_workers=4,
+        retrieval_batch_size=32,
+        use_vectorized_retrieval=True,
+        skip_judge=False,
+        judge_model="qwen-plus",
+        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        judge_api_key_env="DASHSCOPE_API_KEY",
+        judge_temperature=0.0,
+        judge_max_tokens=8,
+        judge_timeout=120,
+        judge_retries=3,
+        judge_retry_sleep_seconds=2.0,
+        judge_workers=4,
+    )
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._configure_visible_gpus", lambda parsed_args: None)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: tmp_path / "eval_run")
+    monkeypatch.setattr("evaluation.evaluate_rag_model.load_eval_samples", lambda **kwargs: ([], {"loaded_samples": 0}))
+    monkeypatch.setattr("evaluation.evaluate_rag_model._load_policy", lambda parsed_args: object())
+    monkeypatch.setattr("evaluation.evaluate_rag_model._build_retrieval_env", lambda parsed_args: object())
+    monkeypatch.setattr("evaluation.evaluate_rag_model.run_predictions", lambda *args, **kwargs: [])
+    monkeypatch.setattr("evaluation.evaluate_rag_model.BailianJudgeClient", FakeJudgeClient)
+    monkeypatch.setattr("evaluation.evaluate_rag_model.evaluate_predictions", fake_evaluate_predictions)
+
+    assert main([]) == 0
+    assert captured["judge_metadata"] == {
+        "judge_model": "qwen-plus",
+        "judge_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
+        "judge_api_key_env": "DASHSCOPE_API_KEY",
+        "judge_temperature": 0.0,
+        "judge_max_tokens": 8,
+        "judge_timeout": 120,
+        "judge_retries": 3,
+        "judge_retry_sleep_seconds": 2.0,
+        "judge_workers": 4,
+    }
+    assert captured["max_workers"] == 4
+
+
+def test_evaluate_torch_dtype_uses_float32_on_cpu_when_no_precision_flag_is_set() -> None:
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        float16="float16",
+        float32="float32",
+        bfloat16="bfloat16",
+    )
+    args = SimpleNamespace(fp16=False, bf16=False)
+
+    assert _torch_dtype(args, fake_torch) == fake_torch.float32
 
 
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:

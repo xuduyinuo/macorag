@@ -121,6 +121,8 @@ def _torch_dtype(args: Any, torch: Any) -> Any:
         return torch.bfloat16
     if args.fp16:
         return torch.float16
+    if not torch.cuda.is_available():
+        return getattr(torch, "float32", torch.float16)
     return torch.float16
 
 
@@ -232,9 +234,23 @@ def main(argv: list[str] | None = None) -> int:
             retries=args.judge_retries,
             retry_sleep_seconds=args.judge_retry_sleep_seconds,
         )
-        summary = evaluate_predictions(output_dir / "predictions.json", client=client, max_workers=args.judge_workers)
-        summary["judge_model"] = args.judge_model
-        _write_json(output_dir / "evaluation_results.json", summary)
+        judge_metadata = {
+            "judge_model": args.judge_model,
+            "judge_endpoint": args.judge_endpoint,
+            "judge_api_key_env": args.judge_api_key_env,
+            "judge_temperature": args.judge_temperature,
+            "judge_max_tokens": args.judge_max_tokens,
+            "judge_timeout": args.judge_timeout,
+            "judge_retries": args.judge_retries,
+            "judge_retry_sleep_seconds": args.judge_retry_sleep_seconds,
+            "judge_workers": args.judge_workers,
+        }
+        evaluate_predictions(
+            output_dir / "predictions.json",
+            client=client,
+            max_workers=args.judge_workers,
+            judge_metadata=judge_metadata,
+        )
 
     print(f"Evaluation artifacts written to {output_dir}")
     return 0
