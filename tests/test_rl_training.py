@@ -14,6 +14,8 @@ from rl_training.policy import sequence_logprobs
 from rl_training.rewards import compute_answer_f1, compute_rl_rewards
 from rl_training.train_grpo_macorag import _parse_gpu_indices
 from rl_training.train_grpo_macorag import _build_policy
+from rl_training.train_grpo_macorag import _extract_vllm_server_model_paths
+from rl_training.train_grpo_macorag import _validate_local_vllm_server_model
 from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _write_train_event
@@ -139,6 +141,52 @@ def test_validate_vllm_gpu_placement_allows_separate_gpus() -> None:
     args = Namespace(use_vllm_generation=True, gpu_indices="1", gpu_index=1, vllm_gpu_indices="0")
 
     _validate_vllm_gpu_placement(args)
+
+
+def test_extract_vllm_server_model_paths_from_process_cmdlines() -> None:
+    cmdlines = [
+        ["python", "/data/conda/envs/macorag/bin/trl", "vllm-serve", "--model", "model/Qwen2.5-7B-Instruct"],
+        ["python", "other.py"],
+        ["trl", "vllm-serve", "--host", "127.0.0.1", "--model=model/Qwen2.5-3B-Instruct"],
+    ]
+
+    assert _extract_vllm_server_model_paths(cmdlines) == [
+        "model/Qwen2.5-7B-Instruct",
+        "model/Qwen2.5-3B-Instruct",
+    ]
+
+
+def test_validate_local_vllm_server_model_rejects_stale_server() -> None:
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_host="127.0.0.1",
+        model_path="model/Qwen2.5-7B-Instruct",
+    )
+
+    try:
+        _validate_local_vllm_server_model(
+            args,
+            cmdlines=[["trl", "vllm-serve", "--model", "model/Qwen2.5-3B-Instruct"]],
+        )
+    except SystemExit as exc:
+        assert "vLLM server model mismatch" in str(exc)
+        assert "Qwen2.5-3B-Instruct" in str(exc)
+        assert "Qwen2.5-7B-Instruct" in str(exc)
+    else:
+        raise AssertionError("expected stale vLLM server model validation to fail")
+
+
+def test_validate_local_vllm_server_model_allows_matching_server() -> None:
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_host="127.0.0.1",
+        model_path="model/Qwen2.5-7B-Instruct",
+    )
+
+    _validate_local_vllm_server_model(
+        args,
+        cmdlines=[["trl", "vllm-serve", "--model", "model/Qwen2.5-7B-Instruct"]],
+    )
 
 
 class _TinyParamModel(torch.nn.Module):

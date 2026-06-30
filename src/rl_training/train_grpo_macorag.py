@@ -53,6 +53,76 @@ def _validate_vllm_gpu_placement(args: Any) -> None:
         )
 
 
+def _is_local_host(host: str | None) -> bool:
+    return str(host or "").strip() in {"", "127.0.0.1", "localhost", "0.0.0.0"}
+
+
+def _iter_proc_cmdlines() -> list[list[str]]:
+    cmdlines: list[list[str]] = []
+    proc_root = Path("/proc")
+    if not proc_root.exists():
+        return cmdlines
+    for entry in proc_root.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            raw = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        parts = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
+        if parts:
+            cmdlines.append(parts)
+    return cmdlines
+
+
+def _extract_vllm_server_model_paths(cmdlines: list[list[str]]) -> list[str]:
+    model_paths: list[str] = []
+    for cmdline in cmdlines:
+        if "vllm-serve" not in cmdline:
+            continue
+        if not any("trl" in Path(part).name for part in cmdline):
+            continue
+        for index, part in enumerate(cmdline):
+            if part == "--model" and index + 1 < len(cmdline):
+                model_paths.append(cmdline[index + 1])
+            elif part.startswith("--model="):
+                model_paths.append(part.split("=", 1)[1])
+    return model_paths
+
+
+def _same_model_path(left: str, right: str) -> bool:
+    left_path = Path(left)
+    right_path = Path(right)
+    if left_path == right_path:
+        return True
+    try:
+        return left_path.resolve() == right_path.resolve()
+    except OSError:
+        return False
+
+
+def _validate_local_vllm_server_model(args: Any, *, cmdlines: list[list[str]] | None = None) -> None:
+    if not getattr(args, "use_vllm_generation", False):
+        return
+    if not _is_local_host(getattr(args, "vllm_host", None)):
+        return
+    model_path = str(getattr(args, "model_path", "") or "")
+    if not model_path:
+        return
+    server_models = _extract_vllm_server_model_paths(cmdlines if cmdlines is not None else _iter_proc_cmdlines())
+    if not server_models:
+        return
+    if any(_same_model_path(path, model_path) for path in server_models):
+        return
+    raise SystemExit(
+        "vLLM server model mismatch: trainer model_path="
+        f"{model_path!r}, but local trl vllm-serve process uses {server_models!r}. "
+        "Stop the stale vLLM server and restart scripts/run_grpo_vllm_server.sh with the current config."
+    )
+
+
 def _local_rank() -> int:
     try:
         return int(os.environ.get("LOCAL_RANK", "0"))
@@ -257,6 +327,7 @@ def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedP
     }
     if not args.use_vllm_generation:
         return HFSharedPolicy(**common)
+    _validate_local_vllm_server_model(args)
     client = VLLMGenerationClient(
         host=args.vllm_host,
         port=args.vllm_port,
