@@ -233,14 +233,10 @@ class Params4bit:
     def __init__(self) -> None:
         self.packed = torch.zeros(1)
         self.dense = torch.ones(2, 3)
-        self.dequantized = False
+        self.quant_state = object()
 
     def detach(self) -> torch.Tensor:
         return self.packed
-
-    def dequantize(self) -> torch.Tensor:
-        self.dequantized = True
-        return self.dense
 
 
 def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
@@ -305,14 +301,23 @@ def test_vllm_generation_client_syncs_parameters_on_communicator_device() -> Non
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
 
 
-def test_vllm_generation_client_dequantizes_4bit_weights_before_sync() -> None:
+def test_vllm_generation_client_dequantizes_4bit_weights_before_sync(monkeypatch) -> None:
+    import rl_training.vllm_client as vllm_client
     from rl_training.vllm_client import _move_tensor_for_sync
 
     parameter = Params4bit()
 
+    called = {}
+
+    def fake_dequantize(weight, state=None):
+        called["weight"] = weight
+        called["state"] = state
+        return parameter.dense
+
+    monkeypatch.setattr(vllm_client, "_dequantize_bnb_weight", fake_dequantize)
     tensor = _move_tensor_for_sync(parameter, device=None)
 
-    assert parameter.dequantized is True
+    assert called == {"weight": parameter, "state": parameter.quant_state}
     assert tensor.shape == (2, 3)
     assert tensor.device.type == "cpu"
 

@@ -35,9 +35,15 @@ def _peft_parameter_name_for_vllm(model: Any, name: str) -> str | None:
     return name.replace("modules_to_save.default.", "")
 
 
+def _dequantize_bnb_weight(parameter: Any, state: Any | None = None) -> Any:
+    from peft.tuners.lora.bnb import dequantize_bnb_weight
+
+    return dequantize_bnb_weight(parameter, state=state)
+
+
 def _move_tensor_for_sync(parameter: Any, *, device: Any | None) -> Any:
-    if parameter.__class__.__name__ == "Params4bit" and callable(getattr(parameter, "dequantize", None)):
-        tensor = parameter.dequantize().detach()
+    if parameter.__class__.__name__ == "Params4bit":
+        tensor = _dequantize_bnb_weight(parameter, state=getattr(parameter, "quant_state", None)).detach()
     else:
         tensor = parameter.detach()
     if device is not None:
