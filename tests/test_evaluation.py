@@ -51,3 +51,10 @@ def test_parse_eval_config_rejects_unknown_yaml_keys(tmp_path: Path) -> None:
 
     with pytest.raises(SystemExit, match="Unknown evaluation config keys"):
         parse_args(["--config", str(config)])
+
+
+def test_parse_eval_config_rejects_missing_explicit_config_with_equals(tmp_path: Path) -> None:
+    missing = tmp_path / "no_such_config.yml"
+
+    with pytest.raises(SystemExit, match="Evaluation config not found"):
+        parse_args([f"--config={missing}"])

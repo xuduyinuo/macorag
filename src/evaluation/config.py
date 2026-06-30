@@ -132,7 +132,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     config_parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     config_args, _ = config_parser.parse_known_args(argv)
     raw_args = sys.argv[1:] if argv is None else argv
-    explicit_config = "--config" in raw_args
+    explicit_config = any(arg == "--config" or arg.startswith("--config=") for arg in raw_args)
     defaults = _defaults_from_config(config_args.config, explicit_config=explicit_config)
     parser = _build_parser(defaults)
     return parser.parse_args(argv)
