@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import socket
 
 import pytest
 
@@ -238,3 +239,90 @@ def test_evaluate_predictions_updates_prediction_file_and_summary(tmp_path: Path
     assert updated[0]["llm_accuracy"] == 1.0
     assert updated[1]["llm_accuracy"] == 0.0
     assert (tmp_path / "evaluation_results.json").exists()
+
+
+def test_evaluate_predictions_preserves_falsy_answers(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.json"
+    predictions_path.write_text(
+        json.dumps(
+            [
+                {"qid": "q0", "pred_answer": 0, "gold_answer": 0},
+                {"qid": "q1", "pred_answer": False, "gold_answer": False},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = FakeJudgeClient(["correct", "correct"])
+
+    summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
+
+    updated = json.loads(predictions_path.read_text(encoding="utf-8"))
+    assert summary["contain_accuracy"] == 1.0
+    assert updated[0]["contain_accuracy"] == 1
+    assert updated[1]["contain_accuracy"] == 1
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def read(self) -> bytes:
+        return json.dumps(self._payload, ensure_ascii=False).encode("utf-8")
+
+    def __enter__(self) -> "_FakeHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
+        return None
+
+
+def test_bailian_judge_client_retries_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: dict[str, int] = {"count": 0}
+
+    def fake_urlopen(_request: object, timeout: int) -> _FakeHTTPResponse:
+        called["count"] += 1
+        if called["count"] == 1:
+            raise socket.timeout("temporary timeout")
+        return _FakeHTTPResponse({"choices": [{"message": {"content": "correct"}}]})
+
+    monkeypatch.setenv("TEST_BAILIAN_API_KEY", "k")
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    from evaluation.bailian_evaluator import BailianJudgeClient
+
+    client = BailianJudgeClient(
+        model="test",
+        endpoint="https://example.com/api/v1/chat/completions",
+        api_key_env="TEST_BAILIAN_API_KEY",
+        temperature=0.0,
+        max_tokens=16,
+        timeout=1,
+        retries=2,
+        retry_sleep_seconds=0.0,
+    )
+    result = client.infer([{"role": "user", "content": "Is this correct?"}])
+
+    assert result == "correct"
+    assert called["count"] == 2
+
+
+def test_evaluate_predictions_includes_judge_metadata_when_provided(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.json"
+    predictions_path.write_text(
+        json.dumps([{"qid": "q1", "pred_answer": "David Arquette", "gold_answer": "David Arquette"}], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    client = FakeJudgeClient(["correct"])
+    metadata = {"judge_model": "test-model", "temperature": 0.0}
+
+    summary = evaluate_predictions(
+        predictions_path,
+        client=client,
+        max_workers=1,
+        judge_metadata=metadata,
+    )
+    evaluation_results = json.loads((tmp_path / "evaluation_results.json").read_text(encoding="utf-8"))
+
+    assert summary["judge_metadata"] == metadata
+    assert evaluation_results["judge_metadata"] == metadata

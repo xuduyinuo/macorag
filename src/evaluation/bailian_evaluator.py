@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import os
 import re
+import socket
 import string
 import time
 import urllib.error
@@ -74,7 +75,14 @@ class BailianJudgeClient:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 return str(body["choices"][0]["message"]["content"])
-            except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as exc:
+            except (
+                urllib.error.URLError,
+                urllib.error.HTTPError,
+                socket.timeout,
+                TimeoutError,
+                KeyError,
+                ValueError,
+            ) as exc:
                 last_error = exc
                 if attempt >= self.retries:
                     break
@@ -113,10 +121,14 @@ def calculate_contain(pre_answer: str | None, gold_answer: str | None) -> int:
     return 1 if normalize_answer(str(gold_answer)) in normalize_answer(str(pre_answer)) else 0
 
 
+def _coerce_answer(value: Any) -> str:
+    return "" if value is None else str(value)
+
+
 def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[int, float, int, str | None]:
     try:
-        pre_answer = str(prediction.get("pred_answer") or "")
-        gold_answer = str(prediction.get("gold_answer") or "")
+        pre_answer = _coerce_answer(prediction.get("pred_answer"))
+        gold_answer = _coerce_answer(prediction.get("gold_answer"))
         return (
             index,
             calculate_llm_accuracy(client, pre_answer, gold_answer),
@@ -124,18 +136,26 @@ def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[
             None,
         )
     except Exception as exc:
-        pre_answer = str(prediction.get("pred_answer") or "")
-        gold_answer = str(prediction.get("gold_answer") or "")
+        pre_answer = _coerce_answer(prediction.get("pred_answer"))
+        gold_answer = _coerce_answer(prediction.get("gold_answer"))
         return index, 0.0, calculate_contain(pre_answer, gold_answer), str(exc)
 
 
-def evaluate_predictions(predictions_path: str | Path, *, client: Any, max_workers: int) -> dict[str, Any]:
+def evaluate_predictions(
+    predictions_path: str | Path,
+    *,
+    client: Any,
+    max_workers: int,
+    judge_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     path = Path(predictions_path)
     predictions = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(predictions, list):
         raise ValueError(f"Invalid predictions format at {path}: expected a JSON list.")
     if not predictions:
         summary = {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0}
+        if judge_metadata is not None:
+            summary["judge_metadata"] = judge_metadata
         (path.parent / "evaluation_results.json").write_text(
             json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -162,6 +182,8 @@ def evaluate_predictions(predictions_path: str | Path, *, client: Any, max_worke
         "contain_accuracy": sum(contain_scores) / len(contain_scores),
         "num_samples": len(predictions),
     }
+    if judge_metadata is not None:
+        summary["judge_metadata"] = judge_metadata
     path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2), encoding="utf-8")
     (path.parent / "evaluation_results.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
