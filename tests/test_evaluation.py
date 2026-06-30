@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
 
 from evaluation.config import parse_args
+from evaluation.data import load_eval_samples
 
 
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
@@ -58,3 +60,48 @@ def test_parse_eval_config_rejects_missing_explicit_config_with_equals(tmp_path:
 
     with pytest.raises(SystemExit, match="Evaluation config not found"):
         parse_args([f"--config={missing}"])
+
+
+def _write_jsonl(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def test_load_eval_samples_skips_corpus_and_normalizes_gold_answer(tmp_path: Path) -> None:
+    data_root = tmp_path / "eval"
+    _write_jsonl(
+        data_root / "hotpotqa" / "hotpotqa_dev.jsonl",
+        [
+            {
+                "qid": "q1",
+                "dataset": "hotpotqa",
+                "question": "Who directed The Tripper?",
+                "gold_answer": "David Arquette",
+                "answer_aliases": ["Arquette"],
+                "supporting_facts": [{"title": "The Tripper", "text": "Directed by David Arquette."}],
+                "metadata": {"split": "dev"},
+            },
+            {
+                "qid": "bad",
+                "dataset": "hotpotqa",
+                "question": "",
+                "answer": "missing question",
+                "supporting_facts": [],
+            },
+        ],
+    )
+    _write_jsonl(data_root / "hotpotqa" / "corpus.jsonl", [{"doc_id": "d1", "text": "not a sample"}])
+
+    samples, summary = load_eval_samples(data_root=data_root, data_files=[], max_samples=None)
+
+    assert len(samples) == 1
+    assert samples[0].qid == "q1"
+    assert samples[0].dataset == "hotpotqa"
+    assert samples[0].answer == "David Arquette"
+    assert samples[0].answer_aliases == ["Arquette"]
+    assert samples[0].metadata == {"split": "dev"}
+    assert summary["loaded_samples"] == 1
+    assert summary["skipped_samples"] == 1
+    assert summary["source_files"] == [str(data_root / "hotpotqa" / "hotpotqa_dev.jsonl")]
