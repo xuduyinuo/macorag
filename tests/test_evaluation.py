@@ -9,6 +9,9 @@ from evaluation.config import parse_args
 from evaluation.data import load_eval_samples
 
 
+from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
+
+
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
     config = tmp_path / "evaluate_rag_model.yml"
     config.write_text(
@@ -189,3 +192,49 @@ def test_explicit_data_files_skips_corpus_jsonl(tmp_path: Path) -> None:
     assert len(samples) == 1
     assert summary["loaded_samples"] == 1
     assert summary["source_files"] == [str(data_root / "hotpotqa" / "hotpotqa_dev.jsonl")]
+
+
+class FakeJudgeClient:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = list(responses)
+        self.messages: list[list[dict[str, str]]] = []
+
+    def infer(self, messages: list[dict[str, str]]) -> str:
+        self.messages.append(messages)
+        return self.responses.pop(0)
+
+
+def test_bailian_evaluator_maps_correct_response_and_contain_accuracy() -> None:
+    client = FakeJudgeClient(["correct"])
+
+    llm_acc = calculate_llm_accuracy(client, "David Arquette", "David Arquette")
+
+    assert llm_acc == 1.0
+    assert calculate_contain("The answer is David Arquette.", "David Arquette") == 1
+    assert calculate_contain("The answer is Wes Craven.", "David Arquette") == 0
+    assert "Respond with ONLY 'correct' or 'incorrect'." in client.messages[0][1]["content"]
+
+
+def test_evaluate_predictions_updates_prediction_file_and_summary(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.json"
+    predictions_path.write_text(
+        json.dumps(
+            [
+                {"qid": "q1", "pred_answer": "David Arquette", "gold_answer": "David Arquette"},
+                {"qid": "q2", "pred_answer": "wrong", "gold_answer": "Right"},
+            ],
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    client = FakeJudgeClient(["correct", "incorrect"])
+
+    summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
+
+    updated = json.loads(predictions_path.read_text(encoding="utf-8"))
+    assert summary["llm_accuracy"] == 0.5
+    assert summary["contain_accuracy"] == 0.5
+    assert summary["num_samples"] == 2
+    assert updated[0]["llm_accuracy"] == 1.0
+    assert updated[1]["llm_accuracy"] == 0.0
+    assert (tmp_path / "evaluation_results.json").exists()
