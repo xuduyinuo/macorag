@@ -186,6 +186,75 @@ def test_vllm_generation_client_syncs_trainable_parameters() -> None:
     assert all(tensor.device.type == "cpu" for _, tensor in backend.updated)
 
 
+class _FakeTokenizer:
+    eos_token_id = 99
+    pad_token_id = 0
+
+    def apply_chat_template(self, messages, add_generation_prompt: bool, tokenize: bool):
+        assert add_generation_prompt is True
+        assert tokenize is True
+        joined = "\n".join(item["content"] for item in messages)
+        return [min(98, ord(char) % 100) for char in joined][-32:]
+
+    def decode(self, token_ids, skip_special_tokens: bool = True):
+        return "decoded response"
+
+
+class _LogprobModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.zeros(1), requires_grad=True)
+
+    def forward(self, input_ids, attention_mask=None, logits_to_keep=None):
+        vocab_size = 128
+        logits = torch.zeros(input_ids.shape[0], input_ids.shape[1], vocab_size, device=input_ids.device)
+        return type("Output", (), {"logits": logits})
+
+
+class _FakeVLLMClient:
+    def __init__(self) -> None:
+        self.prompts: list[list[int]] = []
+
+    def generate(self, prompt_token_ids, *, max_tokens, temperature, top_p, top_k):
+        self.prompts.append(list(prompt_token_ids))
+        return [10, 11], "decoded response"
+
+
+def test_vllm_shared_policy_generates_and_records_trace() -> None:
+    from rl_training.policy import VLLMSharedPolicy
+
+    client = _FakeVLLMClient()
+    model = _LogprobModel()
+    tokenizer = _FakeTokenizer()
+    policy = VLLMSharedPolicy(
+        model=model,
+        tokenizer=tokenizer,
+        vllm_client=client,
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    response = policy.generate(
+        role=AgentRole.QUERY_RETRIEVER,
+        question="Who?",
+        state=RAGState(question="Who?"),
+    )
+
+    assert response == "decoded response"
+    assert len(client.prompts) == 1
+    assert len(policy.trace.actions) == 1
+    action = policy.trace.actions[0]
+    assert action.role == AgentRole.QUERY_RETRIEVER
+    assert action.completion_ids == [10, 11]
+    assert action.response == "decoded response"
+    assert action.old_logprobs.shape == (2,)
+    assert policy.timing["time_vllm_generate_seconds"] >= 0.0
+
+
 def test_load_rl_samples_reads_existing_extracted_files(tmp_path: Path) -> None:
     data_root = tmp_path / "rl"
     _write_jsonl(
