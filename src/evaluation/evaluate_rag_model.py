@@ -128,7 +128,7 @@ def _torch_dtype(args: Any, torch: Any) -> Any:
 
 def _model_kwargs(args: Any, torch: Any) -> dict[str, Any]:
     kwargs: dict[str, Any] = {"torch_dtype": _torch_dtype(args, torch)}
-    if not args.load_4bit:
+    if not args.load_4bit or not torch.cuda.is_available():
         return kwargs
     try:
         from transformers import BitsAndBytesConfig

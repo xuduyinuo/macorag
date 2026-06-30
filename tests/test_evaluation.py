@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from types import SimpleNamespace
 from pathlib import Path
 import socket
@@ -13,6 +14,7 @@ from evaluation.data import EvalSample, load_eval_samples
 from evaluation.evaluate_rag_model import (
     _build_retrieval_env,
     _configure_visible_gpus,
+    _model_kwargs,
     _torch_dtype,
     format_prediction,
     main,
@@ -155,6 +157,31 @@ def test_evaluate_torch_dtype_uses_float32_on_cpu_when_no_precision_flag_is_set(
     args = SimpleNamespace(fp16=False, bf16=False)
 
     assert _torch_dtype(args, fake_torch) == fake_torch.float32
+
+
+def test_evaluate_model_kwargs_skips_4bit_quantization_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeBitsAndBytesConfig:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs
+
+    fake_transformers = SimpleNamespace(BitsAndBytesConfig=FakeBitsAndBytesConfig)
+    fake_bitsandbytes = SimpleNamespace()
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: False),
+        float16="float16",
+        float32="float32",
+        bfloat16="bfloat16",
+    )
+    args = SimpleNamespace(load_4bit=True, bf16=False, fp16=False)
+
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bitsandbytes)
+
+    kwargs = _model_kwargs(args, fake_torch)
+
+    assert kwargs["torch_dtype"] == fake_torch.float32
+    assert "quantization_config" not in kwargs
+    assert "device_map" not in kwargs
 
 
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
