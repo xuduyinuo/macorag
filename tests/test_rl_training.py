@@ -321,7 +321,7 @@ class _FakeTRLClient:
 
     def init_communicator(self) -> None:
         self.communicator_initialized = True
-        if self.sync_device is not None:
+        if self.sync_device is not None and not hasattr(self, "pynccl_comm"):
             self.pynccl_comm = type("FakeCommunicator", (), {"device": self.sync_device})()
 
     def update_named_param(self, name: str, weights: torch.Tensor) -> None:
@@ -329,6 +329,20 @@ class _FakeTRLClient:
         if self.sync_device is not None:
             assert weights.device == self.sync_device
         self.updated.append((name, weights))
+
+
+class _FakeResponse:
+    status_code = 200
+    text = "ok"
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+
+    def post(self, url: str, json: dict) -> _FakeResponse:
+        self.posts.append((url, json))
+        return _FakeResponse()
 
 
 def test_vllm_generation_client_syncs_trainable_parameters() -> None:
@@ -357,6 +371,66 @@ def test_vllm_generation_client_syncs_parameters_on_communicator_device() -> Non
 
     assert [name for name, _ in backend.updated] == ["lora_a", "lora_b"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+
+
+def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient(sync_device=torch.device("meta"))
+    backend.session = _FakeSession()
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "device": torch.device("meta"),
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: None})(),
+        },
+    )()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    model = _TinyPeftModel()
+
+    elapsed = client.sync_lora_parameters(model)
+
+    assert elapsed >= 0.0
+    assert backend.communicator_initialized is True
+    assert [payload["name"] for _, payload in backend.session.posts] == [
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+    ]
+    assert [name for name, _ in backend.updated] == ["broadcast", "broadcast"]
+    assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+
+
+class _FakePolicyWithLoraClient:
+    def __init__(self) -> None:
+        self.vllm_client = type(
+            "Client",
+            (),
+            {
+                "dense_called": False,
+                "lora_called": False,
+                "sync_trainable_parameters": lambda self_client, model: setattr(self_client, "dense_called", True)
+                or 1.0,
+                "sync_lora_parameters": lambda self_client, model: setattr(self_client, "lora_called", True)
+                or 2.0,
+            },
+        )()
+
+
+def test_sync_vllm_after_optimizer_step_uses_lora_mode() -> None:
+    from rl_training.train_grpo_macorag import _sync_vllm_after_optimizer_step
+
+    policy = _FakePolicyWithLoraClient()
+    args = Namespace(use_vllm_generation=True, vllm_sync_after_step=True, vllm_sync_mode="lora")
+
+    elapsed = _sync_vllm_after_optimizer_step(policy, object(), args)
+
+    assert elapsed == 2.0
+    assert policy.vllm_client.lora_called is True
+    assert policy.vllm_client.dense_called is False
 
 
 def test_vllm_generation_client_dequantizes_4bit_weights_before_sync(monkeypatch) -> None:

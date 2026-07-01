@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from .vllm_lora_mapping import collect_lora_named_tensors
+
 
 def collect_trainable_named_parameters(model: Any, *, device: Any | None = None) -> dict[str, Any]:
     params: dict[str, Any] = {}
@@ -94,6 +96,15 @@ class VLLMGenerationClient:
             raise SystemExit("TRL VLLMClient is missing check_server(); installed TRL is incompatible.")
         checker()
 
+    def _ensure_communicator(self) -> None:
+        if self._communicator_initialized:
+            return
+        initializer = getattr(self.backend, "init_communicator", None)
+        if initializer is None:
+            raise SystemExit("TRL VLLMClient is missing init_communicator(); hot sync is unavailable.")
+        initializer()
+        self._communicator_initialized = True
+
     def generate(
         self,
         prompt: str,
@@ -124,12 +135,7 @@ class VLLMGenerationClient:
         updater = getattr(self.backend, "update_named_param", None)
         if updater is None:
             raise SystemExit("TRL VLLMClient is missing update_named_param(); hot LoRA sync is unavailable.")
-        if not self._communicator_initialized:
-            initializer = getattr(self.backend, "init_communicator", None)
-            if initializer is None:
-                raise SystemExit("TRL VLLMClient is missing init_communicator(); hot LoRA sync is unavailable.")
-            initializer()
-            self._communicator_initialized = True
+        self._ensure_communicator()
         sync_device = _backend_communicator_device(self.backend)
         start = time.perf_counter()
         if _is_peft_model(model):
@@ -145,4 +151,30 @@ class VLLMGenerationClient:
         else:
             for name, tensor in collect_trainable_named_parameters(model, device=sync_device).items():
                 updater(name, tensor)
+        return time.perf_counter() - start
+
+    def sync_lora_parameters(self, model: Any) -> float:
+        self._ensure_communicator()
+        sync_device = _backend_communicator_device(self.backend)
+        tensors = collect_lora_named_tensors(model, device=sync_device)
+        if not tensors:
+            raise SystemExit("No LoRA tensors found for vLLM LoRA hot sync.")
+        start = time.perf_counter()
+        for name, tensor in tensors.items():
+            session = getattr(self.backend, "session", None)
+            base_url = getattr(self.backend, "base_url", None)
+            if session is None or base_url is None:
+                raise SystemExit("Installed TRL VLLMClient internals are incompatible with LoRA hot sync.")
+            response = session.post(
+                f"{base_url}/update_lora_param/",
+                json={"name": name, "dtype": str(tensor.dtype), "shape": tuple(tensor.shape)},
+            )
+            if response.status_code != 200:
+                raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+            communicator = getattr(self.backend, "pynccl_comm", None)
+            rank = getattr(self.backend, "rank", None)
+            if communicator is None or rank is None:
+                raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
+            communicator.broadcast(tensor, src=rank)
+            communicator.group.barrier()
         return time.perf_counter() - start

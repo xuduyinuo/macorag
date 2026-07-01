@@ -347,7 +347,12 @@ def _sync_vllm_after_optimizer_step(policy: Any, raw_policy_model: Any, args: An
     client = getattr(policy, "vllm_client", None)
     if client is None:
         raise SystemExit("vLLM generation is enabled but policy has no vLLM client.")
-    return float(client.sync_trainable_parameters(raw_policy_model))
+    sync_mode = getattr(args, "vllm_sync_mode", "dense")
+    if sync_mode == "lora":
+        return float(client.sync_lora_parameters(raw_policy_model))
+    if sync_mode == "dense":
+        return float(client.sync_trainable_parameters(raw_policy_model))
+    raise SystemExit(f"Unsupported vLLM sync mode: {sync_mode}")
 
 
 def _rollout_group(
