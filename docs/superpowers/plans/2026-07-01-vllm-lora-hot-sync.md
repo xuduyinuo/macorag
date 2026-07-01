@@ -461,7 +461,7 @@ git commit -m "feat: add trainer lora hot sync client"
 
 ---
 
-### Task 4: Add Custom vLLM LoRA Server Skeleton
+### Task 4: Add Custom vLLM LoRA Server Parser and Launcher Skeleton
 
 **Files:**
 - Create: `src/rl_training/vllm_lora_server.py`
@@ -472,7 +472,8 @@ git commit -m "feat: add trainer lora hot sync client"
 **Interfaces:**
 - Produces: `parse_server_args(argv: list[str] | None = None) -> argparse.Namespace`.
 - Produces: launcher script `scripts/run_grpo_vllm_lora_server.sh`.
-- Server endpoints planned: `/health/`, `/generate/`, `/get_world_size/`, `/init_communicator/`, `/update_lora_param/`.
+- Produces a parser-only server module that exits with a clear "runtime is not implemented yet" message.
+- Runtime endpoints `/health/`, `/generate/`, `/get_world_size/`, `/init_communicator/`, and `/update_lora_param/` are Task 5.
 
 - [ ] **Step 1: Write failing parser tests**
 
@@ -563,6 +564,7 @@ def test_run_grpo_vllm_lora_server_script_uses_custom_server_and_lora_config() -
     assert "vllm_lora_name" in script
     assert "vllm_lora_int_id" in script
     assert "vllm_lora_adapter_path" in script
+    assert "--data-parallel-size" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
 ```
 
@@ -584,7 +586,7 @@ cd "${REPO_ROOT}"
 
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_grpo.yml}"
 
-read -r YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE YAML_LORA_NAME YAML_LORA_INT_ID YAML_LORA_ADAPTER_PATH < <(
+read -r YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_DP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE YAML_LORA_NAME YAML_LORA_INT_ID YAML_LORA_ADAPTER_PATH < <(
   "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
 import sys
 from pathlib import Path
@@ -597,6 +599,7 @@ print(
     int(config.get("vllm_port", 8000)),
     str(config.get("vllm_gpu_indices", "0")),
     int(config.get("vllm_tensor_parallel_size", 1)),
+    int(config.get("vllm_data_parallel_size", 1)),
     float(config.get("vllm_gpu_memory_utilization", 0.75)),
     int(config.get("vllm_max_model_len", 8192)),
     config.get("vllm_dtype", "auto"),
@@ -614,6 +617,7 @@ exec "${PYTHON:-python}" -m rl_training.vllm_lora_server \
   --host "${YAML_HOST}" \
   --port "${YAML_PORT}" \
   --tensor-parallel-size "${YAML_TP}" \
+  --data-parallel-size "${YAML_DP}" \
   --gpu-memory-utilization "${YAML_GPU_UTIL}" \
   --max-model-len "${YAML_MAX_LEN}" \
   --dtype "${YAML_DTYPE}" \
