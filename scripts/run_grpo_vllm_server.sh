@@ -11,7 +11,7 @@ cd "${REPO_ROOT}"
 
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_grpo.yml}"
 
-read -r YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE < <(
+read -r YAML_SYNC_MODE YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE < <(
   "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
 import sys
 from pathlib import Path
@@ -20,6 +20,7 @@ import yaml
 
 config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
 print(
+    config.get("vllm_sync_mode", "dense"),
     config.get("model_path", "model/Qwen2.5-3B-Instruct"),
     config.get("vllm_host", "127.0.0.1"),
     int(config.get("vllm_port", 8000)),
@@ -31,6 +32,10 @@ print(
 )
 PY
 )
+
+if [[ "${YAML_SYNC_MODE}" == "lora" ]]; then
+  exec "${SCRIPT_DIR}/run_grpo_vllm_lora_server.sh" "$@"
+fi
 
 export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"
 

@@ -1026,6 +1026,8 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
     script = Path("scripts/run_grpo_vllm_server.sh").read_text(encoding="utf-8")
 
     assert "CONFIG_PATH=" in script
+    assert "vllm_sync_mode" in script
+    assert "run_grpo_vllm_lora_server.sh" in script
     assert "vllm_gpu_indices" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
     assert "trl vllm-serve" in script
