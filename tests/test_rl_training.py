@@ -119,6 +119,29 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
     assert args.gpu_indices == "1"
 
 
+def test_parse_args_loads_vllm_lora_sync_config(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                "use_vllm_generation: true",
+                'vllm_sync_mode: "lora"',
+                'vllm_lora_name: "macorag_train"',
+                "vllm_lora_int_id: 7",
+                'vllm_lora_adapter_path: "outputs/adapter"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.vllm_sync_mode == "lora"
+    assert args.vllm_lora_name == "macorag_train"
+    assert args.vllm_lora_int_id == 7
+    assert args.vllm_lora_adapter_path == "outputs/adapter"
+
+
 def test_parse_gpu_indices_normalizes_comma_lists() -> None:
     assert _parse_gpu_indices("0, 1") == {"0", "1"}
     assert _parse_gpu_indices(2) == {"2"}

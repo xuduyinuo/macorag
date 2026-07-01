@@ -64,6 +64,10 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "vllm_sync_after_step": True,
     "vllm_sync_trainable_only": True,
     "vllm_timeout_seconds": 120.0,
+    "vllm_sync_mode": "dense",
+    "vllm_lora_name": "macorag_train",
+    "vllm_lora_int_id": 1,
+    "vllm_lora_adapter_path": "",
 }
 
 BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
@@ -158,6 +162,10 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--vllm-sync-after-step", action=BooleanOptionalAction, default=defaults["vllm_sync_after_step"])
     parser.add_argument("--vllm-sync-trainable-only", action=BooleanOptionalAction, default=defaults["vllm_sync_trainable_only"])
     parser.add_argument("--vllm-timeout-seconds", type=float, default=defaults["vllm_timeout_seconds"])
+    parser.add_argument("--vllm-sync-mode", choices=("dense", "lora"), default=defaults["vllm_sync_mode"])
+    parser.add_argument("--vllm-lora-name", default=defaults["vllm_lora_name"])
+    parser.add_argument("--vllm-lora-int-id", type=int, default=defaults["vllm_lora_int_id"])
+    parser.add_argument("--vllm-lora-adapter-path", default=defaults["vllm_lora_adapter_path"])
     return parser
 
 

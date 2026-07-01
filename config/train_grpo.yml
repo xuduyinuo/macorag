@@ -1,9 +1,9 @@
-model_path: "model/Qwen2.5-3B-Instruct"
-sft_adapter_path: "outputs/lora_qwen2.5-3b_trajectory_20260629_085753/adapter"
+model_path: "model/Qwen2.5-7B-Instruct"
+sft_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
 rl_data_root: "data/rl_train_20"
 rl_data_files: []
 retrieval_root: "data/rl_train_20_retrieval"
-output_dir: "outputs/grpo_qwen2.5-3b"
+output_dir: "outputs/grpo_qwen2.5-7b"
 system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
 max_samples: null
 seed: 42
@@ -33,11 +33,15 @@ vllm_port: 8000
 vllm_gpu_indices: "0"
 vllm_tensor_parallel_size: 1
 vllm_gpu_memory_utilization: 0.75
-vllm_max_model_len: 4608
+vllm_max_model_len: 8192
 vllm_dtype: "auto"
 vllm_sync_after_step: true
 vllm_sync_trainable_only: true
 vllm_timeout_seconds: 120
+vllm_sync_mode: "dense"
+vllm_lora_name: "macorag_train"
+vllm_lora_int_id: 1
+vllm_lora_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
 
 retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
 retrieval_spacy_model: en_core_web_sm
