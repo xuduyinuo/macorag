@@ -351,27 +351,45 @@ class _FakeTRLClient:
 
 
 class _FakeResponse:
-    status_code = 200
-    text = "ok"
+    def __init__(self, *, status_code: int = 200, text: str = "ok", payload: dict | None = None) -> None:
+        self.status_code = status_code
+        self.text = text
+        self._payload = payload or {}
+
+    def json(self) -> dict:
+        return self._payload
 
 
 class _FakeSession:
-    def __init__(self, *, health_payload: dict | None = None, update_status_code: int = 200) -> None:
+    def __init__(
+        self,
+        *,
+        health_payload: dict | None = None,
+        update_status_code: int = 200,
+        update_payload: dict | None = None,
+        update_states: list[dict] | None = None,
+    ) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.gets: list[str] = []
         self.health_payload = health_payload or {}
         self.update_status_code = update_status_code
+        self.update_payload = update_payload or {}
+        self.update_states = update_states or []
 
     def get(self, url: str) -> _FakeResponse:
-        response = _FakeResponse()
-        response.json = lambda: self.health_payload
-        return response
+        self.gets.append(url)
+        if "/lora_update_status/" in url:
+            payload = self.update_states.pop(0) if self.update_states else {"state": "ok", "error": None}
+            return _FakeResponse(payload=payload)
+        return _FakeResponse(payload=self.health_payload)
 
     def post(self, url: str, json: dict) -> _FakeResponse:
         self.posts.append((url, json))
-        response = _FakeResponse()
-        response.status_code = self.update_status_code
-        response.text = "unsupported" if self.update_status_code != 200 else "ok"
-        return response
+        return _FakeResponse(
+            status_code=self.update_status_code,
+            text="unsupported" if self.update_status_code != 200 else "ok",
+            payload=self.update_payload,
+        )
 
 
 def test_vllm_generation_client_syncs_trainable_parameters() -> None:
@@ -406,7 +424,7 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
     backend = _FakeTRLClient(sync_device=torch.device("meta"))
-    backend.session = _FakeSession()
+    backend.session = _FakeSession(update_payload={"update_id": "sync-1"})
     backend.base_url = "http://127.0.0.1:8000"
     backend.rank = 1
     backend.pynccl_comm = type(
@@ -431,6 +449,39 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
     ]
     assert [name for name, _ in backend.updated] == ["broadcast", "broadcast"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+    assert backend.session.gets == [
+        "http://127.0.0.1:8000/lora_update_status/sync-1",
+        "http://127.0.0.1:8000/lora_update_status/sync-1",
+    ]
+
+
+def test_vllm_generation_client_sync_lora_parameters_raises_on_update_error_status() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        update_payload={"update_id": "sync-err"},
+        update_states=[{"state": "error", "error": "worker failed"}],
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: None})(),
+        },
+    )()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=0.1, backend=backend)
+
+    try:
+        client.sync_lora_parameters(_TinyPeftModel())
+    except RuntimeError as exc:
+        assert "vLLM LoRA update failed" in str(exc)
+        assert "worker failed" in str(exc)
+    else:
+        raise AssertionError("expected LoRA update error status to fail")
 
 
 def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch() -> None:
@@ -445,6 +496,7 @@ def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch()
             "lora_int_id": 1,
             "model": "model/Qwen2.5-7B-Instruct",
             "lora_adapter_path": "outputs/adapter",
+            "supports_lora_param_update": True,
         }
     )
     backend.base_url = "http://127.0.0.1:8000"
@@ -479,7 +531,6 @@ def test_vllm_generation_client_validate_lora_server_rejects_unsupported_update_
             "lora_adapter_path": "outputs/adapter",
             "supports_lora_param_update": False,
         },
-        update_status_code=501,
     )
     backend.base_url = "http://127.0.0.1:8000"
     client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
@@ -496,6 +547,35 @@ def test_vllm_generation_client_validate_lora_server_rejects_unsupported_update_
         assert "LoRA hot sync is unsupported" in str(exc)
     else:
         raise AssertionError("expected unsupported LoRA update validation to fail")
+
+
+def test_vllm_generation_client_validate_lora_server_accepts_health_capability_without_probe_post() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        health_payload={
+            "status": "ok",
+            "sync_mode": "lora",
+            "lora_name": "macorag_train",
+            "lora_int_id": 1,
+            "model": "model/Qwen2.5-7B-Instruct",
+            "lora_adapter_path": "outputs/adapter",
+            "supports_lora_param_update": True,
+        }
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    args = Namespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        vllm_lora_name="macorag_train",
+        vllm_lora_int_id=1,
+        vllm_lora_adapter_path="outputs/adapter",
+    )
+
+    client.validate_lora_server(args)
+
+    assert backend.session.posts == []
 
 
 def test_build_policy_keeps_dense_mode_on_existing_health_check(monkeypatch) -> None:

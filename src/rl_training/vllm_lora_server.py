@@ -1,6 +1,8 @@
 import argparse
 import os
 import re
+import threading
+import uuid
 from collections.abc import Sequence
 from typing import Any, Optional
 
@@ -99,6 +101,79 @@ def parse_vllm_lora_tensor_name(name: str) -> tuple[str, str]:
     raise ValueError(f"Unsupported LoRA tensor name: {name}")
 
 
+def _resolve_packed_lora_module(adapter_manager: Any, loras: dict[str, Any], module_name: str) -> tuple[str, int]:
+    packed_modules = getattr(adapter_manager, "packed_modules", {})
+    for packed_module_name, unpacked_module_names in packed_modules.items():
+        if module_name in unpacked_module_names:
+            return packed_module_name, list(unpacked_module_names).index(module_name)
+
+    fallback_mappings = {
+        "self_attn.qkv_proj": ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"],
+        "mlp.gate_up_proj": ["mlp.gate_proj", "mlp.up_proj"],
+    }
+    for packed_suffix, unpacked_suffixes in fallback_mappings.items():
+        for index, unpacked_suffix in enumerate(unpacked_suffixes):
+            if module_name.endswith(unpacked_suffix):
+                packed_module_name = module_name[: -len(unpacked_suffix)] + packed_suffix
+                if packed_module_name in loras:
+                    return packed_module_name, index
+
+    raise KeyError(f"Registered LoRA module not found: {module_name}")
+
+
+def _lora_b_scaling(layer: Any, list_index: Optional[int]) -> float:
+    rank = getattr(layer, "rank", None)
+    if not rank:
+        return 1.0
+    if list_index is not None:
+        lora_alphas = getattr(layer, "lora_alphas", None)
+        if lora_alphas is None or list_index >= len(lora_alphas) or lora_alphas[list_index] is None:
+            return 1.0
+        return float(lora_alphas[list_index]) / float(rank)
+    lora_alpha = getattr(layer, "lora_alpha", None)
+    if lora_alpha is None:
+        return 1.0
+    return float(lora_alpha) / float(rank)
+
+
+def _mark_lora_b_scaling_merged(layer: Any, list_index: Optional[int]) -> None:
+    scaling = getattr(layer, "scaling", None)
+    if scaling is None:
+        return
+    if list_index is not None and isinstance(scaling, list) and list_index < len(scaling):
+        scaling[list_index] = 1
+    elif list_index is None:
+        layer.scaling = 1
+
+
+def _resolve_registered_lora_target(
+    adapter_manager: Any,
+    lora_model: Any,
+    module_name: str,
+    side: str,
+) -> tuple[Any, torch.Tensor, float, Optional[int]]:
+    loras = getattr(lora_model, "loras", {})
+    list_index: Optional[int] = None
+    if module_name in loras:
+        layer = loras[module_name]
+    else:
+        packed_module_name, list_index = _resolve_packed_lora_module(adapter_manager, loras, module_name)
+        layer = loras[packed_module_name]
+
+    target_container = getattr(layer, "lora_a" if side == "lora_A" else "lora_b", None)
+    if target_container is None:
+        raise KeyError(f"Registered LoRA tensor side not found: {module_name}.{side}")
+    if list_index is not None:
+        if list_index >= len(target_container) or target_container[list_index] is None:
+            raise KeyError(f"Registered packed LoRA tensor not found: {module_name}.{side}")
+        target = target_container[list_index]
+    else:
+        target = target_container
+
+    scaling = _lora_b_scaling(layer, list_index) if side == "lora_B" else 1.0
+    return layer, target, scaling, list_index
+
+
 def update_registered_lora_tensor(
     adapter_manager: Any,
     lora_int_id: int,
@@ -111,16 +186,13 @@ def update_registered_lora_tensor(
         raise KeyError(f"Registered LoRA adapter not found: {lora_int_id}")
 
     lora_model = registered_adapters[lora_int_id]
-    loras = getattr(lora_model, "loras", {})
-    if module_name not in loras:
-        raise KeyError(f"Registered LoRA module not found: {module_name}")
-
-    layer = loras[module_name]
-    target = getattr(layer, "lora_a" if side == "lora_A" else "lora_b", None)
-    if target is None:
-        raise KeyError(f"Registered LoRA tensor side not found: {module_name}.{side}")
+    layer, target, scaling, list_index = _resolve_registered_lora_target(
+        adapter_manager, lora_model, module_name, side
+    )
 
     source = tensor.detach().to(device=target.device, dtype=target.dtype).T.contiguous()
+    if side == "lora_B":
+        source = source * scaling
     if tuple(target.shape) != tuple(source.shape):
         raise ValueError(
             f"LoRA tensor shape mismatch for {name}: expected PEFT shape "
@@ -128,6 +200,8 @@ def update_registered_lora_tensor(
         )
 
     target.copy_(source)
+    if side == "lora_B":
+        _mark_lora_b_scaling_merged(layer, list_index)
     return tuple(target.shape)
 
 
@@ -137,7 +211,10 @@ def refresh_active_lora(adapter_manager: Any, lora_int_id: int) -> bool:
         return False
 
     adapter_manager._deactivate_adapter(lora_int_id)
-    return bool(adapter_manager.activate_adapter(lora_int_id))
+    active_adapters.pop(lora_int_id, None)
+    if not adapter_manager.activate_adapter(lora_int_id):
+        raise RuntimeError(f"Failed to reactivate LoRA adapter {lora_int_id}.")
+    return True
 
 
 def create_app(
@@ -154,6 +231,8 @@ def create_app(
 
     app = FastAPI()
     lora_request = build_lora_request(args)
+    update_statuses: dict[str, dict[str, Optional[str]]] = {}
+    update_status_lock = threading.Lock()
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
@@ -230,13 +309,37 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         try:
-            llm.collective_rpc(
-                method="update_lora_param",
-                args=(request.name, dtype, tuple(request.shape), args.lora_int_id),
-            )
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=str(exc)) from exc
-        return {"message": "Request received, updating LoRA parameter"}
+            parse_vllm_lora_tensor_name(request.name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        update_id = uuid.uuid4().hex
+        with update_status_lock:
+            update_statuses[update_id] = {"state": "pending", "error": None}
+
+        def _dispatch_update() -> None:
+            try:
+                llm.collective_rpc(
+                    method="update_lora_param",
+                    args=(request.name, dtype, tuple(request.shape), args.lora_int_id),
+                )
+            except Exception as exc:
+                with update_status_lock:
+                    update_statuses[update_id] = {"state": "error", "error": str(exc)}
+            else:
+                with update_status_lock:
+                    update_statuses[update_id] = {"state": "ok", "error": None}
+
+        threading.Thread(target=_dispatch_update, daemon=True).start()
+        return {"message": "Request received, updating LoRA parameter", "update_id": update_id}
+
+    @app.get("/lora_update_status/{update_id}")
+    async def lora_update_status(update_id: str):
+        with update_status_lock:
+            status = update_statuses.get(update_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"Unknown LoRA update id: {update_id}")
+        return status
 
     @app.post("/reset_prefix_cache/")
     async def reset_prefix_cache():

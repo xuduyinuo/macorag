@@ -133,21 +133,10 @@ class VLLMGenerationClient:
         if mismatches:
             raise SystemExit("LoRA server identity mismatch: " + "; ".join(mismatches))
 
-        try:
-            response = session.post(
-                f"{base_url}/update_lora_param/",
-                json={
-                    "name": "__macorag_lora_capability_probe__",
-                    "dtype": "torch.float32",
-                    "shape": [0],
-                },
-            )
-        except Exception as exc:
-            raise SystemExit(f"Unable to probe vLLM LoRA hot-sync endpoint: {exc}") from exc
-        if response.status_code != 200:
+        if health.get("supports_lora_param_update") is not True:
             raise SystemExit(
                 "LoRA hot sync is unsupported by the connected vLLM server: "
-                f"POST /update_lora_param/ returned HTTP {response.status_code}, {response.text}"
+                "health endpoint did not report supports_lora_param_update=true"
             )
 
     def _ensure_communicator(self) -> None:
@@ -225,10 +214,40 @@ class VLLMGenerationClient:
             )
             if response.status_code != 200:
                 raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+            try:
+                update_id = response.json().get("update_id")
+            except Exception:
+                update_id = None
             communicator = getattr(self.backend, "pynccl_comm", None)
             rank = getattr(self.backend, "rank", None)
             if communicator is None or rank is None:
                 raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
             communicator.broadcast(tensor, src=rank)
             communicator.group.barrier()
+            if update_id:
+                self._poll_lora_update_status(session, base_url, update_id)
         return time.perf_counter() - start
+
+    def _poll_lora_update_status(self, session: Any, base_url: str, update_id: str) -> None:
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            response = session.get(f"{base_url}/lora_update_status/{update_id}")
+            if response.status_code != 200:
+                raise RuntimeError(
+                    f"GET /lora_update_status/{update_id} returned HTTP {response.status_code}, {response.text}"
+                )
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(f"Invalid LoRA update status response for {update_id}: {exc}") from exc
+
+            state = payload.get("state")
+            if state == "ok":
+                return
+            if state == "error":
+                raise RuntimeError(f"vLLM LoRA update failed for {update_id}: {payload.get('error')}")
+            if state != "pending":
+                raise RuntimeError(f"Unknown vLLM LoRA update status for {update_id}: {state!r}")
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"Timed out waiting for vLLM LoRA update {update_id}.")
+            time.sleep(0.05)

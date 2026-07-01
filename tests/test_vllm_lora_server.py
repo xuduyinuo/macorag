@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -83,6 +85,8 @@ class _FakeLLM:
 
 class _FakeLoRALayer:
     def __init__(self) -> None:
+        self.rank = 2
+        self.lora_alpha = 4
         self.lora_a = torch.zeros(3, 2, dtype=torch.float16)
         self.lora_b = torch.zeros(2, 4, dtype=torch.float16)
 
@@ -107,6 +111,42 @@ class _FakeAdapterManager:
         self.activated.append(lora_id)
         self._active_adapters[lora_id] = None
         return True
+
+
+class _FakePackedLoRALayer:
+    def __init__(self) -> None:
+        self.rank = 2
+        self.lora_alphas = [4, 6, 8]
+        self.lora_a = [
+            torch.zeros(3, 2, dtype=torch.float16),
+            torch.zeros(5, 2, dtype=torch.float16),
+            torch.zeros(7, 2, dtype=torch.float16),
+        ]
+        self.lora_b = [
+            torch.zeros(2, 11, dtype=torch.float16),
+            torch.zeros(2, 13, dtype=torch.float16),
+            torch.zeros(2, 17, dtype=torch.float16),
+        ]
+
+
+class _FakePackedAdapterManager(_FakeAdapterManager):
+    def __init__(self) -> None:
+        super().__init__()
+        self.packed_modules = {
+            "model.layers.0.self_attn.qkv_proj": [
+                "model.layers.0.self_attn.q_proj",
+                "model.layers.0.self_attn.k_proj",
+                "model.layers.0.self_attn.v_proj",
+            ],
+            "model.layers.0.mlp.gate_up_proj": [
+                "model.layers.0.mlp.gate_proj",
+                "model.layers.0.mlp.up_proj",
+            ],
+        }
+        self._registered_adapters[1].loras = {
+            "model.layers.0.self_attn.qkv_proj": _FakePackedLoRALayer(),
+            "model.layers.0.mlp.gate_up_proj": _FakePackedLoRALayer(),
+        }
 
 
 def test_parse_vllm_lora_tensor_name_maps_module_and_side() -> None:
@@ -178,7 +218,45 @@ def test_update_registered_lora_tensor_transposes_peft_b_weight() -> None:
 
     layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
     assert shape == (2, 4)
-    assert torch.equal(layer.lora_b, incoming.T)
+    assert torch.equal(layer.lora_b, incoming.T * 2)
+
+
+def test_update_registered_lora_tensor_maps_q_proj_into_packed_qkv_index() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakePackedAdapterManager()
+    incoming = torch.arange(6, dtype=torch.float16).reshape(2, 3)
+
+    shape = update_registered_lora_tensor(
+        manager,
+        1,
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        incoming,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.qkv_proj"]
+    assert shape == (3, 2)
+    assert torch.equal(layer.lora_a[0], incoming.T)
+    assert torch.equal(layer.lora_a[1], torch.zeros_like(layer.lora_a[1]))
+
+
+def test_update_registered_lora_tensor_maps_gate_proj_into_packed_gate_up_index_and_scales_b() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakePackedAdapterManager()
+    incoming = torch.arange(22, dtype=torch.float16).reshape(11, 2)
+
+    shape = update_registered_lora_tensor(
+        manager,
+        1,
+        "model.layers.0.mlp.gate_proj.lora_B.weight",
+        incoming,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.mlp.gate_up_proj"]
+    assert shape == (2, 11)
+    assert torch.equal(layer.lora_b[0], incoming.T * 2)
+    assert torch.equal(layer.lora_b[1], torch.zeros_like(layer.lora_b[1]))
 
 
 def test_update_registered_lora_tensor_rejects_shape_mismatch() -> None:
@@ -231,7 +309,24 @@ def test_refresh_active_lora_reactivates_active_adapter() -> None:
     assert manager.activated == [1]
 
 
-def test_refresh_active_lora_returns_false_when_reactivation_fails() -> None:
+def test_refresh_active_lora_pops_active_adapter_before_reactivation() -> None:
+    from rl_training.vllm_lora_server import refresh_active_lora
+
+    manager = _FakeAdapterManager()
+
+    def _sticky_deactivate(lora_id: int) -> None:
+        manager.deactivated.append(lora_id)
+
+    manager._deactivate_adapter = _sticky_deactivate
+
+    refreshed = refresh_active_lora(manager, 1)
+
+    assert refreshed is True
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
+
+
+def test_refresh_active_lora_raises_when_reactivation_fails() -> None:
     from rl_training.vllm_lora_server import refresh_active_lora
 
     manager = _FakeAdapterManager()
@@ -242,11 +337,23 @@ def test_refresh_active_lora_returns_false_when_reactivation_fails() -> None:
 
     manager.activate_adapter = _fail_activate
 
+    with pytest.raises(RuntimeError, match="Failed to reactivate LoRA adapter"):
+        refresh_active_lora(manager, 1)
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
+
+
+def test_refresh_active_lora_returns_false_when_adapter_was_not_active() -> None:
+    from rl_training.vllm_lora_server import refresh_active_lora
+
+    manager = _FakeAdapterManager()
+    manager._active_adapters.clear()
+
     refreshed = refresh_active_lora(manager, 1)
 
     assert refreshed is False
-    assert manager.deactivated == [1]
-    assert manager.activated == [1]
+    assert manager.deactivated == []
+    assert manager.activated == []
 
 
 def test_generate_endpoint_passes_fixed_lora_request() -> None:
@@ -346,11 +453,99 @@ def test_update_lora_param_endpoint_dispatches_collective_rpc_with_lora_id() -> 
     )
 
     assert response.status_code == 200
+    update_id = response.json()["update_id"]
+    for _ in range(20):
+        status = TestClient(app).get(f"/lora_update_status/{update_id}").json()
+        if status["state"] == "ok":
+            break
+        time.sleep(0.01)
+
+    assert status == {"state": "ok", "error": None}
     assert llm.collective_rpc_calls[-1] == {
         "method": "update_lora_param",
         "args": ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3), 1),
         "kwargs": {},
     }
+
+
+def test_update_lora_param_endpoint_returns_before_collective_rpc_completes_and_exposes_status() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    class BlockingLLM(_FakeLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = threading.Event()
+
+        def collective_rpc(self, *, method, args=(), kwargs=None):
+            self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
+            self.release.wait(timeout=2)
+            return [None]
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = BlockingLLM()
+    client = TestClient(create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams))
+
+    start = time.perf_counter()
+    response = client.post(
+        "/update_lora_param/",
+        json={
+            "name": "model.layers.0.self_attn.q_proj.lora_A.weight",
+            "dtype": "torch.float32",
+            "shape": [2, 3],
+        },
+    )
+    elapsed = time.perf_counter() - start
+
+    assert response.status_code == 200
+    assert elapsed < 0.5
+    update_id = response.json()["update_id"]
+    assert client.get(f"/lora_update_status/{update_id}").json() == {"state": "pending", "error": None}
+
+    llm.release.set()
+    for _ in range(20):
+        status = client.get(f"/lora_update_status/{update_id}").json()
+        if status["state"] == "ok":
+            break
+        time.sleep(0.01)
+
+    assert status == {"state": "ok", "error": None}
+
+
+def test_lora_update_status_endpoint_returns_404_for_unknown_update() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    client = TestClient(create_app(args, llm=_FakeLLM(), sampling_params_cls=_FakeSamplingParams))
+
+    response = client.get("/lora_update_status/missing")
+
+    assert response.status_code == 404
 
 
 def test_update_lora_param_endpoint_rejects_bad_dtype() -> None:
