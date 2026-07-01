@@ -139,13 +139,13 @@ git commit -m "feat: add grpo vllm lora sync config"
 
 **Files:**
 - Create: `src/rl_training/vllm_lora_mapping.py`
-- Modify: `src/rl_training/vllm_client.py`
 - Test: `tests/test_rl_training.py`
 
 **Interfaces:**
 - Produces: `normalize_peft_lora_name(name: str) -> str | None`.
 - Produces: `collect_lora_named_tensors(model: Any, device: Any | None = None) -> dict[str, Any]`.
 - Consumes: PEFT `named_parameters()` output from `raw_policy_model`.
+- Runtime sync integration is Task 3; Task 2 only creates and tests the mapping/collection interface.
 
 - [ ] **Step 1: Write failing name mapping tests**
 
