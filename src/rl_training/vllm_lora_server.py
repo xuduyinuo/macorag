@@ -59,11 +59,23 @@ class WeightSyncLoRAWorkerExtension:
         self.pynccl_comm = PyNcclCommunicator(process_group, device=self.device)
         self.client_rank = world_size - 1
 
-    def update_lora_param(self, name: str, dtype: torch.dtype, shape: Sequence[int]) -> None:
-        raise RuntimeError(
-            "LoRA in-memory tensor replacement is not implemented for vLLM 0.8.5.post1 yet. "
-            f"Requested {name} dtype={dtype} shape={tuple(shape)}."
-        )
+    def update_lora_param(self, name: str, dtype: torch.dtype, shape: Sequence[int], lora_int_id: int) -> None:
+        if self.pynccl_comm is None:
+            raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
+
+        weight = torch.empty(tuple(shape), dtype=dtype, device=self.device)
+        self.pynccl_comm.broadcast(weight, src=self.client_rank)
+        self.pynccl_comm.group.barrier()
+
+        worker_lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if worker_lora_manager is None:
+            raise RuntimeError("vLLM LoRA manager is not initialized.")
+        adapter_manager = getattr(worker_lora_manager, "_adapter_manager", None)
+        if adapter_manager is None:
+            raise RuntimeError("vLLM adapter manager is not initialized.")
+
+        update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
+        refresh_active_lora(adapter_manager, lora_int_id)
 
     def close_communicator(self) -> None:
         if self.pynccl_comm is not None:
@@ -173,7 +185,7 @@ def create_app(
             "lora_name": args.lora_name,
             "lora_int_id": args.lora_int_id,
             "lora_adapter_path": args.lora_adapter_path,
-            "supports_lora_param_update": False,
+            "supports_lora_param_update": True,
         }
 
     @app.get("/get_world_size/")
@@ -214,16 +226,17 @@ def create_app(
     @app.post("/update_lora_param/")
     async def update_lora_param(request: UpdateLoRAParamRequest = Body(...)):
         try:
-            _dtype_from_wire(request.dtype)
+            dtype = _dtype_from_wire(request.dtype)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        raise HTTPException(
-            status_code=501,
-            detail=(
-                "LoRA in-memory tensor replacement is not implemented for this vLLM version yet. "
-                f"Requested {request.name} shape={request.shape}."
-            ),
-        )
+        try:
+            llm.collective_rpc(
+                method="update_lora_param",
+                args=(request.name, dtype, tuple(request.shape), args.lora_int_id),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {"message": "Request received, updating LoRA parameter"}
 
     @app.post("/reset_prefix_cache/")
     async def reset_prefix_cache():

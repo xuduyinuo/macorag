@@ -312,11 +312,48 @@ def test_health_endpoint_exposes_lora_identity_and_capability_status() -> None:
         "lora_name": "macorag_train",
         "lora_int_id": 1,
         "lora_adapter_path": "outputs/adapter",
-        "supports_lora_param_update": False,
+        "supports_lora_param_update": True,
     }
 
 
-def test_update_lora_param_endpoint_fails_explicitly() -> None:
+def test_update_lora_param_endpoint_dispatches_collective_rpc_with_lora_id() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = _FakeLLM()
+    app = create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams)
+
+    response = TestClient(app).post(
+        "/update_lora_param/",
+        json={
+            "name": "model.layers.0.self_attn.q_proj.lora_A.weight",
+            "dtype": "torch.float32",
+            "shape": [2, 3],
+        },
+    )
+
+    assert response.status_code == 200
+    assert llm.collective_rpc_calls[-1] == {
+        "method": "update_lora_param",
+        "args": ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3), 1),
+        "kwargs": {},
+    }
+
+
+def test_update_lora_param_endpoint_rejects_bad_dtype() -> None:
     from fastapi.testclient import TestClient
 
     from rl_training.vllm_lora_server import create_app, parse_server_args
@@ -337,11 +374,46 @@ def test_update_lora_param_endpoint_fails_explicitly() -> None:
 
     response = TestClient(app, raise_server_exceptions=False).post(
         "/update_lora_param/",
-        json={"name": "model.layers.0.self_attn.q_proj.lora_A.weight", "dtype": "torch.float32", "shape": [64, 3584]},
+        json={"name": "model.layers.0.self_attn.q_proj.lora_A.weight", "dtype": "bad", "shape": [2, 3]},
     )
 
-    assert response.status_code == 501
-    assert "LoRA in-memory tensor replacement is not implemented" in response.text
+    assert response.status_code == 400
+
+
+def test_weight_sync_lora_worker_extension_updates_registered_adapter() -> None:
+    from rl_training.vllm_lora_server import WeightSyncLoRAWorkerExtension
+
+    manager = _FakeAdapterManager()
+    extension = WeightSyncLoRAWorkerExtension()
+    extension.device = torch.device("cpu")
+    extension.client_rank = 1
+    extension.model_runner = type(
+        "Runner",
+        (),
+        {"lora_manager": type("WorkerManager", (), {"_adapter_manager": manager})()},
+    )()
+
+    class FakeComm:
+        def __init__(self) -> None:
+            self.group = type("Group", (), {"barrier": lambda self_group: None})()
+
+        def broadcast(self, tensor, src):
+            assert src == 1
+            tensor.copy_(torch.arange(6, dtype=tensor.dtype).reshape(2, 3))
+
+    extension.pynccl_comm = FakeComm()
+
+    extension.update_lora_param(
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        torch.float16,
+        (2, 3),
+        1,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
+    assert torch.equal(layer.lora_a, torch.arange(6, dtype=torch.float16).reshape(2, 3).T)
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
 
 
 def test_reset_prefix_cache_endpoint_calls_llm_reset() -> None:
