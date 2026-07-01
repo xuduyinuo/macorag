@@ -37,10 +37,10 @@ vllm_gpu_memory_utilization: 0.75
 vllm_max_model_len: 8192
 vllm_dtype: "auto"
 vllm_sync_after_step: true
-vllm_sync_every_steps: 4
+vllm_sync_every_steps: 1
 vllm_sync_trainable_only: true
 vllm_timeout_seconds: 120
-vllm_sync_mode: "dense"
+vllm_sync_mode: "lora"
 vllm_lora_name: "macorag_train"
 vllm_lora_int_id: 1
 vllm_lora_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
