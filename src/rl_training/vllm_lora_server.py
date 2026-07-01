@@ -162,6 +162,14 @@ def create_app(
             ),
         )
 
+    @app.post("/reset_prefix_cache/")
+    async def reset_prefix_cache():
+        resetter = getattr(llm, "reset_prefix_cache", None)
+        if not callable(resetter):
+            raise HTTPException(status_code=501, detail="vLLM reset_prefix_cache() is not available in this server.")
+        success = resetter()
+        return {"message": f"Request received, resetting prefix cache status: {bool(success)}"}
+
     @app.post("/close_communicator/")
     async def close_communicator():
         llm.collective_rpc(method="close_communicator")

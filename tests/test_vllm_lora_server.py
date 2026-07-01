@@ -57,6 +57,7 @@ class _FakeLLM:
     def __init__(self) -> None:
         self.generate_calls = []
         self.collective_rpc_calls = []
+        self.reset_prefix_cache_calls = 0
 
     def generate(self, prompts, *, sampling_params, lora_request):
         self.generate_calls.append(
@@ -71,6 +72,10 @@ class _FakeLLM:
     def collective_rpc(self, *, method, args=(), kwargs=None):
         self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
         return [None]
+
+    def reset_prefix_cache(self):
+        self.reset_prefix_cache_calls += 1
+        return True
 
 
 def test_generate_endpoint_passes_fixed_lora_request() -> None:
@@ -133,3 +138,29 @@ def test_update_lora_param_endpoint_fails_explicitly() -> None:
 
     assert response.status_code == 501
     assert "LoRA in-memory tensor replacement is not implemented" in response.text
+
+
+def test_reset_prefix_cache_endpoint_calls_llm_reset() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = _FakeLLM()
+    app = create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams)
+
+    response = TestClient(app).post("/reset_prefix_cache/")
+
+    assert response.status_code == 200
+    assert llm.reset_prefix_cache_calls == 1
