@@ -44,9 +44,33 @@ def build_lora_request(args: argparse.Namespace):
     )
 
 
+def register_lora_adapter_on_workers(llm: Any, args: argparse.Namespace) -> None:
+    llm.collective_rpc(
+        method="register_lora_adapter",
+        args=(args.lora_name, args.lora_int_id, args.lora_adapter_path),
+    )
+
+
 class WeightSyncLoRAWorkerExtension:
     pynccl_comm = None
     client_rank = None
+
+    def register_lora_adapter(self, lora_name: str, lora_int_id: int, lora_adapter_path: str) -> None:
+        worker_lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if worker_lora_manager is None:
+            raise RuntimeError("vLLM LoRA manager is not initialized.")
+
+        from vllm.lora.request import LoRARequest
+
+        request = LoRARequest(
+            lora_name=lora_name,
+            lora_int_id=lora_int_id,
+            lora_path=lora_adapter_path,
+        )
+        if not worker_lora_manager.add_adapter(request):
+            raise RuntimeError(f"Failed to register LoRA adapter {lora_int_id}.")
+        if not worker_lora_manager.pin_adapter(lora_int_id):
+            raise RuntimeError(f"Failed to pin LoRA adapter {lora_int_id}.")
 
     def init_communicator(self, host: str, port: int, world_size: int) -> None:
         if self.pynccl_comm is not None:
@@ -381,6 +405,7 @@ def main() -> None:
         max_lora_rank=64,
         worker_extension_cls="rl_training.vllm_lora_server.WeightSyncLoRAWorkerExtension",
     )
+    register_lora_adapter_on_workers(llm, args)
     app = create_app(args, llm=llm, sampling_params_cls=SamplingParams)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 

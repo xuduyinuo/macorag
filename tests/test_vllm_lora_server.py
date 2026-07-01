@@ -53,6 +53,34 @@ def test_build_lora_request_uses_configured_identity() -> None:
     assert request.lora_path == "outputs/adapter"
 
 
+def test_register_lora_adapter_on_workers_dispatches_startup_registration() -> None:
+    from rl_training.vllm_lora_server import parse_server_args, register_lora_adapter_on_workers
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = _FakeLLM()
+
+    register_lora_adapter_on_workers(llm, args)
+
+    assert llm.collective_rpc_calls == [
+        {
+            "method": "register_lora_adapter",
+            "args": ("macorag_train", 1, "outputs/adapter"),
+            "kwargs": {},
+        }
+    ]
+
+
 class _FakeSamplingParams:
     def __init__(self, **kwargs) -> None:
         self.kwargs = kwargs
@@ -609,6 +637,36 @@ def test_weight_sync_lora_worker_extension_updates_registered_adapter() -> None:
     assert torch.equal(layer.lora_a, torch.arange(6, dtype=torch.float16).reshape(2, 3).T)
     assert manager.deactivated == [1]
     assert manager.activated == [1]
+
+
+def test_weight_sync_lora_worker_extension_registers_and_pins_adapter() -> None:
+    from vllm.lora.request import LoRARequest
+
+    from rl_training.vllm_lora_server import WeightSyncLoRAWorkerExtension
+
+    class FakeWorkerLoRAManager:
+        def __init__(self) -> None:
+            self.added: list[LoRARequest] = []
+            self.pinned: list[int] = []
+
+        def add_adapter(self, request: LoRARequest) -> bool:
+            self.added.append(request)
+            return True
+
+        def pin_adapter(self, lora_int_id: int) -> bool:
+            self.pinned.append(lora_int_id)
+            return True
+
+    worker_lora_manager = FakeWorkerLoRAManager()
+    extension = WeightSyncLoRAWorkerExtension()
+    extension.model_runner = type("Runner", (), {"lora_manager": worker_lora_manager})()
+
+    extension.register_lora_adapter("macorag_train", 1, "outputs/adapter")
+
+    assert [(request.lora_name, request.lora_int_id, request.lora_path) for request in worker_lora_manager.added] == [
+        ("macorag_train", 1, "outputs/adapter")
+    ]
+    assert worker_lora_manager.pinned == [1]
 
 
 def test_reset_prefix_cache_endpoint_calls_llm_reset() -> None:
