@@ -18,7 +18,7 @@ def normalize_peft_lora_name(name: str) -> str | None:
     return f"{match.group('base')}.{match.group('side')}.weight"
 
 
-def collect_lora_named_tensors(model: Any, *, device: Any | None = None) -> dict[str, Any]:
+def collect_lora_named_tensors(model: Any, device: Any | None = None) -> dict[str, Any]:
     tensors: dict[str, Any] = {}
     for name, parameter in model.named_parameters():
         mapped = normalize_peft_lora_name(name)
