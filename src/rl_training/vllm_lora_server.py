@@ -104,10 +104,16 @@ class WeightSyncLoRAWorkerExtension:
             raise RuntimeError("vLLM adapter manager is not initialized.")
 
         for name, dtype, shape in tensors:
+            validate_registered_lora_tensor(adapter_manager, lora_int_id, name, shape)
+
+        received: list[tuple[str, torch.Tensor]] = []
+        for name, dtype, shape in tensors:
             weight = torch.empty(tuple(shape), dtype=dtype, device=self.device)
             self.pynccl_comm.broadcast(weight, src=self.client_rank)
-            update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
+            received.append((name, weight))
         self.pynccl_comm.group.barrier()
+        for name, weight in received:
+            update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
         refresh_active_lora(adapter_manager, lora_int_id)
 
     def close_communicator(self) -> None:
@@ -233,6 +239,26 @@ def update_registered_lora_tensor(
     target.copy_(source)
     if side == "lora_B":
         _mark_lora_b_scaling_merged(layer, list_index)
+    return tuple(target.shape)
+
+
+def validate_registered_lora_tensor(
+    adapter_manager: Any,
+    lora_int_id: int,
+    name: str,
+    shape: Sequence[int],
+) -> tuple[int, ...]:
+    module_name, side = parse_vllm_lora_tensor_name(name)
+    registered_adapters = getattr(adapter_manager, "_registered_adapters", {})
+    if lora_int_id not in registered_adapters:
+        raise KeyError(f"Registered LoRA adapter not found: {lora_int_id}")
+
+    lora_model = registered_adapters[lora_int_id]
+    _, target, _, _ = _resolve_registered_lora_target(adapter_manager, lora_model, module_name, side)
+    expected_shape = tuple(target.T.shape)
+    actual_shape = tuple(shape)
+    if expected_shape != actual_shape:
+        raise ValueError(f"LoRA tensor shape mismatch for {name}: expected PEFT shape {expected_shape}, got {actual_shape}")
     return tuple(target.shape)
 
 

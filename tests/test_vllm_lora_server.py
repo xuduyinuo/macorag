@@ -790,6 +790,42 @@ def test_weight_sync_lora_worker_extension_updates_registered_adapter_batch() ->
     assert manager.activated == [1]
 
 
+def test_weight_sync_lora_worker_extension_batch_validates_before_broadcast() -> None:
+    from rl_training.vllm_lora_server import WeightSyncLoRAWorkerExtension
+
+    manager = _FakeAdapterManager()
+    extension = WeightSyncLoRAWorkerExtension()
+    extension.device = torch.device("cpu")
+    extension.client_rank = 1
+    extension.model_runner = type(
+        "Runner",
+        (),
+        {"lora_manager": type("WorkerManager", (), {"_adapter_manager": manager})()},
+    )()
+
+    class FakeComm:
+        def __init__(self) -> None:
+            self.broadcast_calls = 0
+            self.group = type("Group", (), {"barrier": lambda self_group: None})()
+
+        def broadcast(self, tensor, src):
+            self.broadcast_calls += 1
+
+    communicator = FakeComm()
+    extension.pynccl_comm = communicator
+
+    with pytest.raises(ValueError, match="shape mismatch"):
+        extension.update_lora_params(
+            [
+                ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float16, (2, 3)),
+                ("model.layers.0.self_attn.q_proj.lora_B.weight", torch.float16, (999, 2)),
+            ],
+            1,
+        )
+
+    assert communicator.broadcast_calls == 0
+
+
 def test_weight_sync_lora_worker_extension_registers_and_pins_adapter() -> None:
     from vllm.lora.request import LoRARequest
 
