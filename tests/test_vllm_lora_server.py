@@ -489,11 +489,18 @@ def test_update_lora_param_endpoint_dispatches_collective_rpc_with_lora_id() -> 
         time.sleep(0.01)
 
     assert status == {"state": "ok", "error": None}
-    assert llm.collective_rpc_calls[-1] == {
-        "method": "update_lora_param",
-        "args": ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3), 1),
-        "kwargs": {},
-    }
+    assert llm.collective_rpc_calls[-2:] == [
+        {
+            "method": "validate_lora_params",
+            "args": ([("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3))], 1),
+            "kwargs": {},
+        },
+        {
+            "method": "update_lora_param",
+            "args": ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3), 1),
+            "kwargs": {},
+        },
+    ]
 
 
 def test_update_lora_params_endpoint_dispatches_single_batch_collective_rpc() -> None:
@@ -543,17 +550,59 @@ def test_update_lora_params_endpoint_dispatches_single_batch_collective_rpc() ->
         time.sleep(0.01)
 
     assert status == {"state": "ok", "error": None}
-    assert llm.collective_rpc_calls[-1] == {
-        "method": "update_lora_params",
-        "args": (
-            [
-                ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3)),
-                ("model.layers.0.self_attn.q_proj.lora_B.weight", torch.float16, (4, 2)),
-            ],
-            1,
-        ),
-        "kwargs": {},
-    }
+    expected_specs = [
+        ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3)),
+        ("model.layers.0.self_attn.q_proj.lora_B.weight", torch.float16, (4, 2)),
+    ]
+    assert llm.collective_rpc_calls[-2:] == [
+        {"method": "validate_lora_params", "args": (expected_specs, 1), "kwargs": {}},
+        {"method": "update_lora_params", "args": (expected_specs, 1), "kwargs": {}},
+    ]
+
+
+def test_update_lora_params_endpoint_rejects_failed_preflight_without_update_id() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    class RejectingLLM(_FakeLLM):
+        def collective_rpc(self, *, method, args=(), kwargs=None):
+            self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
+            if method == "validate_lora_params":
+                raise ValueError("shape mismatch")
+            return [None]
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = RejectingLLM()
+    client = TestClient(create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams), raise_server_exceptions=False)
+
+    response = client.post(
+        "/update_lora_params/",
+        json={
+            "tensors": [
+                {
+                    "name": "model.layers.0.self_attn.q_proj.lora_A.weight",
+                    "dtype": "torch.float16",
+                    "shape": [999, 3],
+                }
+            ]
+        },
+    )
+
+    assert response.status_code == 400
+    assert "shape mismatch" in response.text
+    assert [call["method"] for call in llm.collective_rpc_calls] == ["validate_lora_params"]
 
 
 def test_update_lora_param_endpoint_returns_before_collective_rpc_completes_and_exposes_status() -> None:
@@ -568,7 +617,8 @@ def test_update_lora_param_endpoint_returns_before_collective_rpc_completes_and_
 
         def collective_rpc(self, *, method, args=(), kwargs=None):
             self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
-            self.release.wait(timeout=2)
+            if method != "validate_lora_params":
+                self.release.wait(timeout=2)
             return [None]
 
     args = parse_server_args(

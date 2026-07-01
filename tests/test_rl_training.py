@@ -516,6 +516,34 @@ def test_vllm_generation_client_sync_lora_parameters_raises_on_update_error_stat
         raise AssertionError("expected LoRA update error status to fail")
 
 
+def test_vllm_generation_client_sync_lora_parameters_does_not_broadcast_after_preflight_error() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(update_status_code=400, update_payload={"detail": "shape mismatch"})
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: None})(),
+        },
+    )()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=0.1, backend=backend)
+
+    try:
+        client.sync_lora_parameters(_TinyPeftModel())
+    except RuntimeError as exc:
+        assert "Request failed: 400" in str(exc)
+    else:
+        raise AssertionError("expected LoRA preflight rejection to fail")
+
+    assert backend.updated == []
+    assert backend.session.gets == []
+
+
 def test_vllm_generation_client_sync_lora_parameters_requires_update_id() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 

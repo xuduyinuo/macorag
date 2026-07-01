@@ -116,6 +116,21 @@ class WeightSyncLoRAWorkerExtension:
             update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
         refresh_active_lora(adapter_manager, lora_int_id)
 
+    def validate_lora_params(
+        self,
+        tensors: Sequence[tuple[str, torch.dtype, Sequence[int]]],
+        lora_int_id: int,
+    ) -> None:
+        worker_lora_manager = getattr(self.model_runner, "lora_manager", None)
+        if worker_lora_manager is None:
+            raise RuntimeError("vLLM LoRA manager is not initialized.")
+        adapter_manager = getattr(worker_lora_manager, "_adapter_manager", None)
+        if adapter_manager is None:
+            raise RuntimeError("vLLM adapter manager is not initialized.")
+
+        for name, _dtype, shape in tensors:
+            validate_registered_lora_tensor(adapter_manager, lora_int_id, name, shape)
+
     def close_communicator(self) -> None:
         if self.pynccl_comm is not None:
             del self.pynccl_comm
@@ -376,6 +391,13 @@ def create_app(
             parse_vllm_lora_tensor_name(request.name)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        try:
+            llm.collective_rpc(
+                method="validate_lora_params",
+                args=([(request.name, dtype, tuple(request.shape))], args.lora_int_id),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         update_id = uuid.uuid4().hex
         with update_status_lock:
@@ -413,6 +435,11 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             tensor_specs.append((tensor.name, dtype, tuple(tensor.shape)))
+
+        try:
+            llm.collective_rpc(method="validate_lora_params", args=(tensor_specs, args.lora_int_id))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         update_id = uuid.uuid4().hex
         with update_status_lock:
