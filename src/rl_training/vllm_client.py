@@ -96,6 +96,60 @@ class VLLMGenerationClient:
             raise SystemExit("TRL VLLMClient is missing check_server(); installed TRL is incompatible.")
         checker()
 
+    def validate_lora_server(self, args: Any) -> None:
+        session = getattr(self.backend, "session", None)
+        base_url = getattr(self.backend, "base_url", None)
+        if session is None or base_url is None:
+            raise SystemExit("Installed TRL VLLMClient internals are incompatible with LoRA server validation.")
+
+        try:
+            response = session.get(f"{base_url}/health/")
+            if response.status_code != 200:
+                raise SystemExit(f"vLLM LoRA server health check failed: HTTP {response.status_code}, {response.text}")
+            health = response.json()
+        except SystemExit:
+            raise
+        except Exception as exc:
+            raise SystemExit(f"Unable to validate vLLM LoRA server health endpoint: {exc}") from exc
+
+        mismatches: list[str] = []
+        if health.get("sync_mode") != "lora":
+            mismatches.append(f"sync_mode expected lora got {health.get('sync_mode')!r}")
+        expected_lora_name = getattr(args, "vllm_lora_name", None)
+        if health.get("lora_name") != expected_lora_name:
+            mismatches.append(f"lora_name expected {expected_lora_name!r} got {health.get('lora_name')!r}")
+        expected_lora_int_id = getattr(args, "vllm_lora_int_id", None)
+        if health.get("lora_int_id") != expected_lora_int_id:
+            mismatches.append(f"lora_int_id expected {expected_lora_int_id!r} got {health.get('lora_int_id')!r}")
+        if "model" in health and health.get("model") != getattr(args, "model_path", None):
+            mismatches.append(f"model expected {getattr(args, 'model_path', None)!r} got {health.get('model')!r}")
+        if "lora_adapter_path" in health and health.get("lora_adapter_path") != getattr(
+            args, "vllm_lora_adapter_path", None
+        ):
+            mismatches.append(
+                "lora_adapter_path expected "
+                f"{getattr(args, 'vllm_lora_adapter_path', None)!r} got {health.get('lora_adapter_path')!r}"
+            )
+        if mismatches:
+            raise SystemExit("LoRA server identity mismatch: " + "; ".join(mismatches))
+
+        try:
+            response = session.post(
+                f"{base_url}/update_lora_param/",
+                json={
+                    "name": "__macorag_lora_capability_probe__",
+                    "dtype": "torch.float32",
+                    "shape": [0],
+                },
+            )
+        except Exception as exc:
+            raise SystemExit(f"Unable to probe vLLM LoRA hot-sync endpoint: {exc}") from exc
+        if response.status_code != 200:
+            raise SystemExit(
+                "LoRA hot sync is unsupported by the connected vLLM server: "
+                f"POST /update_lora_param/ returned HTTP {response.status_code}, {response.text}"
+            )
+
     def _ensure_communicator(self) -> None:
         if self._communicator_initialized:
             return

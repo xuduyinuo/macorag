@@ -112,6 +112,39 @@ def test_generate_endpoint_passes_fixed_lora_request() -> None:
     assert llm.generate_calls[0]["lora_request"].lora_path == "outputs/adapter"
 
 
+def test_health_endpoint_exposes_lora_identity_and_capability_status() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    app = create_app(args, llm=_FakeLLM(), sampling_params_cls=_FakeSamplingParams)
+
+    response = TestClient(app).get("/health/")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "ok",
+        "sync_mode": "lora",
+        "model": "model/Qwen2.5-7B-Instruct",
+        "lora_name": "macorag_train",
+        "lora_int_id": 1,
+        "lora_adapter_path": "outputs/adapter",
+        "supports_lora_param_update": False,
+    }
+
+
 def test_update_lora_param_endpoint_fails_explicitly() -> None:
     from fastapi.testclient import TestClient
 

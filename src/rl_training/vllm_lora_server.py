@@ -111,7 +111,15 @@ def create_app(
 
     @app.get("/health/")
     async def health():
-        return {"status": "ok", "lora_name": args.lora_name, "model": args.model}
+        return {
+            "status": "ok",
+            "sync_mode": "lora",
+            "model": args.model,
+            "lora_name": args.lora_name,
+            "lora_int_id": args.lora_int_id,
+            "lora_adapter_path": args.lora_adapter_path,
+            "supports_lora_param_update": False,
+        }
 
     @app.get("/get_world_size/")
     async def get_world_size():

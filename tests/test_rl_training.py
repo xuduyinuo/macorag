@@ -236,11 +236,15 @@ class _TinyPeftModel(torch.nn.Module):
             ),
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
-                torch.nn.Parameter(torch.tensor([2.0]), requires_grad=True),
+                torch.nn.Parameter(torch.tensor([2.0], dtype=torch.float16), requires_grad=True),
             ),
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight",
                 torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True),
+            ),
+            (
+                "base_model.model.model.layers.0.self_attn.k_proj.lora_A.default.weight",
+                torch.nn.Parameter(torch.tensor([4.0], dtype=torch.float16), requires_grad=False),
             ),
         ]
 
@@ -297,6 +301,17 @@ def test_collect_lora_named_tensors_maps_only_lora_params() -> None:
         "model.layers.0.self_attn.q_proj.lora_B.weight",
     ]
     assert all(tensor.device.type == "cpu" for tensor in tensors.values())
+    assert tensors["model.layers.0.self_attn.q_proj.lora_A.weight"].dtype is torch.float16
+
+
+def test_collect_lora_named_tensors_filters_frozen_lora_params() -> None:
+    from rl_training.vllm_lora_mapping import collect_lora_named_tensors
+
+    model = _TinyPeftModel()
+
+    tensors = collect_lora_named_tensors(model)
+
+    assert "model.layers.0.self_attn.k_proj.lora_A.weight" not in tensors
 
 
 def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
@@ -339,12 +354,22 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self) -> None:
+    def __init__(self, *, health_payload: dict | None = None, update_status_code: int = 200) -> None:
         self.posts: list[tuple[str, dict]] = []
+        self.health_payload = health_payload or {}
+        self.update_status_code = update_status_code
+
+    def get(self, url: str) -> _FakeResponse:
+        response = _FakeResponse()
+        response.json = lambda: self.health_payload
+        return response
 
     def post(self, url: str, json: dict) -> _FakeResponse:
         self.posts.append((url, json))
-        return _FakeResponse()
+        response = _FakeResponse()
+        response.status_code = self.update_status_code
+        response.text = "unsupported" if self.update_status_code != 200 else "ok"
+        return response
 
 
 def test_vllm_generation_client_syncs_trainable_parameters() -> None:
@@ -404,6 +429,150 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
     ]
     assert [name for name, _ in backend.updated] == ["broadcast", "broadcast"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
+
+
+def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        health_payload={
+            "status": "ok",
+            "sync_mode": "lora",
+            "lora_name": "other",
+            "lora_int_id": 1,
+            "model": "model/Qwen2.5-7B-Instruct",
+            "lora_adapter_path": "outputs/adapter",
+        }
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    args = Namespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        vllm_lora_name="macorag_train",
+        vllm_lora_int_id=1,
+        vllm_lora_adapter_path="outputs/adapter",
+    )
+
+    try:
+        client.validate_lora_server(args)
+    except SystemExit as exc:
+        assert "LoRA server identity mismatch" in str(exc)
+        assert "lora_name" in str(exc)
+    else:
+        raise AssertionError("expected LoRA server identity validation to fail")
+
+
+def test_vllm_generation_client_validate_lora_server_rejects_unsupported_update_endpoint() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        health_payload={
+            "status": "ok",
+            "sync_mode": "lora",
+            "lora_name": "macorag_train",
+            "lora_int_id": 1,
+            "model": "model/Qwen2.5-7B-Instruct",
+            "lora_adapter_path": "outputs/adapter",
+            "supports_lora_param_update": False,
+        },
+        update_status_code=501,
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    args = Namespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        vllm_lora_name="macorag_train",
+        vllm_lora_int_id=1,
+        vllm_lora_adapter_path="outputs/adapter",
+    )
+
+    try:
+        client.validate_lora_server(args)
+    except SystemExit as exc:
+        assert "LoRA hot sync is unsupported" in str(exc)
+    else:
+        raise AssertionError("expected unsupported LoRA update validation to fail")
+
+
+def test_build_policy_keeps_dense_mode_on_existing_health_check(monkeypatch) -> None:
+    import rl_training.train_grpo_macorag as train_grpo
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            calls.append("init")
+
+        def check_server(self) -> None:
+            calls.append("check_server")
+
+        def validate_lora_server(self, args) -> None:
+            calls.append("validate_lora_server")
+
+    monkeypatch.setattr(train_grpo, "_validate_local_vllm_server_model", lambda args: calls.append("model_check"))
+    monkeypatch.setattr(train_grpo, "VLLMGenerationClient", FakeClient)
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_sync_mode="dense",
+        vllm_host="127.0.0.1",
+        vllm_port=8000,
+        vllm_timeout_seconds=5,
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    policy = _build_policy(args, _LogprobModel(), _FakeTokenizer())
+
+    assert policy.vllm_client.__class__ is FakeClient
+    assert calls == ["model_check", "init", "check_server"]
+
+
+def test_build_policy_validates_lora_server_before_generic_health(monkeypatch) -> None:
+    import rl_training.train_grpo_macorag as train_grpo
+
+    calls: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **kwargs) -> None:
+            calls.append("init")
+
+        def check_server(self) -> None:
+            calls.append("check_server")
+
+        def validate_lora_server(self, args) -> None:
+            calls.append("validate_lora_server")
+            raise SystemExit("LoRA hot sync is unsupported")
+
+    monkeypatch.setattr(train_grpo, "_validate_local_vllm_server_model", lambda args: calls.append("model_check"))
+    monkeypatch.setattr(train_grpo, "VLLMGenerationClient", FakeClient)
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_sync_mode="lora",
+        vllm_host="127.0.0.1",
+        vllm_port=8000,
+        vllm_timeout_seconds=5,
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    try:
+        _build_policy(args, _LogprobModel(), _FakeTokenizer())
+    except SystemExit as exc:
+        assert "LoRA hot sync is unsupported" in str(exc)
+    else:
+        raise AssertionError("expected LoRA server validation to fail")
+
+    assert calls == ["model_check", "init", "validate_lora_server"]
 
 
 class _FakePolicyWithLoraClient:

@@ -333,7 +333,10 @@ def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedP
         port=args.vllm_port,
         timeout_seconds=args.vllm_timeout_seconds,
     )
-    client.check_server()
+    if getattr(args, "vllm_sync_mode", "dense") == "lora":
+        client.validate_lora_server(args)
+    else:
+        client.check_server()
     return VLLMSharedPolicy(vllm_client=client, **common)
 
 

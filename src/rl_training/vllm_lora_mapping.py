@@ -21,10 +21,12 @@ def normalize_peft_lora_name(name: str) -> str | None:
 def collect_lora_named_tensors(model: Any, device: Any | None = None) -> dict[str, Any]:
     tensors: dict[str, Any] = {}
     for name, parameter in model.named_parameters():
+        if not getattr(parameter, "requires_grad", False):
+            continue
         mapped = normalize_peft_lora_name(name)
         if mapped is None:
             continue
-        tensor = parameter.detach().float()
+        tensor = parameter.detach()
         if device is not None:
             tensor = tensor.to(device=device)
         else:
