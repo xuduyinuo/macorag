@@ -690,6 +690,7 @@ def test_run_grpo_vllm_lora_server_script_uses_custom_server_and_lora_config() -
     assert "vllm_lora_int_id" in script
     assert "vllm_lora_adapter_path" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
+    assert "--data-parallel-size" in script
 
 
 def test_write_train_event_records_sample_progress(tmp_path: Path) -> None:

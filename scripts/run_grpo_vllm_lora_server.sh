@@ -11,7 +11,7 @@ cd "${REPO_ROOT}"
 
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_grpo.yml}"
 
-read -r YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE YAML_LORA_NAME YAML_LORA_INT_ID YAML_LORA_ADAPTER_PATH < <(
+read -r YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE YAML_LORA_NAME YAML_LORA_INT_ID YAML_LORA_ADAPTER_PATH YAML_DP < <(
   "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
 import sys
 from pathlib import Path
@@ -30,6 +30,7 @@ print(
     config.get("vllm_lora_name", "macorag_train"),
     int(config.get("vllm_lora_int_id", 1)),
     config.get("vllm_lora_adapter_path") or config.get("sft_adapter_path", ""),
+    int(config.get("vllm_data_parallel_size", 1)),
 )
 PY
 )
@@ -46,5 +47,6 @@ exec "${PYTHON:-python}" -m rl_training.vllm_lora_server \
   --dtype "${YAML_DTYPE}" \
   --lora-name "${YAML_LORA_NAME}" \
   --lora-int-id "${YAML_LORA_INT_ID}" \
+  --data-parallel-size "${YAML_DP}" \
   --lora-adapter-path "${YAML_LORA_ADAPTER_PATH}" \
   "$@"
