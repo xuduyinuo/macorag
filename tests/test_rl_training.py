@@ -682,6 +682,16 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
     assert "--gpu-memory-utilization" in script
 
 
+def test_run_grpo_vllm_lora_server_script_uses_custom_server_and_lora_config() -> None:
+    script = Path("scripts/run_grpo_vllm_lora_server.sh").read_text(encoding="utf-8")
+
+    assert "rl_training.vllm_lora_server" in script
+    assert "vllm_lora_name" in script
+    assert "vllm_lora_int_id" in script
+    assert "vllm_lora_adapter_path" in script
+    assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
+
+
 def test_write_train_event_records_sample_progress(tmp_path: Path) -> None:
     event_path = tmp_path / "train_events.jsonl"
 
