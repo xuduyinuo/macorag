@@ -271,17 +271,28 @@ git commit -m "feat: add vllm lora tensor mapping"
 - Produces: `VLLMGenerationClient.sync_lora_parameters(model: Any) -> float`.
 - Produces: `_sync_vllm_after_optimizer_step(policy, raw_policy_model, args) -> float` chooses dense or LoRA mode.
 - Consumes: `collect_lora_named_tensors()`.
+- Implements LoRA sync in the project wrapper by posting `/update_lora_param/` metadata and using TRL's existing
+  `pynccl_comm.broadcast(...)`; do not require the installed TRL `VLLMClient` to expose `update_lora_param()`.
 
 - [ ] **Step 1: Write failing client test**
 
-Add fake backend method in `_FakeTRLClient`:
+Add fake backend fields in the test setup rather than adding an `update_lora_param()` method. The real TRL backend does
+not expose that method, so the wrapper must use `backend.session`, `backend.base_url`, `backend.rank`, and
+`backend.pynccl_comm`.
 
 ```python
-def update_lora_param(self, name: str, weights: torch.Tensor) -> None:
-    assert self.communicator_initialized is True
-    if self.sync_device is not None:
-        assert weights.device == self.sync_device
-    self.updated.append((name, weights))
+class _FakeResponse:
+    status_code = 200
+    text = "ok"
+
+
+class _FakeSession:
+    def __init__(self) -> None:
+        self.posts: list[tuple[str, dict]] = []
+
+    def post(self, url: str, json: dict) -> _FakeResponse:
+        self.posts.append((url, json))
+        return _FakeResponse()
 ```
 
 Add test:
@@ -291,6 +302,18 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
     backend = _FakeTRLClient(sync_device=torch.device("meta"))
+    backend.session = _FakeSession()
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "device": torch.device("meta"),
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: None})(),
+        },
+    )()
     client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
     model = _TinyPeftModel()
 
@@ -298,10 +321,11 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
 
     assert elapsed >= 0.0
     assert backend.communicator_initialized is True
-    assert [name for name, _ in backend.updated] == [
+    assert [payload["name"] for _, payload in backend.session.posts] == [
         "model.layers.0.self_attn.q_proj.lora_A.weight",
         "model.layers.0.self_attn.q_proj.lora_B.weight",
     ]
+    assert [name for name, _ in backend.updated] == ["broadcast", "broadcast"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
 ```
 
@@ -337,13 +361,32 @@ def _ensure_communicator(self) -> None:
 
 Refactor `sync_trainable_parameters()` to call `_ensure_communicator()`.
 
-Add method:
+Add helpers and method:
 
 ```python
+def _post_lora_param_metadata(backend: Any, name: str, tensor: Any) -> None:
+    session = getattr(backend, "session", None)
+    base_url = getattr(backend, "base_url", None)
+    if session is None or base_url is None:
+        raise SystemExit("Installed TRL VLLMClient internals are incompatible with LoRA hot sync.")
+    response = session.post(
+        f"{base_url}/update_lora_param/",
+        json={"name": name, "dtype": str(tensor.dtype), "shape": tuple(tensor.shape)},
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+
+
+def _broadcast_lora_tensor(backend: Any, tensor: Any) -> None:
+    communicator = getattr(backend, "pynccl_comm", None)
+    rank = getattr(backend, "rank", None)
+    if communicator is None or rank is None:
+        raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
+    communicator.broadcast(tensor, src=rank)
+    communicator.group.barrier()
+
+
 def sync_lora_parameters(self, model: Any) -> float:
-    updater = getattr(self.backend, "update_lora_param", None)
-    if updater is None:
-        raise SystemExit("vLLM server does not expose update_lora_param(); start scripts/run_grpo_vllm_lora_server.sh.")
     self._ensure_communicator()
     sync_device = _backend_communicator_device(self.backend)
     start = time.perf_counter()
@@ -351,7 +394,8 @@ def sync_lora_parameters(self, model: Any) -> float:
     if not tensors:
         raise SystemExit("No LoRA tensors found for vLLM LoRA hot sync.")
     for name, tensor in tensors.items():
-        updater(name, tensor)
+        _post_lora_param_metadata(self.backend, name, tensor)
+        _broadcast_lora_tensor(self.backend, tensor)
     return time.perf_counter() - start
 ```
 
