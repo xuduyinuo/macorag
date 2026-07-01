@@ -323,7 +323,11 @@ def create_app(
     @app.post("/init_communicator/")
     async def init_communicator(request: InitCommunicatorRequest = Body(...)):
         world_size = args.tensor_parallel_size * args.data_parallel_size + 1
-        llm.collective_rpc(method="init_communicator", args=(request.host, request.port, world_size))
+        threading.Thread(
+            target=llm.collective_rpc,
+            kwargs={"method": "init_communicator", "args": (request.host, request.port, world_size)},
+            daemon=True,
+        ).start()
         return {"message": "Request received, initializing communicator"}
 
     @app.post("/update_lora_param/")
@@ -375,7 +379,11 @@ def create_app(
 
     @app.post("/close_communicator/")
     async def close_communicator():
-        llm.collective_rpc(method="close_communicator")
+        threading.Thread(
+            target=llm.collective_rpc,
+            kwargs={"method": "close_communicator"},
+            daemon=True,
+        ).start()
         return {"message": "Request received, closing communicator"}
 
     return app

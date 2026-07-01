@@ -552,6 +552,52 @@ def test_update_lora_param_endpoint_returns_before_collective_rpc_completes_and_
     assert status == {"state": "ok", "error": None}
 
 
+def test_init_communicator_endpoint_returns_before_collective_rpc_completes() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    class BlockingLLM(_FakeLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = threading.Event()
+
+        def collective_rpc(self, *, method, args=(), kwargs=None):
+            self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
+            self.release.wait(timeout=2)
+            return [None]
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = BlockingLLM()
+    client = TestClient(create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams))
+
+    start = time.perf_counter()
+    response = client.post("/init_communicator/", json={"host": "0.0.0.0", "port": 12345, "world_size": 2})
+    elapsed = time.perf_counter() - start
+
+    assert response.status_code == 200
+    assert elapsed < 0.5
+    for _ in range(20):
+        if llm.collective_rpc_calls:
+            break
+        time.sleep(0.01)
+    assert llm.collective_rpc_calls == [
+        {"method": "init_communicator", "args": ("0.0.0.0", 12345, 2), "kwargs": {}}
+    ]
+    llm.release.set()
+
+
 def test_lora_update_status_endpoint_returns_404_for_unknown_update() -> None:
     from fastapi.testclient import TestClient
 
