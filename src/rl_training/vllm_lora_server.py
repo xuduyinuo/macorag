@@ -1,5 +1,6 @@
 import argparse
 import os
+import re
 from collections.abc import Sequence
 from typing import Any, Optional
 
@@ -7,6 +8,12 @@ import torch
 
 
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+
+
+_VLLM_LORA_TENSOR_RE = re.compile(
+    r"^(?P<module>model\.layers\.\d+\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|"
+    r"mlp\.(?:gate_proj|up_proj|down_proj)))\.(?P<side>lora_[AB])\.weight$"
+)
 
 
 def parse_server_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
@@ -74,13 +81,9 @@ def _dtype_from_wire(value: str) -> torch.dtype:
 
 
 def parse_vllm_lora_tensor_name(name: str) -> tuple[str, str]:
-    for side in ("lora_A", "lora_B"):
-        suffix = f".{side}.weight"
-        if name.endswith(suffix):
-            module_name = name[: -len(suffix)]
-            if module_name.startswith("model.layers."):
-                return module_name, side
-            break
+    match = _VLLM_LORA_TENSOR_RE.match(name)
+    if match is not None:
+        return match.group("module"), match.group("side")
     raise ValueError(f"Unsupported LoRA tensor name: {name}")
 
 
@@ -122,8 +125,7 @@ def refresh_active_lora(adapter_manager: Any, lora_int_id: int) -> bool:
         return False
 
     adapter_manager._deactivate_adapter(lora_int_id)
-    adapter_manager.activate_adapter(lora_int_id)
-    return True
+    return bool(adapter_manager.activate_adapter(lora_int_id))
 
 
 def create_app(

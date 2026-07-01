@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from rl_training.vllm_lora_server import parse_server_args
@@ -130,6 +131,20 @@ def test_parse_vllm_lora_tensor_name_rejects_unsupported_name() -> None:
         raise AssertionError("expected unsupported LoRA tensor name to fail")
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "model.layers.0.self_attn.rotary_emb.lora_A.weight",
+        "model.layers.0.foo.bar.lora_B.weight",
+    ],
+)
+def test_parse_vllm_lora_tensor_name_rejects_unsupported_layer_module(name: str) -> None:
+    from rl_training.vllm_lora_server import parse_vllm_lora_tensor_name
+
+    with pytest.raises(ValueError, match="Unsupported LoRA tensor name"):
+        parse_vllm_lora_tensor_name(name)
+
+
 def test_update_registered_lora_tensor_transposes_peft_a_weight() -> None:
     from rl_training.vllm_lora_server import update_registered_lora_tensor
 
@@ -212,6 +227,24 @@ def test_refresh_active_lora_reactivates_active_adapter() -> None:
     refreshed = refresh_active_lora(manager, 1)
 
     assert refreshed is True
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
+
+
+def test_refresh_active_lora_returns_false_when_reactivation_fails() -> None:
+    from rl_training.vllm_lora_server import refresh_active_lora
+
+    manager = _FakeAdapterManager()
+
+    def _fail_activate(lora_id: int) -> bool:
+        manager.activated.append(lora_id)
+        return False
+
+    manager.activate_adapter = _fail_activate
+
+    refreshed = refresh_active_lora(manager, 1)
+
+    assert refreshed is False
     assert manager.deactivated == [1]
     assert manager.activated == [1]
 
