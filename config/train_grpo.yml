@@ -32,6 +32,7 @@ vllm_host: "127.0.0.1"
 vllm_port: 8000
 vllm_gpu_indices: "0"
 vllm_tensor_parallel_size: 1
+vllm_data_parallel_size: 1
 vllm_gpu_memory_utilization: 0.75
 vllm_max_model_len: 8192
 vllm_dtype: "auto"

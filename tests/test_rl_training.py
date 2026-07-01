@@ -91,6 +91,7 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
                 "vllm_port: 8123",
                 'vllm_gpu_indices: "0"',
                 "vllm_tensor_parallel_size: 1",
+                "vllm_data_parallel_size: 2",
                 "vllm_gpu_memory_utilization: 0.70",
                 "vllm_max_model_len: 4608",
                 'vllm_dtype: "auto"',
@@ -110,6 +111,7 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
     assert args.vllm_port == 8123
     assert args.vllm_gpu_indices == "0"
     assert args.vllm_tensor_parallel_size == 1
+    assert args.vllm_data_parallel_size == 2
     assert args.vllm_gpu_memory_utilization == 0.70
     assert args.vllm_max_model_len == 4608
     assert args.vllm_dtype == "auto"

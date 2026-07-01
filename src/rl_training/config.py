@@ -58,6 +58,7 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "vllm_port": 8000,
     "vllm_gpu_indices": "0",
     "vllm_tensor_parallel_size": 1,
+    "vllm_data_parallel_size": 1,
     "vllm_gpu_memory_utilization": 0.75,
     "vllm_max_model_len": 4608,
     "vllm_dtype": "auto",
@@ -156,6 +157,7 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--vllm-port", type=int, default=defaults["vllm_port"])
     parser.add_argument("--vllm-gpu-indices", default=defaults["vllm_gpu_indices"])
     parser.add_argument("--vllm-tensor-parallel-size", type=int, default=defaults["vllm_tensor_parallel_size"])
+    parser.add_argument("--vllm-data-parallel-size", type=int, default=defaults["vllm_data_parallel_size"])
     parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=defaults["vllm_gpu_memory_utilization"])
     parser.add_argument("--vllm-max-model-len", type=int, default=defaults["vllm_max_model_len"])
     parser.add_argument("--vllm-dtype", default=defaults["vllm_dtype"])
