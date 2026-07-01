@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import torch
+
 from rl_training.vllm_lora_server import parse_server_args
 
 
@@ -76,6 +78,142 @@ class _FakeLLM:
     def reset_prefix_cache(self):
         self.reset_prefix_cache_calls += 1
         return True
+
+
+class _FakeLoRALayer:
+    def __init__(self) -> None:
+        self.lora_a = torch.zeros(3, 2, dtype=torch.float16)
+        self.lora_b = torch.zeros(2, 4, dtype=torch.float16)
+
+
+class _FakeLoRAModel:
+    def __init__(self) -> None:
+        self.loras = {"model.layers.0.self_attn.q_proj": _FakeLoRALayer()}
+
+
+class _FakeAdapterManager:
+    def __init__(self) -> None:
+        self._registered_adapters = {1: _FakeLoRAModel()}
+        self._active_adapters = {1: None}
+        self.deactivated: list[int] = []
+        self.activated: list[int] = []
+
+    def _deactivate_adapter(self, lora_id: int) -> None:
+        self.deactivated.append(lora_id)
+        self._active_adapters.pop(lora_id, None)
+
+    def activate_adapter(self, lora_id: int) -> bool:
+        self.activated.append(lora_id)
+        self._active_adapters[lora_id] = None
+        return True
+
+
+def test_parse_vllm_lora_tensor_name_maps_module_and_side() -> None:
+    from rl_training.vllm_lora_server import parse_vllm_lora_tensor_name
+
+    assert parse_vllm_lora_tensor_name(
+        "model.layers.0.self_attn.q_proj.lora_A.weight"
+    ) == ("model.layers.0.self_attn.q_proj", "lora_A")
+    assert parse_vllm_lora_tensor_name(
+        "model.layers.31.mlp.down_proj.lora_B.weight"
+    ) == ("model.layers.31.mlp.down_proj", "lora_B")
+
+
+def test_parse_vllm_lora_tensor_name_rejects_unsupported_name() -> None:
+    from rl_training.vllm_lora_server import parse_vllm_lora_tensor_name
+
+    try:
+        parse_vllm_lora_tensor_name("model.embed_tokens.weight")
+    except ValueError as exc:
+        assert "Unsupported LoRA tensor name" in str(exc)
+    else:
+        raise AssertionError("expected unsupported LoRA tensor name to fail")
+
+
+def test_update_registered_lora_tensor_transposes_peft_a_weight() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakeAdapterManager()
+    incoming = torch.arange(6, dtype=torch.float16).reshape(2, 3)
+
+    shape = update_registered_lora_tensor(
+        manager,
+        1,
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        incoming,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
+    assert shape == (3, 2)
+    assert torch.equal(layer.lora_a, incoming.T)
+
+
+def test_update_registered_lora_tensor_transposes_peft_b_weight() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakeAdapterManager()
+    incoming = torch.arange(8, dtype=torch.float16).reshape(4, 2)
+
+    shape = update_registered_lora_tensor(
+        manager,
+        1,
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+        incoming,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
+    assert shape == (2, 4)
+    assert torch.equal(layer.lora_b, incoming.T)
+
+
+def test_update_registered_lora_tensor_rejects_shape_mismatch() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakeAdapterManager()
+    incoming = torch.zeros(5, 5, dtype=torch.float16)
+
+    try:
+        update_registered_lora_tensor(
+            manager,
+            1,
+            "model.layers.0.self_attn.q_proj.lora_A.weight",
+            incoming,
+        )
+    except ValueError as exc:
+        assert "LoRA tensor shape mismatch" in str(exc)
+    else:
+        raise AssertionError("expected shape mismatch to fail")
+
+
+def test_update_registered_lora_tensor_rejects_missing_module() -> None:
+    from rl_training.vllm_lora_server import update_registered_lora_tensor
+
+    manager = _FakeAdapterManager()
+    incoming = torch.zeros(2, 3, dtype=torch.float16)
+
+    try:
+        update_registered_lora_tensor(
+            manager,
+            1,
+            "model.layers.0.self_attn.k_proj.lora_A.weight",
+            incoming,
+        )
+    except KeyError as exc:
+        assert "Registered LoRA module not found" in str(exc)
+    else:
+        raise AssertionError("expected missing module to fail")
+
+
+def test_refresh_active_lora_reactivates_active_adapter() -> None:
+    from rl_training.vllm_lora_server import refresh_active_lora
+
+    manager = _FakeAdapterManager()
+
+    refreshed = refresh_active_lora(manager, 1)
+
+    assert refreshed is True
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
 
 
 def test_generate_endpoint_passes_fixed_lora_request() -> None:

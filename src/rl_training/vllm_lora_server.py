@@ -73,6 +73,59 @@ def _dtype_from_wire(value: str) -> torch.dtype:
     return dtype
 
 
+def parse_vllm_lora_tensor_name(name: str) -> tuple[str, str]:
+    for side in ("lora_A", "lora_B"):
+        suffix = f".{side}.weight"
+        if name.endswith(suffix):
+            module_name = name[: -len(suffix)]
+            if module_name.startswith("model.layers."):
+                return module_name, side
+            break
+    raise ValueError(f"Unsupported LoRA tensor name: {name}")
+
+
+def update_registered_lora_tensor(
+    adapter_manager: Any,
+    lora_int_id: int,
+    name: str,
+    tensor: torch.Tensor,
+) -> tuple[int, ...]:
+    module_name, side = parse_vllm_lora_tensor_name(name)
+    registered_adapters = getattr(adapter_manager, "_registered_adapters", {})
+    if lora_int_id not in registered_adapters:
+        raise KeyError(f"Registered LoRA adapter not found: {lora_int_id}")
+
+    lora_model = registered_adapters[lora_int_id]
+    loras = getattr(lora_model, "loras", {})
+    if module_name not in loras:
+        raise KeyError(f"Registered LoRA module not found: {module_name}")
+
+    layer = loras[module_name]
+    target = getattr(layer, "lora_a" if side == "lora_A" else "lora_b", None)
+    if target is None:
+        raise KeyError(f"Registered LoRA tensor side not found: {module_name}.{side}")
+
+    source = tensor.detach().to(device=target.device, dtype=target.dtype).T.contiguous()
+    if tuple(target.shape) != tuple(source.shape):
+        raise ValueError(
+            f"LoRA tensor shape mismatch for {name}: expected PEFT shape "
+            f"{tuple(target.T.shape)}, got {tuple(tensor.shape)}"
+        )
+
+    target.copy_(source)
+    return tuple(target.shape)
+
+
+def refresh_active_lora(adapter_manager: Any, lora_int_id: int) -> bool:
+    active_adapters = getattr(adapter_manager, "_active_adapters", {})
+    if lora_int_id not in active_adapters:
+        return False
+
+    adapter_manager._deactivate_adapter(lora_int_id)
+    adapter_manager.activate_adapter(lora_int_id)
+    return True
+
+
 def create_app(
     args: argparse.Namespace,
     *,
