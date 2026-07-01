@@ -215,17 +215,19 @@ class VLLMGenerationClient:
             if response.status_code != 200:
                 raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
             try:
-                update_id = response.json().get("update_id")
-            except Exception:
-                update_id = None
+                payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(f"Invalid /update_lora_param/ response for {name}: {exc}") from exc
+            update_id = payload.get("update_id")
+            if not isinstance(update_id, str) or not update_id:
+                raise RuntimeError(f"/update_lora_param/ response for {name} missing update_id.")
             communicator = getattr(self.backend, "pynccl_comm", None)
             rank = getattr(self.backend, "rank", None)
             if communicator is None or rank is None:
                 raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
             communicator.broadcast(tensor, src=rank)
             communicator.group.barrier()
-            if update_id:
-                self._poll_lora_update_status(session, base_url, update_id)
+            self._poll_lora_update_status(session, base_url, update_id)
         return time.perf_counter() - start
 
     def _poll_lora_update_status(self, session: Any, base_url: str, update_id: str) -> None:

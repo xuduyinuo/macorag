@@ -484,6 +484,34 @@ def test_vllm_generation_client_sync_lora_parameters_raises_on_update_error_stat
         raise AssertionError("expected LoRA update error status to fail")
 
 
+def test_vllm_generation_client_sync_lora_parameters_requires_update_id() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(update_payload={})
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: None})(),
+        },
+    )()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=0.1, backend=backend)
+
+    try:
+        client.sync_lora_parameters(_TinyPeftModel())
+    except RuntimeError as exc:
+        assert "missing update_id" in str(exc)
+    else:
+        raise AssertionError("expected missing LoRA update id to fail")
+
+    assert backend.updated == []
+    assert backend.session.gets == []
+
+
 def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
