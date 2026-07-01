@@ -229,15 +229,15 @@ class _TinyPeftModel(torch.nn.Module):
         self.unmerged = False
         self._named_params = [
             (
-                "base_model.model.layers.0.q_proj.base_layer.weight",
+                "base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight",
                 torch.nn.Parameter(torch.tensor([1.0]), requires_grad=False),
             ),
             (
-                "base_model.model.layers.0.q_proj.lora_A.default.weight",
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight",
                 torch.nn.Parameter(torch.tensor([2.0]), requires_grad=True),
             ),
             (
-                "base_model.model.layers.0.q_proj.lora_B.default.weight",
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.default.weight",
                 torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True),
             ),
         ]
@@ -260,6 +260,41 @@ class Params4bit:
 
     def detach(self) -> torch.Tensor:
         return self.packed
+
+
+def test_normalize_peft_lora_name_maps_qwen_modules() -> None:
+    from rl_training.vllm_lora_mapping import normalize_peft_lora_name
+
+    assert normalize_peft_lora_name(
+        "base_model.model.model.layers.0.self_attn.q_proj.lora_A.default.weight"
+    ) == "model.layers.0.self_attn.q_proj.lora_A.weight"
+    assert normalize_peft_lora_name(
+        "base_model.model.model.layers.31.mlp.down_proj.lora_B.default.weight"
+    ) == "model.layers.31.mlp.down_proj.lora_B.weight"
+
+
+def test_normalize_peft_lora_name_ignores_non_lora_weights() -> None:
+    from rl_training.vllm_lora_mapping import normalize_peft_lora_name
+
+    assert normalize_peft_lora_name("base_model.model.model.embed_tokens.weight") is None
+    assert (
+        normalize_peft_lora_name("base_model.model.model.layers.0.self_attn.q_proj.base_layer.weight")
+        is None
+    )
+
+
+def test_collect_lora_named_tensors_maps_only_lora_params() -> None:
+    from rl_training.vllm_lora_mapping import collect_lora_named_tensors
+
+    model = _TinyPeftModel()
+
+    tensors = collect_lora_named_tensors(model)
+
+    assert sorted(tensors) == [
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+    ]
+    assert all(tensor.device.type == "cpu" for tensor in tensors.values())
 
 
 def test_collect_trainable_named_parameters_returns_only_trainable_cpu_tensors() -> None:
@@ -356,7 +391,7 @@ def test_vllm_generation_client_merges_peft_adapter_before_sync() -> None:
 
     assert model.merged is True
     assert model.unmerged is True
-    assert [name for name, _ in backend.updated] == ["layers.0.q_proj.weight"]
+    assert [name for name, _ in backend.updated] == ["model.layers.0.self_attn.q_proj.weight"]
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
 
 
