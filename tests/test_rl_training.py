@@ -443,7 +443,9 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
 
     assert elapsed >= 0.0
     assert backend.communicator_initialized is True
-    assert [payload["name"] for _, payload in backend.session.posts] == [
+    assert len(backend.session.posts) == 1
+    assert backend.session.posts[0][0] == "http://127.0.0.1:8000/update_lora_params/"
+    assert [item["name"] for item in backend.session.posts[0][1]["tensors"]] == [
         "model.layers.0.self_attn.q_proj.lora_A.weight",
         "model.layers.0.self_attn.q_proj.lora_B.weight",
     ]
@@ -451,8 +453,38 @@ def test_vllm_generation_client_syncs_lora_parameters_only() -> None:
     assert all(tensor.device.type == "meta" for _, tensor in backend.updated)
     assert backend.session.gets == [
         "http://127.0.0.1:8000/lora_update_status/sync-1",
-        "http://127.0.0.1:8000/lora_update_status/sync-1",
     ]
+
+
+def test_vllm_generation_client_syncs_lora_parameters_in_one_batch_request() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient(sync_device=torch.device("meta"))
+    backend.session = _FakeSession(update_payload={"update_id": "batch-1"})
+    backend.base_url = "http://127.0.0.1:8000"
+    backend.rank = 1
+    backend.pynccl_comm = type(
+        "FakeCommunicator",
+        (),
+        {
+            "device": torch.device("meta"),
+            "broadcast": lambda self, tensor, src: backend.updated.append(("broadcast", tensor)),
+            "group": type("Group", (), {"barrier": lambda self: backend.updated.append(("barrier", torch.empty(0)))})(),
+        },
+    )()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+
+    client.sync_lora_parameters(_TinyPeftModel())
+
+    assert len(backend.session.posts) == 1
+    url, payload = backend.session.posts[0]
+    assert url == "http://127.0.0.1:8000/update_lora_params/"
+    assert [item["name"] for item in payload["tensors"]] == [
+        "model.layers.0.self_attn.q_proj.lora_A.weight",
+        "model.layers.0.self_attn.q_proj.lora_B.weight",
+    ]
+    assert [name for name, _ in backend.updated] == ["broadcast", "broadcast", "barrier"]
+    assert backend.session.gets == ["http://127.0.0.1:8000/lora_update_status/batch-1"]
 
 
 def test_vllm_generation_client_sync_lora_parameters_raises_on_update_error_status() -> None:

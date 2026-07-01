@@ -496,6 +496,66 @@ def test_update_lora_param_endpoint_dispatches_collective_rpc_with_lora_id() -> 
     }
 
 
+def test_update_lora_params_endpoint_dispatches_single_batch_collective_rpc() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = _FakeLLM()
+    client = TestClient(create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams))
+
+    response = client.post(
+        "/update_lora_params/",
+        json={
+            "tensors": [
+                {
+                    "name": "model.layers.0.self_attn.q_proj.lora_A.weight",
+                    "dtype": "torch.float32",
+                    "shape": [2, 3],
+                },
+                {
+                    "name": "model.layers.0.self_attn.q_proj.lora_B.weight",
+                    "dtype": "torch.float16",
+                    "shape": [4, 2],
+                },
+            ]
+        },
+    )
+
+    assert response.status_code == 200
+    update_id = response.json()["update_id"]
+    for _ in range(20):
+        status = client.get(f"/lora_update_status/{update_id}").json()
+        if status["state"] == "ok":
+            break
+        time.sleep(0.01)
+
+    assert status == {"state": "ok", "error": None}
+    assert llm.collective_rpc_calls[-1] == {
+        "method": "update_lora_params",
+        "args": (
+            [
+                ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float32, (2, 3)),
+                ("model.layers.0.self_attn.q_proj.lora_B.weight", torch.float16, (4, 2)),
+            ],
+            1,
+        ),
+        "kwargs": {},
+    }
+
+
 def test_update_lora_param_endpoint_returns_before_collective_rpc_completes_and_exposes_status() -> None:
     from fastapi.testclient import TestClient
 
@@ -681,6 +741,51 @@ def test_weight_sync_lora_worker_extension_updates_registered_adapter() -> None:
 
     layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
     assert torch.equal(layer.lora_a, torch.arange(6, dtype=torch.float16).reshape(2, 3).T)
+    assert manager.deactivated == [1]
+    assert manager.activated == [1]
+
+
+def test_weight_sync_lora_worker_extension_updates_registered_adapter_batch() -> None:
+    from rl_training.vllm_lora_server import WeightSyncLoRAWorkerExtension
+
+    manager = _FakeAdapterManager()
+    extension = WeightSyncLoRAWorkerExtension()
+    extension.device = torch.device("cpu")
+    extension.client_rank = 1
+    extension.model_runner = type(
+        "Runner",
+        (),
+        {"lora_manager": type("WorkerManager", (), {"_adapter_manager": manager})()},
+    )()
+
+    payloads = [
+        torch.arange(6, dtype=torch.float16).reshape(2, 3),
+        torch.arange(8, dtype=torch.float16).reshape(4, 2),
+    ]
+
+    class FakeComm:
+        def __init__(self) -> None:
+            self.index = 0
+            self.group = type("Group", (), {"barrier": lambda self_group: None})()
+
+        def broadcast(self, tensor, src):
+            assert src == 1
+            tensor.copy_(payloads[self.index])
+            self.index += 1
+
+    extension.pynccl_comm = FakeComm()
+
+    extension.update_lora_params(
+        [
+            ("model.layers.0.self_attn.q_proj.lora_A.weight", torch.float16, (2, 3)),
+            ("model.layers.0.self_attn.q_proj.lora_B.weight", torch.float16, (4, 2)),
+        ],
+        1,
+    )
+
+    layer = manager._registered_adapters[1].loras["model.layers.0.self_attn.q_proj"]
+    assert torch.equal(layer.lora_a, payloads[0].T)
+    assert torch.equal(layer.lora_b, payloads[1].T * 2)
     assert manager.deactivated == [1]
     assert manager.activated == [1]
 

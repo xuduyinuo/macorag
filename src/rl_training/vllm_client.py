@@ -203,31 +203,36 @@ class VLLMGenerationClient:
         if not tensors:
             raise SystemExit("No LoRA tensors found for vLLM LoRA hot sync.")
         start = time.perf_counter()
-        for name, tensor in tensors.items():
-            session = getattr(self.backend, "session", None)
-            base_url = getattr(self.backend, "base_url", None)
-            if session is None or base_url is None:
-                raise SystemExit("Installed TRL VLLMClient internals are incompatible with LoRA hot sync.")
-            response = session.post(
-                f"{base_url}/update_lora_param/",
-                json={"name": name, "dtype": str(tensor.dtype), "shape": tuple(tensor.shape)},
-            )
-            if response.status_code != 200:
-                raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
-            try:
-                payload = response.json()
-            except Exception as exc:
-                raise RuntimeError(f"Invalid /update_lora_param/ response for {name}: {exc}") from exc
-            update_id = payload.get("update_id")
-            if not isinstance(update_id, str) or not update_id:
-                raise RuntimeError(f"/update_lora_param/ response for {name} missing update_id.")
-            communicator = getattr(self.backend, "pynccl_comm", None)
-            rank = getattr(self.backend, "rank", None)
-            if communicator is None or rank is None:
-                raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
+        session = getattr(self.backend, "session", None)
+        base_url = getattr(self.backend, "base_url", None)
+        if session is None or base_url is None:
+            raise SystemExit("Installed TRL VLLMClient internals are incompatible with LoRA hot sync.")
+        response = session.post(
+            f"{base_url}/update_lora_params/",
+            json={
+                "tensors": [
+                    {"name": name, "dtype": str(tensor.dtype), "shape": tuple(tensor.shape)}
+                    for name, tensor in tensors.items()
+                ]
+            },
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"Request failed: {response.status_code}, {response.text}")
+        try:
+            payload = response.json()
+        except Exception as exc:
+            raise RuntimeError(f"Invalid /update_lora_params/ response: {exc}") from exc
+        update_id = payload.get("update_id")
+        if not isinstance(update_id, str) or not update_id:
+            raise RuntimeError("/update_lora_params/ response missing update_id.")
+        communicator = getattr(self.backend, "pynccl_comm", None)
+        rank = getattr(self.backend, "rank", None)
+        if communicator is None or rank is None:
+            raise SystemExit("vLLM LoRA hot sync communicator is not initialized.")
+        for tensor in tensors.values():
             communicator.broadcast(tensor, src=rank)
-            communicator.group.barrier()
-            self._poll_lora_update_status(session, base_url, update_id)
+        communicator.group.barrier()
+        self._poll_lora_update_status(session, base_url, update_id)
         return time.perf_counter() - start
 
     def _poll_lora_update_status(self, session: Any, base_url: str, update_id: str) -> None:

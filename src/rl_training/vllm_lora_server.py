@@ -86,12 +86,15 @@ class WeightSyncLoRAWorkerExtension:
         self.client_rank = world_size - 1
 
     def update_lora_param(self, name: str, dtype: torch.dtype, shape: Sequence[int], lora_int_id: int) -> None:
+        self.update_lora_params([(name, dtype, tuple(shape))], lora_int_id)
+
+    def update_lora_params(
+        self,
+        tensors: Sequence[tuple[str, torch.dtype, Sequence[int]]],
+        lora_int_id: int,
+    ) -> None:
         if self.pynccl_comm is None:
             raise RuntimeError("Communicator not initialized. Call `init_communicator` first.")
-
-        weight = torch.empty(tuple(shape), dtype=dtype, device=self.device)
-        self.pynccl_comm.broadcast(weight, src=self.client_rank)
-        self.pynccl_comm.group.barrier()
 
         worker_lora_manager = getattr(self.model_runner, "lora_manager", None)
         if worker_lora_manager is None:
@@ -100,7 +103,11 @@ class WeightSyncLoRAWorkerExtension:
         if adapter_manager is None:
             raise RuntimeError("vLLM adapter manager is not initialized.")
 
-        update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
+        for name, dtype, shape in tensors:
+            weight = torch.empty(tuple(shape), dtype=dtype, device=self.device)
+            self.pynccl_comm.broadcast(weight, src=self.client_rank)
+            update_registered_lora_tensor(adapter_manager, lora_int_id, name, weight)
+        self.pynccl_comm.group.barrier()
         refresh_active_lora(adapter_manager, lora_int_id)
 
     def close_communicator(self) -> None:
@@ -279,6 +286,9 @@ def create_app(
         dtype: str
         shape: list[int]
 
+    class UpdateLoRAParamsRequest(BaseModel):
+        tensors: list[UpdateLoRAParamRequest]
+
     @app.get("/health/")
     async def health():
         return {
@@ -360,6 +370,43 @@ def create_app(
 
         threading.Thread(target=_dispatch_update, daemon=True).start()
         return {"message": "Request received, updating LoRA parameter", "update_id": update_id}
+
+    @app.post("/update_lora_params/")
+    async def update_lora_params(request: UpdateLoRAParamsRequest = Body(...)):
+        if not request.tensors:
+            raise HTTPException(status_code=400, detail="No LoRA tensors provided.")
+
+        tensor_specs: list[tuple[str, torch.dtype, tuple[int, ...]]] = []
+        for tensor in request.tensors:
+            try:
+                dtype = _dtype_from_wire(tensor.dtype)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            try:
+                parse_vllm_lora_tensor_name(tensor.name)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            tensor_specs.append((tensor.name, dtype, tuple(tensor.shape)))
+
+        update_id = uuid.uuid4().hex
+        with update_status_lock:
+            update_statuses[update_id] = {"state": "pending", "error": None}
+
+        def _dispatch_update() -> None:
+            try:
+                llm.collective_rpc(
+                    method="update_lora_params",
+                    args=(tensor_specs, args.lora_int_id),
+                )
+            except Exception as exc:
+                with update_status_lock:
+                    update_statuses[update_id] = {"state": "error", "error": str(exc)}
+            else:
+                with update_status_lock:
+                    update_statuses[update_id] = {"state": "ok", "error": None}
+
+        threading.Thread(target=_dispatch_update, daemon=True).start()
+        return {"message": "Request received, updating LoRA parameters", "update_id": update_id}
 
     @app.get("/lora_update_status/{update_id}")
     async def lora_update_status(update_id: str):
