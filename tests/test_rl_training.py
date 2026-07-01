@@ -96,6 +96,7 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
                 "vllm_max_model_len: 4608",
                 'vllm_dtype: "auto"',
                 "vllm_sync_after_step: true",
+                "vllm_sync_every_steps: 4",
                 "vllm_sync_trainable_only: true",
                 "vllm_timeout_seconds: 90",
                 'gpu_indices: "1"',
@@ -116,6 +117,7 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
     assert args.vllm_max_model_len == 4608
     assert args.vllm_dtype == "auto"
     assert args.vllm_sync_after_step is True
+    assert args.vllm_sync_every_steps == 4
     assert args.vllm_sync_trainable_only is True
     assert args.vllm_timeout_seconds == 90
     assert args.gpu_indices == "1"
@@ -595,13 +597,26 @@ def test_sync_vllm_after_optimizer_step_uses_lora_mode() -> None:
     from rl_training.train_grpo_macorag import _sync_vllm_after_optimizer_step
 
     policy = _FakePolicyWithLoraClient()
-    args = Namespace(use_vllm_generation=True, vllm_sync_after_step=True, vllm_sync_mode="lora")
+    args = Namespace(use_vllm_generation=True, vllm_sync_after_step=True, vllm_sync_mode="lora", vllm_sync_every_steps=1)
 
     elapsed = _sync_vllm_after_optimizer_step(policy, object(), args)
 
     assert elapsed == 2.0
     assert policy.vllm_client.lora_called is True
     assert policy.vllm_client.dense_called is False
+
+
+def test_sync_vllm_after_optimizer_step_respects_sync_interval() -> None:
+    from rl_training.train_grpo_macorag import _sync_vllm_after_optimizer_step
+
+    policy = _FakePolicyWithLoraClient()
+    args = Namespace(use_vllm_generation=True, vllm_sync_after_step=True, vllm_sync_mode="dense", vllm_sync_every_steps=4)
+
+    elapsed = _sync_vllm_after_optimizer_step(policy, object(), args, completed_step=3)
+
+    assert elapsed == 0.0
+    assert policy.vllm_client.dense_called is False
+    assert policy.vllm_client.lora_called is False
 
 
 def test_vllm_generation_client_dequantizes_4bit_weights_before_sync(monkeypatch) -> None:

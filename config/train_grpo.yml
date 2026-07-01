@@ -21,8 +21,8 @@ gradient_accumulation_steps: 1
 kl_beta: 0.02
 clip_epsilon: 0.2
 
-max_prompt_length: 4096
-max_completion_length: 256
+max_prompt_length: 2048
+max_completion_length: 192
 temperature: 0.8
 top_p: 0.95
 top_k: 5
@@ -37,6 +37,7 @@ vllm_gpu_memory_utilization: 0.75
 vllm_max_model_len: 8192
 vllm_dtype: "auto"
 vllm_sync_after_step: true
+vllm_sync_every_steps: 4
 vllm_sync_trainable_only: true
 vllm_timeout_seconds: 120
 vllm_sync_mode: "dense"

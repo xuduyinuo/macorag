@@ -63,6 +63,7 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "vllm_max_model_len": 4608,
     "vllm_dtype": "auto",
     "vllm_sync_after_step": True,
+    "vllm_sync_every_steps": 1,
     "vllm_sync_trainable_only": True,
     "vllm_timeout_seconds": 120.0,
     "vllm_sync_mode": "dense",
@@ -162,6 +163,7 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--vllm-max-model-len", type=int, default=defaults["vllm_max_model_len"])
     parser.add_argument("--vllm-dtype", default=defaults["vllm_dtype"])
     parser.add_argument("--vllm-sync-after-step", action=BooleanOptionalAction, default=defaults["vllm_sync_after_step"])
+    parser.add_argument("--vllm-sync-every-steps", type=int, default=defaults["vllm_sync_every_steps"])
     parser.add_argument("--vllm-sync-trainable-only", action=BooleanOptionalAction, default=defaults["vllm_sync_trainable_only"])
     parser.add_argument("--vllm-timeout-seconds", type=float, default=defaults["vllm_timeout_seconds"])
     parser.add_argument("--vllm-sync-mode", choices=("dense", "lora"), default=defaults["vllm_sync_mode"])

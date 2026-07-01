@@ -340,12 +340,21 @@ def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedP
     return VLLMSharedPolicy(vllm_client=client, **common)
 
 
-def _sync_vllm_after_optimizer_step(policy: Any, raw_policy_model: Any, args: Any) -> float:
+def _sync_vllm_after_optimizer_step(
+    policy: Any,
+    raw_policy_model: Any,
+    args: Any,
+    *,
+    completed_step: int | None = None,
+) -> float:
     if not getattr(args, "use_vllm_generation", False):
         return 0.0
     if not getattr(args, "vllm_sync_after_step", True):
         return 0.0
     if not _is_main_process():
+        return 0.0
+    sync_every_steps = max(1, int(getattr(args, "vllm_sync_every_steps", 1)))
+    if completed_step is not None and completed_step % sync_every_steps != 0:
         return 0.0
     client = getattr(policy, "vllm_client", None)
     if client is None:
@@ -641,7 +650,12 @@ def main() -> None:
                 )
                 time_weight_sync_seconds = 0.0
                 if metrics.get("did_optimizer_step"):
-                    time_weight_sync_seconds = _sync_vllm_after_optimizer_step(policy, raw_policy_model, args)
+                    time_weight_sync_seconds = _sync_vllm_after_optimizer_step(
+                        policy,
+                        raw_policy_model,
+                        args,
+                        completed_step=global_step + 1,
+                    )
                 time_total_seconds = time.perf_counter() - sample_start_time
                 global_step += 1
                 reward_totals = [item["rewards"]["total"] for item in rollouts]
@@ -729,7 +743,7 @@ def main() -> None:
     if global_step % max(1, int(args.gradient_accumulation_steps)) != 0:
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
-        _sync_vllm_after_optimizer_step(policy, raw_policy_model, args)
+        _sync_vllm_after_optimizer_step(policy, raw_policy_model, args, completed_step=global_step)
 
     if _is_main_process():
         raw_policy_model.save_pretrained(output_dir / "adapter")
@@ -758,6 +772,8 @@ def main() -> None:
                 "vllm_gpu_indices": args.vllm_gpu_indices,
                 "vllm_tensor_parallel_size": args.vllm_tensor_parallel_size,
                 "vllm_max_model_len": args.vllm_max_model_len,
+                "vllm_sync_mode": args.vllm_sync_mode,
+                "vllm_sync_every_steps": args.vllm_sync_every_steps,
             },
         )
         print(f"GRPO training complete. Adapter saved to {output_dir / 'adapter'}.")
