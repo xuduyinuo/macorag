@@ -1,6 +1,6 @@
-model_path: "model/Qwen2.5-7B-Instruct"
+model_path: "model/Qwen2.5-3B-Instruct"
 data_root: "data/sft/teacher_qwen_plus_trajectory_train"
-output_dir: "outputs/lora_qwen2.5-7b_trajectory"
+output_dir: "outputs/lora_qwen2.5-3b_trajectory"
 system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
 max_length: 5120
 max_samples: null
@@ -18,7 +18,7 @@ target_modules:
   - down_proj
   - gate_proj
 
-per_device_train_batch_size: 1
+per_device_train_batch_size: 2
 gradient_accumulation_steps: 8
 num_train_epochs: 3.0
 learning_rate: 0.00002
@@ -41,9 +41,9 @@ fp16: false
 bf16: false
 load_4bit: true
 disable_tqdm: false
-log_jsonl_path: "outputs/lora_qwen2.5-7b_trajectory/train_metrics.jsonl"
+log_jsonl_path: "outputs/lora_qwen2.5-3b_trajectory/train_metrics.jsonl"
 gpu_index: 0
-gpu_indices: "0,1"
+gpu_indices: "1"
 
 check_only: false
 check_only_max_samples: 20

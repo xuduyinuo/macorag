@@ -1,12 +1,12 @@
 command: build
-processed_root: "data/trajectory_train"
-retrieval_root: "data/trajectory_train_retrieval"
+processed_root: "data/eval_1000"
+retrieval_root: "data/eval_1000_retrieval"
 datasets:
   - hotpotqa
   - 2wiki
   - musique
 splits:
-  - train
+  - dev
 build_index: true
 embedding_model: "sentence-transformers/all-mpnet-base-v2"
 spacy_model: "en_core_web_sm"

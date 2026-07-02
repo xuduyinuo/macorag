@@ -8,51 +8,74 @@ from typing import Any
 
 DEFAULT_CONFIG_PATH = "config/train_grpo.yml"
 
-DEFAULT_ARG_VALUES: dict[str, Any] = {
+# 基础路径：保持入口、数据、检索索引和输出目录由 YAML 统一管理。
+PATH_DEFAULTS: dict[str, Any] = {
     "model_path": "model/Qwen2.5-7B-Instruct",
     "sft_adapter_path": "outputs/lora_qwen2.5-7b_trajectory_20260625_163149/adapter",
     "rl_data_root": "data/rl/trajectory_train",
     "rl_data_files": (),
     "retrieval_root": "data/trajectory_train_retrieval",
-    "output_dir": "outputs/grpo_qwen2.5-7b_trajectory",
+    "output_root": "outputs/grpo_qwen2.5-7b_trajectory",
+}
+
+# rollout 与采样：控制每个样本的 RAG 交互轮数、组内采样数和生成截断。
+ROLLOUT_DEFAULTS: dict[str, Any] = {
     "system_prompt": "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON.",
     "max_samples": None,
     "seed": 42,
     "max_rounds": 3,
     "group_size": 4,
     "num_train_epochs": 1.0,
-    "learning_rate": 1e-5,
-    "weight_decay": 0.0,
-    "warmup_ratio": 0.0,
-    "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 1,
+    "max_steps": 0,
     "max_prompt_length": 4096,
     "max_completion_length": 256,
     "temperature": 0.8,
     "top_p": 0.95,
     "top_k": 5,
+}
+
+# GRPO 优化：只训练 LoRA adapter，损失、KL 和梯度累积语义不变。
+OPTIMIZATION_DEFAULTS: dict[str, Any] = {
+    "learning_rate": 1e-5,
+    "weight_decay": 0.0,
+    "warmup_ratio": 0.0,
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 1,
     "kl_beta": 0.02,
     "clip_epsilon": 0.2,
-    "save_steps": 100,
-    "save_total_limit": 3,
-    "logging_steps": 1,
-    "max_steps": 0,
     "bf16": False,
     "fp16": False,
     "load_4bit": True,
     "gradient_checkpointing": True,
+}
+
+# 运行环境：launcher 会优先读取 gpu_indices，gpu_index 仅作为兼容回退。
+RUNTIME_DEFAULTS: dict[str, Any] = {
     "gpu_index": 0,
     "gpu_indices": "0,1",
     "check_only": False,
     "disable_tqdm": False,
-    "log_jsonl_path": None,
-    "rollout_jsonl_path": None,
+}
+
+# 日志与检查点：长样本训练依赖 JSONL 心跳，不改变原文件名默认值。
+LOGGING_DEFAULTS: dict[str, Any] = {
+    "save_steps": 100,
+    "save_total_limit": 3,
+    "logging_steps": 1,
+}
+
+# 检索环境：这些参数必须与预构建 LinearRAG 索引保持一致。
+RETRIEVAL_DEFAULTS: dict[str, Any] = {
     "retrieval_embedding_model": "BAAI/bge-base-en-v1.5",
     "retrieval_spacy_model": None,
     "retrieval_top_k": 5,
     "retrieval_max_workers": 8,
     "retrieval_batch_size": 128,
     "use_vectorized_retrieval": False,
+}
+
+# vLLM 生成与权重同步：当前支持 dense 与 LoRA 两种同步路径。
+VLLM_DEFAULTS: dict[str, Any] = {
     "use_vllm_generation": False,
     "vllm_host": "127.0.0.1",
     "vllm_port": 8000,
@@ -72,6 +95,16 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "vllm_lora_adapter_path": "",
 }
 
+DEFAULT_ARG_VALUES: dict[str, Any] = {
+    **PATH_DEFAULTS,
+    **ROLLOUT_DEFAULTS,
+    **OPTIMIZATION_DEFAULTS,
+    **VLLM_DEFAULTS,
+    **RETRIEVAL_DEFAULTS,
+    **LOGGING_DEFAULTS,
+    **RUNTIME_DEFAULTS,
+}
+
 BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
 
 
@@ -89,6 +122,7 @@ def _load_yaml_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"Invalid config format at {path}: expected a mapping.")
 
     config = {str(key).replace("-", "_"): value for key, value in payload.items()}
+
     allowed = {*DEFAULT_ARG_VALUES, "config"}
     unknown = sorted(set(config) - allowed)
     if unknown:
@@ -109,67 +143,87 @@ def _defaults_from_config(config_path: str, *, explicit_config: bool) -> dict[st
 def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train MACORAG with online RAG-GRPO.")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config file.")
-    parser.add_argument("--model-path", default=defaults["model_path"])
-    parser.add_argument("--sft-adapter-path", default=defaults["sft_adapter_path"])
-    parser.add_argument("--rl-data-root", default=defaults["rl_data_root"])
-    parser.add_argument("--rl-data-files", nargs="*", default=defaults["rl_data_files"])
-    parser.add_argument("--retrieval-root", default=defaults["retrieval_root"])
-    parser.add_argument("--output-dir", default=defaults["output_dir"])
-    parser.add_argument("--system-prompt", default=defaults["system_prompt"])
-    parser.add_argument("--max-samples", type=int, default=defaults["max_samples"])
-    parser.add_argument("--seed", type=int, default=defaults["seed"])
-    parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
-    parser.add_argument("--group-size", type=int, default=defaults["group_size"])
-    parser.add_argument("--num-train-epochs", type=float, default=defaults["num_train_epochs"])
-    parser.add_argument("--learning-rate", type=float, default=defaults["learning_rate"])
-    parser.add_argument("--weight-decay", type=float, default=defaults["weight_decay"])
-    parser.add_argument("--warmup-ratio", type=float, default=defaults["warmup_ratio"])
-    parser.add_argument("--per-device-train-batch-size", type=int, default=defaults["per_device_train_batch_size"])
-    parser.add_argument("--gradient-accumulation-steps", type=int, default=defaults["gradient_accumulation_steps"])
-    parser.add_argument("--max-prompt-length", type=int, default=defaults["max_prompt_length"])
-    parser.add_argument("--max-completion-length", type=int, default=defaults["max_completion_length"])
-    parser.add_argument("--temperature", type=float, default=defaults["temperature"])
-    parser.add_argument("--top-p", type=float, default=defaults["top_p"])
-    parser.add_argument("--top-k", type=int, default=defaults["top_k"])
-    parser.add_argument("--kl-beta", type=float, default=defaults["kl_beta"])
-    parser.add_argument("--clip-epsilon", type=float, default=defaults["clip_epsilon"])
-    parser.add_argument("--save-steps", type=int, default=defaults["save_steps"])
-    parser.add_argument("--save-total-limit", type=int, default=defaults["save_total_limit"])
-    parser.add_argument("--logging-steps", type=int, default=defaults["logging_steps"])
-    parser.add_argument("--max-steps", type=int, default=defaults["max_steps"])
-    parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
-    parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"])
-    parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"])
-    parser.add_argument("--gradient-checkpointing", action=BooleanOptionalAction, default=defaults["gradient_checkpointing"])
-    parser.add_argument("--gpu-index", type=int, default=defaults["gpu_index"])
-    parser.add_argument("--gpu-indices", default=defaults["gpu_indices"])
-    parser.add_argument("--check-only", action=BooleanOptionalAction, default=defaults["check_only"])
-    parser.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"])
-    parser.add_argument("--log-jsonl-path", default=defaults["log_jsonl_path"])
-    parser.add_argument("--rollout-jsonl-path", default=defaults["rollout_jsonl_path"])
-    parser.add_argument("--retrieval-embedding-model", default=defaults["retrieval_embedding_model"])
-    parser.add_argument("--retrieval-spacy-model", default=defaults["retrieval_spacy_model"])
-    parser.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
-    parser.add_argument("--retrieval-max-workers", type=int, default=defaults["retrieval_max_workers"])
-    parser.add_argument("--retrieval-batch-size", type=int, default=defaults["retrieval_batch_size"])
-    parser.add_argument("--use-vectorized-retrieval", action=BooleanOptionalAction, default=defaults["use_vectorized_retrieval"])
-    parser.add_argument("--use-vllm-generation", action=BooleanOptionalAction, default=defaults["use_vllm_generation"])
-    parser.add_argument("--vllm-host", default=defaults["vllm_host"])
-    parser.add_argument("--vllm-port", type=int, default=defaults["vllm_port"])
-    parser.add_argument("--vllm-gpu-indices", default=defaults["vllm_gpu_indices"])
-    parser.add_argument("--vllm-tensor-parallel-size", type=int, default=defaults["vllm_tensor_parallel_size"])
-    parser.add_argument("--vllm-data-parallel-size", type=int, default=defaults["vllm_data_parallel_size"])
-    parser.add_argument("--vllm-gpu-memory-utilization", type=float, default=defaults["vllm_gpu_memory_utilization"])
-    parser.add_argument("--vllm-max-model-len", type=int, default=defaults["vllm_max_model_len"])
-    parser.add_argument("--vllm-dtype", default=defaults["vllm_dtype"])
-    parser.add_argument("--vllm-sync-after-step", action=BooleanOptionalAction, default=defaults["vllm_sync_after_step"])
-    parser.add_argument("--vllm-sync-every-steps", type=int, default=defaults["vllm_sync_every_steps"])
-    parser.add_argument("--vllm-sync-trainable-only", action=BooleanOptionalAction, default=defaults["vllm_sync_trainable_only"])
-    parser.add_argument("--vllm-timeout-seconds", type=float, default=defaults["vllm_timeout_seconds"])
-    parser.add_argument("--vllm-sync-mode", choices=("dense", "lora"), default=defaults["vllm_sync_mode"])
-    parser.add_argument("--vllm-lora-name", default=defaults["vllm_lora_name"])
-    parser.add_argument("--vllm-lora-int-id", type=int, default=defaults["vllm_lora_int_id"])
-    parser.add_argument("--vllm-lora-adapter-path", default=defaults["vllm_lora_adapter_path"])
+
+    paths = parser.add_argument_group("基础路径")
+    paths.add_argument("--model-path", default=defaults["model_path"])
+    paths.add_argument("--sft-adapter-path", default=defaults["sft_adapter_path"])
+    paths.add_argument("--rl-data-root", default=defaults["rl_data_root"])
+    paths.add_argument("--rl-data-files", nargs="*", default=defaults["rl_data_files"])
+    paths.add_argument("--retrieval-root", default=defaults["retrieval_root"])
+    paths.add_argument("--output-root", default=defaults["output_root"])
+
+    rollout = parser.add_argument_group("rollout 与采样")
+    rollout.add_argument("--system-prompt", default=defaults["system_prompt"])
+    rollout.add_argument("--max-samples", type=int, default=defaults["max_samples"])
+    rollout.add_argument("--seed", type=int, default=defaults["seed"])
+    rollout.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
+    rollout.add_argument("--group-size", type=int, default=defaults["group_size"])
+    rollout.add_argument("--num-train-epochs", type=float, default=defaults["num_train_epochs"])
+    rollout.add_argument("--max-steps", type=int, default=defaults["max_steps"])
+    rollout.add_argument("--max-prompt-length", type=int, default=defaults["max_prompt_length"])
+    rollout.add_argument("--max-completion-length", type=int, default=defaults["max_completion_length"])
+    rollout.add_argument("--temperature", type=float, default=defaults["temperature"])
+    rollout.add_argument("--top-p", type=float, default=defaults["top_p"])
+    rollout.add_argument("--top-k", type=int, default=defaults["top_k"])
+
+    optimization = parser.add_argument_group("GRPO 优化")
+    optimization.add_argument("--learning-rate", type=float, default=defaults["learning_rate"])
+    optimization.add_argument("--weight-decay", type=float, default=defaults["weight_decay"])
+    optimization.add_argument("--warmup-ratio", type=float, default=defaults["warmup_ratio"])
+    optimization.add_argument("--per-device-train-batch-size", type=int, default=defaults["per_device_train_batch_size"])
+    optimization.add_argument("--gradient-accumulation-steps", type=int, default=defaults["gradient_accumulation_steps"])
+    optimization.add_argument("--kl-beta", type=float, default=defaults["kl_beta"])
+    optimization.add_argument("--clip-epsilon", type=float, default=defaults["clip_epsilon"])
+    optimization.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
+    optimization.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"])
+    optimization.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"])
+    optimization.add_argument(
+        "--gradient-checkpointing",
+        action=BooleanOptionalAction,
+        default=defaults["gradient_checkpointing"],
+    )
+
+    vllm = parser.add_argument_group("vLLM 生成与权重同步")
+    vllm.add_argument("--use-vllm-generation", action=BooleanOptionalAction, default=defaults["use_vllm_generation"])
+    vllm.add_argument("--vllm-host", default=defaults["vllm_host"])
+    vllm.add_argument("--vllm-port", type=int, default=defaults["vllm_port"])
+    vllm.add_argument("--vllm-gpu-indices", default=defaults["vllm_gpu_indices"])
+    vllm.add_argument("--vllm-tensor-parallel-size", type=int, default=defaults["vllm_tensor_parallel_size"])
+    vllm.add_argument("--vllm-data-parallel-size", type=int, default=defaults["vllm_data_parallel_size"])
+    vllm.add_argument("--vllm-gpu-memory-utilization", type=float, default=defaults["vllm_gpu_memory_utilization"])
+    vllm.add_argument("--vllm-max-model-len", type=int, default=defaults["vllm_max_model_len"])
+    vllm.add_argument("--vllm-dtype", default=defaults["vllm_dtype"])
+    vllm.add_argument("--vllm-sync-after-step", action=BooleanOptionalAction, default=defaults["vllm_sync_after_step"])
+    vllm.add_argument("--vllm-sync-every-steps", type=int, default=defaults["vllm_sync_every_steps"])
+    vllm.add_argument("--vllm-sync-trainable-only", action=BooleanOptionalAction, default=defaults["vllm_sync_trainable_only"])
+    vllm.add_argument("--vllm-timeout-seconds", type=float, default=defaults["vllm_timeout_seconds"])
+    vllm.add_argument("--vllm-sync-mode", choices=("dense", "lora"), default=defaults["vllm_sync_mode"])
+    vllm.add_argument("--vllm-lora-name", default=defaults["vllm_lora_name"])
+    vllm.add_argument("--vllm-lora-int-id", type=int, default=defaults["vllm_lora_int_id"])
+    vllm.add_argument("--vllm-lora-adapter-path", default=defaults["vllm_lora_adapter_path"])
+
+    retrieval = parser.add_argument_group("检索环境")
+    retrieval.add_argument("--retrieval-embedding-model", default=defaults["retrieval_embedding_model"])
+    retrieval.add_argument("--retrieval-spacy-model", default=defaults["retrieval_spacy_model"])
+    retrieval.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
+    retrieval.add_argument("--retrieval-max-workers", type=int, default=defaults["retrieval_max_workers"])
+    retrieval.add_argument("--retrieval-batch-size", type=int, default=defaults["retrieval_batch_size"])
+    retrieval.add_argument(
+        "--use-vectorized-retrieval",
+        action=BooleanOptionalAction,
+        default=defaults["use_vectorized_retrieval"],
+    )
+
+    logging = parser.add_argument_group("日志与检查点")
+    logging.add_argument("--save-steps", type=int, default=defaults["save_steps"])
+    logging.add_argument("--save-total-limit", type=int, default=defaults["save_total_limit"])
+    logging.add_argument("--logging-steps", type=int, default=defaults["logging_steps"])
+
+    runtime = parser.add_argument_group("运行环境")
+    runtime.add_argument("--gpu-index", type=int, default=defaults["gpu_index"])
+    runtime.add_argument("--gpu-indices", default=defaults["gpu_indices"])
+    runtime.add_argument("--check-only", action=BooleanOptionalAction, default=defaults["check_only"])
+    runtime.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"])
     return parser
 
 
@@ -181,4 +235,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     explicit_config = "--config" in raw_args
     defaults = _defaults_from_config(config_args.config, explicit_config=explicit_config)
     parser = _build_parser(defaults)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if not getattr(args, "vllm_lora_adapter_path", None):
+        args.vllm_lora_adapter_path = args.sft_adapter_path
+    return args

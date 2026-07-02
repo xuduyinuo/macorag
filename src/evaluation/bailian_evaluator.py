@@ -141,6 +141,39 @@ def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[
         return index, 0.0, calculate_contain(pre_answer, gold_answer), str(exc)
 
 
+def _dataset_name(prediction: dict[str, Any]) -> str:
+    dataset = str(prediction.get("dataset") or "unknown").strip()
+    return dataset or "unknown"
+
+
+def _summarize_predictions(predictions: list[dict[str, Any]]) -> dict[str, Any]:
+    if not predictions:
+        return {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0}
+    llm_scores = [float(prediction.get("llm_accuracy", 0.0) or 0.0) for prediction in predictions]
+    contain_scores = [int(prediction.get("contain_accuracy", 0) or 0) for prediction in predictions]
+    return {
+        "llm_accuracy": sum(llm_scores) / len(llm_scores),
+        "contain_accuracy": sum(contain_scores) / len(contain_scores),
+        "num_samples": len(predictions),
+    }
+
+
+def _write_dataset_prediction_files(output_dir: Path, predictions: list[dict[str, Any]]) -> dict[str, Any]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for prediction in predictions:
+        grouped.setdefault(_dataset_name(prediction), []).append(prediction)
+    by_dataset = {
+        dataset: _summarize_predictions(dataset_predictions)
+        for dataset, dataset_predictions in sorted(grouped.items())
+    }
+    for dataset, dataset_predictions in sorted(grouped.items()):
+        (output_dir / f"predictions_{dataset}.json").write_text(
+            json.dumps(dataset_predictions, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    return by_dataset
+
+
 def evaluate_predictions(
     predictions_path: str | Path,
     *,
@@ -153,7 +186,7 @@ def evaluate_predictions(
     if not isinstance(predictions, list):
         raise ValueError(f"Invalid predictions format at {path}: expected a JSON list.")
     if not predictions:
-        summary = {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0}
+        summary = {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0, "by_dataset": {}}
         if judge_metadata is not None:
             summary["judge_metadata"] = judge_metadata
         (path.parent / "evaluation_results.json").write_text(
@@ -177,11 +210,8 @@ def evaluate_predictions(
             if error is not None:
                 predictions[index]["evaluation_error"] = error
 
-    summary = {
-        "llm_accuracy": sum(llm_scores) / len(llm_scores),
-        "contain_accuracy": sum(contain_scores) / len(contain_scores),
-        "num_samples": len(predictions),
-    }
+    summary = _summarize_predictions(predictions)
+    summary["by_dataset"] = _write_dataset_prediction_files(path.parent, predictions)
     if judge_metadata is not None:
         summary["judge_metadata"] = judge_metadata
     path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2), encoding="utf-8")

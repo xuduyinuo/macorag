@@ -436,9 +436,13 @@ def test_ordered_trainer_train_sampler_accepts_transformers_dataset_argument() -
     assert list(iter(sampler)) == [0, 1, 2, 3]
 
 
-def test_training_shell_script_launches_two_gpu_torchrun() -> None:
+def test_training_shell_script_derives_gpu_visibility_from_yaml() -> None:
     script = Path("scripts/run_train_sft_lora_gpu1.sh").read_text(encoding="utf-8")
 
-    assert 'CUDA_VISIBLE_DEVICES="0,1"' in script
+    assert 'CUDA_VISIBLE_DEVICES="0,1"' not in script
+    assert "yaml.safe_load" in script
+    assert "YAML_GPU_INDICES" in script
+    assert "NPROC_PER_NODE" in script
+    assert 'export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"' in script
     assert "torchrun" in script
-    assert "--nproc_per_node=2" in script
+    assert "--nproc_per_node=${NPROC_PER_NODE}" in script

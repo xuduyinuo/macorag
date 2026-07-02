@@ -18,7 +18,8 @@ from rl_training.train_grpo_macorag import _extract_vllm_server_model_paths
 from rl_training.train_grpo_macorag import _validate_local_vllm_server_model
 from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
-from rl_training.train_grpo_macorag import _write_train_event
+from rl_training.train_grpo_macorag import _build_train_metrics_payload
+from rl_training.train_grpo_macorag import _dataset_rollout_path
 from rl_training.trainer import compute_grpo_loss
 from rl_training.vllm_client import collect_trainable_named_parameters
 
@@ -39,7 +40,7 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
                 'sft_adapter_path: "outputs/sft/adapter"',
                 'rl_data_root: "data/rl/train"',
                 'retrieval_root: "data/trajectory_train_retrieval"',
-                'output_dir: "outputs/grpo"',
+                'output_root: "outputs/grpo"',
                 "max_samples: 8",
                 "max_rounds: 2",
                 "group_size: 4",
@@ -61,7 +62,7 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.sft_adapter_path == "outputs/sft/adapter"
     assert args.rl_data_root == "data/rl/train"
     assert args.retrieval_root == "data/trajectory_train_retrieval"
-    assert args.output_dir == "outputs/grpo"
+    assert args.output_root == "outputs/grpo"
     assert args.max_samples == 3
     assert args.max_rounds == 2
     assert args.group_size == 4
@@ -70,6 +71,204 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.gradient_accumulation_steps == 2
     assert args.gpu_indices == "0,1"
     assert args.disable_tqdm is False
+
+
+def test_parse_args_supports_output_root(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text('output_root: "outputs/grpo_runs"\n', encoding="utf-8")
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.output_root == "outputs/grpo_runs"
+    assert not hasattr(args, "output_dir")
+
+
+def test_parse_args_rejects_removed_output_and_log_path_keys(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'output_dir: "outputs/legacy_grpo"',
+                'log_jsonl_path: "outputs/metrics.jsonl"',
+                'rollout_jsonl_path: "outputs/rollouts.jsonl"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        parse_args(["--config", str(config)])
+    except SystemExit as exc:
+        message = str(exc)
+        assert "output_dir" in message
+        assert "log_jsonl_path" in message
+        assert "rollout_jsonl_path" in message
+    else:
+        raise AssertionError("expected removed output/log path keys to fail")
+
+
+def test_parse_args_defaults_vllm_lora_adapter_path_to_sft_adapter_path(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'sft_adapter_path: "outputs/sft/adapter"',
+                'vllm_sync_mode: "lora"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.vllm_lora_adapter_path == "outputs/sft/adapter"
+
+
+def test_make_timestamped_run_dir_uses_linearrag_style_child_directory() -> None:
+    from rl_training.logging_utils import make_timestamped_run_dir
+
+    assert make_timestamped_run_dir("outputs/grpo_runs", timestamp="2026-07-01_12-34-56") == Path(
+        "outputs/grpo_runs/2026-07-01_12-34-56"
+    )
+
+
+def test_rl_runtime_helpers_are_extracted_and_reexported() -> None:
+    import rl_training.runtime as runtime
+    import rl_training.train_grpo_macorag as entrypoint
+
+    assert entrypoint._parse_gpu_indices is runtime.parse_gpu_indices
+    assert entrypoint._validate_vllm_gpu_placement is runtime.validate_vllm_gpu_placement
+    assert entrypoint._validate_local_vllm_server_model is runtime.validate_local_vllm_server_model
+
+
+def test_rl_logging_helpers_are_extracted_and_reexported() -> None:
+    import rl_training.logging_utils as logging_utils
+    import rl_training.train_grpo_macorag as entrypoint
+
+    assert entrypoint._write_json is logging_utils.write_json
+    assert entrypoint._append_jsonl is logging_utils.append_jsonl
+
+
+def test_train_grpo_yaml_has_documented_sections() -> None:
+    text = Path("config/train_grpo.yml").read_text(encoding="utf-8")
+
+    for heading in [
+        "# 基础路径",
+        "# rollout 与采样",
+        "# GRPO 优化",
+        "# vLLM 生成与权重同步",
+        "# 检索环境",
+        "# 日志与检查点",
+        "# 运行环境",
+    ]:
+        assert heading in text
+
+
+def test_train_grpo_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:
+    import yaml
+
+    config = yaml.safe_load(Path("config/train_grpo.yml").read_text(encoding="utf-8"))
+
+    for key in [
+        "output_root",
+        "max_samples",
+        "max_rounds",
+        "group_size",
+        "num_train_epochs",
+        "max_steps",
+        "learning_rate",
+        "gradient_accumulation_steps",
+        "kl_beta",
+        "clip_epsilon",
+        "max_prompt_length",
+        "max_completion_length",
+        "temperature",
+        "top_p",
+        "top_k",
+        "retrieval_top_k",
+        "save_steps",
+        "logging_steps",
+    ]:
+        assert key in config
+
+    for key in [
+        "output_dir",
+        "vllm_lora_adapter_path",
+        "vllm_host",
+        "vllm_port",
+        "vllm_sync_after_step",
+        "vllm_sync_trainable_only",
+        "vllm_timeout_seconds",
+        "log_jsonl_path",
+        "rollout_jsonl_path",
+        "gpu_index",
+        "check_only",
+        "disable_tqdm",
+    ]:
+        assert key not in config
+
+
+def test_dataset_rollout_path_groups_samples_by_dataset(tmp_path: Path) -> None:
+    assert _dataset_rollout_path(tmp_path, "hotpotqa") == tmp_path / "rollout_samples" / "hotpotqa.jsonl"
+    assert _dataset_rollout_path(tmp_path, "2wiki/train") == tmp_path / "rollout_samples" / "2wiki_train.jsonl"
+
+
+def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() -> None:
+    sample = Namespace(qid="q1", dataset="hotpotqa", answer="Gold answer")
+    best_rollout = {
+        "final_answer": "Predicted answer",
+        "trajectory": [{"answer": {"answer": "Predicted answer"}}],
+        "parse_errors": [],
+        "rewards": {
+            "query_reward": 0.5,
+            "evidence_reward": 1.0,
+            "answer_f1": 0.75,
+        },
+    }
+    rollouts = [
+        {"advantage": -1.0, "rewards": {"total": 1.0}},
+        {"advantage": 1.0, "rewards": {"total": 3.0}},
+    ]
+    metrics = {
+        "loss": 0.2,
+        "policy_loss": 0.1,
+        "kl": 0.01,
+        "time_backward_seconds": 4.0,
+        "time_optimizer_step_seconds": 0.2,
+    }
+    rollout_timing = {
+        "time_rollout_seconds": 10.0,
+        "time_vllm_generate_seconds": 6.0,
+        "time_reward_seconds": 0.3,
+    }
+
+    payload = _build_train_metrics_payload(
+        epoch=1,
+        sample_index=0,
+        sample_total=5,
+        sample=sample,
+        global_step=2,
+        metrics=metrics,
+        rollouts=rollouts,
+        best_rollout=best_rollout,
+        learning_rate=0.00001,
+        rollout_timing=rollout_timing,
+        time_weight_sync_seconds=0.4,
+        time_total_seconds=15.0,
+    )
+
+    assert payload["gold_answer"] == "Gold answer"
+    assert payload["generated_answer"] == "Predicted answer"
+    assert payload["timing"] == {
+        "rollout_seconds": 10.0,
+        "vllm_generate_seconds": 6.0,
+        "reward_seconds": 0.3,
+        "backward_seconds": 4.0,
+        "optimizer_step_seconds": 0.2,
+        "weight_sync_seconds": 0.4,
+        "total_seconds": 15.0,
+    }
+    assert all(not key.startswith("time_") for key in payload)
 
 
 def test_parse_args_supports_disabling_rl_progress_bar(tmp_path: Path) -> None:
@@ -1047,36 +1246,6 @@ def test_run_grpo_vllm_lora_server_script_uses_custom_server_and_lora_config() -
     assert "vllm_lora_adapter_path" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
     assert "--data-parallel-size" in script
-
-
-def test_write_train_event_records_sample_progress(tmp_path: Path) -> None:
-    event_path = tmp_path / "train_events.jsonl"
-
-    _write_train_event(
-        event_path,
-        event="sample_start",
-        epoch=1,
-        sample_index=4,
-        sample_total=12,
-        sample_qid="q5",
-        sample_dataset="2wiki",
-        step=3,
-        group_index=0,
-    )
-
-    rows = [json.loads(line) for line in event_path.read_text(encoding="utf-8").splitlines()]
-    assert rows == [
-        {
-            "event": "sample_start",
-            "epoch": 1,
-            "sample": 5,
-            "sample_total": 12,
-            "qid": "q5",
-            "dataset": "2wiki",
-            "step": 3,
-            "group_index": 0,
-        }
-    ]
 
 
 def test_compute_answer_f1_uses_normalized_token_overlap_and_aliases() -> None:

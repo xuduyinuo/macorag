@@ -4,19 +4,23 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from pathlib import Path
 import socket
 
 import pytest
 
+from rag import RAGState
 from evaluation.config import parse_args
 from evaluation.data import EvalSample, load_eval_samples
 from evaluation.evaluate_rag_model import (
     _build_retrieval_env,
     _configure_visible_gpus,
+    _load_policy,
     _model_kwargs,
     _torch_dtype,
+    VLLMOpenAIPolicy,
     format_prediction,
     main,
     run_predictions,
@@ -45,6 +49,8 @@ def test_evaluate_shell_script_derives_gpu_visibility_from_yaml() -> None:
     script = Path("scripts/evaluate_rag_model.sh").read_text(encoding="utf-8")
 
     assert "CONFIG_PATH=" in script
+    assert 'ENV_FILE="${REPO_ROOT}/.env"' in script
+    assert 'source "${ENV_FILE}"' in script
     assert "parse_args" in script
     assert 'export CUDA_VISIBLE_DEVICES="${EFFECTIVE_GPU_INDICES}"' in script
     assert 'export MACORAG_SILENT_RETRIEVAL="${MACORAG_SILENT_RETRIEVAL:-1}"' in script
@@ -75,6 +81,161 @@ def test_evaluate_shell_script_uses_cli_gpu_indices_override_for_cuda_visibility
     )
 
     assert "CUDA_VISIBLE_DEVICES=7,8" in output
+
+
+def test_vllm_server_helper_script_exists() -> None:
+    script = Path("scripts/model_vllm_servers.sh")
+
+    text = script.read_text(encoding="utf-8")
+
+    assert "vllm serve" in text
+    assert "--enable-lora" in text
+    assert "--lora-modules" in text
+    assert "model_path" in text
+    assert "adapter_path" in text
+    assert "vllm_model" in text
+    assert "vllm_bin" in text
+    assert "config/model_vllm_servers.yml" in text
+    assert "MACORAG_VLLM_DRY_RUN" in text
+
+
+def test_model_vllm_server_config_file_exists() -> None:
+    config = Path("config/model_vllm_servers.yml")
+
+    text = config.read_text(encoding="utf-8")
+
+    assert 'vllm_bin: "/data/conda/envs/vllm/bin/vllm"' in text
+    assert 'model_path: "model/Qwen2.5-7B-Instruct"' in text
+    assert "adapter_path:" in text
+    assert "vllm_model:" in text
+    assert "gpu_indices:" in text
+    assert "vllm_base_urls:" in text
+    assert "max_model_len:" in text
+    assert "max_model_len: null" not in text
+    assert "environment:" in text
+    assert 'VLLM_USE_FLASHINFER_SAMPLER: "0"' in text
+    assert 'VLLM_ATTENTION_BACKEND: "FLASH_ATTN"' in text
+
+
+def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> None:
+    config = tmp_path / "model_vllm_servers.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'vllm_bin: "/opt/vllm/bin/vllm"',
+                'model_path: "model/base"',
+                'adapter_path: "outputs/adapter"',
+                'vllm_model: "adapter-name"',
+                'gpu_indices: "2,3"',
+                "vllm_base_urls:",
+                '  - "http://127.0.0.1:8100/v1"',
+                '  - "http://127.0.0.1:8101/v1"',
+                'host: "0.0.0.0"',
+                'dtype: "float16"',
+                "gpu_memory_utilization: 0.8",
+                "max_model_len: 2048",
+                "trust_remote_code: true",
+                "environment:",
+                '  VLLM_USE_FLASHINFER_SAMPLER: "0"',
+                '  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"',
+                "extra_args:",
+                '  - "--max-num-seqs"',
+                '  - "32"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["MACORAG_VLLM_DRY_RUN"] = "1"
+
+    result = subprocess.run(
+        ["bash", "scripts/model_vllm_servers.sh", "--config", str(config)],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+        env=env,
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=2 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 0.0.0.0 --port 8100" in result.stdout
+    assert "VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN" in result.stdout
+    assert "--enable-lora --lora-modules adapter-name=outputs/adapter" in result.stdout
+    assert "--dtype float16 --gpu-memory-utilization 0.8 --max-model-len 2048 --trust-remote-code --max-num-seqs 32" in result.stdout
+    assert "CUDA_VISIBLE_DEVICES=3 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 0.0.0.0 --port 8101" in result.stdout
+
+
+def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
+    config = tmp_path / "model_vllm_servers.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'vllm_bin: "/opt/vllm/bin/vllm"',
+                'model_path: "model/base"',
+                'adapter_path: "outputs/adapter"',
+                'vllm_model: "adapter-name"',
+                'gpu_indices: "2"',
+                "vllm_base_urls:",
+                '  - "http://127.0.0.1:8100/v1"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["MACORAG_VLLM_DRY_RUN"] = "1"
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/model_vllm_servers.sh",
+            "--config",
+            str(config),
+            "--gpu-indices",
+            "4",
+            "--vllm-base-urls",
+            "http://127.0.0.1:8200/v1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+        env=env,
+    )
+
+    assert "CUDA_VISIBLE_DEVICES=4 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 127.0.0.1 --port 8200" in result.stdout
+
+
+def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path: Path) -> None:
+    config = tmp_path / "model_vllm_servers.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'vllm_bin: "/opt/vllm/bin/vllm"',
+                'model_path: "model/base"',
+                "adapter_path: null",
+                'vllm_model: "adapter-name"',
+                'gpu_indices: "2"',
+                "vllm_base_urls:",
+                '  - "http://127.0.0.1:8100/v1"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env["MACORAG_VLLM_DRY_RUN"] = "1"
+
+    result = subprocess.run(
+        ["bash", "scripts/model_vllm_servers.sh", "--config", str(config)],
+        check=True,
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+        env=env,
+    )
+
+    assert "/opt/vllm/bin/vllm serve model/base" in result.stdout
+    assert "--served-model-name adapter-name" in result.stdout
+    assert "--enable-lora" not in result.stdout
+    assert "--lora-modules" not in result.stdout
 
 
 def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -109,6 +270,55 @@ def test_evaluate_build_retrieval_env_uses_eval_retrieval_config(monkeypatch: py
     assert captured["retrieval_root"] == "data/eval_1000_retrieval"
     assert captured["embedding_model"] == "sentence-transformers/all-mpnet-base-v2"
     assert captured["top_k"] == 5
+
+
+def test_cached_retrieval_env_shares_dataset_engine_across_threads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    created_by_thread: list[str] = []
+    queried_by_thread: list[str] = []
+
+    class FakeQueryResult:
+        passages = ["passage"]
+        scores = [1.0]
+
+    class FakeEngine:
+        def __init__(self, owner: str) -> None:
+            self.owner = owner
+
+        def query(self, query: str) -> FakeQueryResult:
+            queried_by_thread.append(threading.current_thread().name)
+            return FakeQueryResult()
+
+    def fake_create_linear_rag_query_engine(**kwargs) -> FakeEngine:
+        owner = threading.current_thread().name
+        created_by_thread.append(owner)
+        return FakeEngine(owner)
+
+    monkeypatch.setattr("rl_training.retrieval.create_linear_rag_query_engine", fake_create_linear_rag_query_engine)
+    env = CachedLinearRAGRetrievalEnv(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+    )
+    barrier = threading.Barrier(2, timeout=5)
+
+    def query_once() -> None:
+        barrier.wait()
+        env.query("hotpotqa", "query")
+
+    threads = [threading.Thread(target=query_once, name=f"worker-{index}") for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert len(created_by_thread) == 1
+    assert sorted(queried_by_thread) == ["worker-0", "worker-1"]
 
 
 def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
@@ -274,6 +484,38 @@ def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
     assert args.skip_judge is True
 
 
+def test_parse_eval_config_loads_vllm_backend_fields(tmp_path: Path) -> None:
+    config = tmp_path / "evaluate_rag_model.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'inference_backend: "vllm_openai"',
+                "vllm_base_urls:",
+                '  - "http://127.0.0.1:8000/v1"',
+                '  - "http://127.0.0.1:8001/v1"',
+                'vllm_model: "macorag-lora"',
+                'vllm_api_key_env: ""',
+                "vllm_timeout: 30",
+                "vllm_retries: 2",
+                "vllm_retry_sleep_seconds: 0.1",
+                "eval_request_workers: 8",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config), "--eval-request-workers", "4"])
+
+    assert args.inference_backend == "vllm_openai"
+    assert args.vllm_base_urls == ["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"]
+    assert args.vllm_model == "macorag-lora"
+    assert args.vllm_api_key_env == ""
+    assert args.vllm_timeout == 30
+    assert args.vllm_retries == 2
+    assert args.vllm_retry_sleep_seconds == 0.1
+    assert args.eval_request_workers == 4
+
+
 def test_parse_eval_config_rejects_unknown_yaml_keys(tmp_path: Path) -> None:
     config = tmp_path / "evaluate_rag_model.yml"
     config.write_text("unknown_key: 1\n", encoding="utf-8")
@@ -415,6 +657,40 @@ def test_explicit_data_files_skips_corpus_jsonl(tmp_path: Path) -> None:
     assert summary["source_files"] == [str(data_root / "hotpotqa" / "hotpotqa_dev.jsonl")]
 
 
+def test_explicit_data_files_accepts_dataset_directory(tmp_path: Path) -> None:
+    data_root = tmp_path / "eval"
+    _write_jsonl(data_root / "2wiki" / "corpus.jsonl", [{"doc_id": "d1", "text": "should be skipped"}])
+    _write_jsonl(
+        data_root / "2wiki" / "2wiki_dev.jsonl",
+        [
+            {
+                "qid": "q5",
+                "dataset": "2wiki",
+                "question": "Where was the director born?",
+                "answer": "London",
+                "supporting_facts": [{"title": "Director", "text": "Born in London."}],
+            }
+        ],
+    )
+    _write_jsonl(
+        data_root / "hotpotqa" / "hotpotqa_dev.jsonl",
+        [
+            {
+                "qid": "q6",
+                "dataset": "hotpotqa",
+                "question": "Who directed The Tripper?",
+                "answer": "David Arquette",
+                "supporting_facts": [{"title": "The Tripper", "text": "Directed by David Arquette."}],
+            }
+        ],
+    )
+
+    samples, summary = load_eval_samples(data_root=data_root, data_files=["2wiki"], max_samples=None)
+
+    assert [sample.dataset for sample in samples] == ["2wiki"]
+    assert summary["source_files"] == [str(data_root / "2wiki" / "2wiki_dev.jsonl")]
+
+
 class FakeJudgeClient:
     def __init__(self, responses: list[str]) -> None:
         self.responses = list(responses)
@@ -441,24 +717,34 @@ def test_evaluate_predictions_updates_prediction_file_and_summary(tmp_path: Path
     predictions_path.write_text(
         json.dumps(
             [
-                {"qid": "q1", "pred_answer": "David Arquette", "gold_answer": "David Arquette"},
-                {"qid": "q2", "pred_answer": "wrong", "gold_answer": "Right"},
+                {"qid": "q1", "dataset": "hotpotqa", "pred_answer": "David Arquette", "gold_answer": "David Arquette"},
+                {"qid": "q2", "dataset": "musique", "pred_answer": "wrong", "gold_answer": "Right"},
+                {"qid": "q3", "dataset": "hotpotqa", "pred_answer": "Right", "gold_answer": "Right"},
             ],
             ensure_ascii=False,
         ),
         encoding="utf-8",
     )
-    client = FakeJudgeClient(["correct", "incorrect"])
+    client = FakeJudgeClient(["correct", "incorrect", "correct"])
 
     summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
 
     updated = json.loads(predictions_path.read_text(encoding="utf-8"))
-    assert summary["llm_accuracy"] == 0.5
-    assert summary["contain_accuracy"] == 0.5
-    assert summary["num_samples"] == 2
+    assert summary["llm_accuracy"] == pytest.approx(2 / 3)
+    assert summary["contain_accuracy"] == pytest.approx(2 / 3)
+    assert summary["num_samples"] == 3
+    assert summary["by_dataset"] == {
+        "hotpotqa": {"llm_accuracy": 1.0, "contain_accuracy": 1.0, "num_samples": 2},
+        "musique": {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 1},
+    }
     assert updated[0]["llm_accuracy"] == 1.0
     assert updated[1]["llm_accuracy"] == 0.0
+    assert updated[2]["llm_accuracy"] == 1.0
     assert (tmp_path / "evaluation_results.json").exists()
+    hotpotqa_predictions = json.loads((tmp_path / "predictions_hotpotqa.json").read_text(encoding="utf-8"))
+    musique_predictions = json.loads((tmp_path / "predictions_musique.json").read_text(encoding="utf-8"))
+    assert [item["qid"] for item in hotpotqa_predictions] == ["q1", "q3"]
+    assert [item["qid"] for item in musique_predictions] == ["q2"]
 
 
 def test_evaluate_predictions_preserves_falsy_answers(tmp_path: Path) -> None:
@@ -525,6 +811,79 @@ def test_bailian_judge_client_retries_on_timeout(monkeypatch: pytest.MonkeyPatch
 
     assert result == "correct"
     assert called["count"] == 2
+
+
+def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request: object, timeout: int) -> _FakeHTTPResponse:
+        captured["url"] = request.full_url
+        captured["headers"] = dict(request.header_items())
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["timeout"] = timeout
+        return _FakeHTTPResponse({"choices": [{"message": {"content": "<answer>{\"can_answer\": true}</answer>"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    policy = VLLMOpenAIPolicy(
+        base_urls=["http://127.0.0.1:8000/v1"],
+        model="macorag-lora",
+        api_key_env="",
+        system_prompt="sys",
+        max_completion_length=32,
+        temperature=0.0,
+        top_p=0.95,
+        timeout=12,
+        retries=1,
+        retry_sleep_seconds=0.0,
+    )
+
+    response = policy.generate(
+        role="answer_generator",
+        question="Question?",
+        state=RAGState(question="Question?"),
+    )
+
+    payload = captured["payload"]
+    assert captured["url"] == "http://127.0.0.1:8000/v1/chat/completions"
+    assert captured["timeout"] == 12
+    assert payload["model"] == "macorag-lora"
+    assert payload["messages"][0] == {"role": "system", "content": "sys"}
+    assert payload["temperature"] == 0.0
+    assert payload["top_p"] == 0.95
+    assert payload["max_tokens"] == 32
+    assert response == '<answer>{"can_answer": true}</answer>'
+
+
+def test_vllm_policy_round_robins_base_urls(monkeypatch: pytest.MonkeyPatch) -> None:
+    urls: list[str] = []
+
+    def fake_urlopen(request: object, timeout: int) -> _FakeHTTPResponse:
+        urls.append(request.full_url)
+        return _FakeHTTPResponse({"choices": [{"message": {"content": "ok"}}]})
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+    policy = VLLMOpenAIPolicy(
+        base_urls=["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"],
+        model="macorag-lora",
+        api_key_env="",
+        system_prompt="sys",
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        timeout=12,
+        retries=1,
+        retry_sleep_seconds=0.0,
+    )
+
+    policy.set_endpoint_index(0)
+    policy.generate(role="answer_generator", question="Question?", state=RAGState(question="Question?"))
+    policy.set_endpoint_index(1)
+    policy.generate(role="answer_generator", question="Question?", state=RAGState(question="Question?"))
+
+    assert urls == [
+        "http://127.0.0.1:8000/v1/chat/completions",
+        "http://127.0.0.1:8001/v1/chat/completions",
+    ]
 
 
 def test_evaluate_predictions_includes_judge_metadata_when_provided(tmp_path: Path) -> None:
@@ -702,6 +1061,138 @@ def test_run_predictions_re_raises_runtime_dependency_errors(
         run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
 
     assert not (tmp_path / "predictions.jsonl").exists()
+
+
+def test_run_predictions_re_raises_vllm_service_errors(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    sample = EvalSample("q1", "hotpotqa", "Question?", "Answer", [], [], {})
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, inference_backend="vllm_openai", eval_request_workers=1)
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            raise RuntimeError("vLLM chat completion failed after 3 attempt(s): connection refused")
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    with pytest.raises(RuntimeError, match="vLLM chat completion failed"):
+        run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert not (tmp_path / "predictions.jsonl").exists()
+
+
+def test_load_policy_uses_vllm_without_loading_local_model(monkeypatch: pytest.MonkeyPatch) -> None:
+    args = SimpleNamespace(
+        inference_backend="vllm_openai",
+        vllm_base_urls=["http://127.0.0.1:8000/v1"],
+        vllm_model="macorag-lora",
+        vllm_api_key_env="",
+        system_prompt="sys",
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        vllm_timeout=30,
+        vllm_retries=2,
+        vllm_retry_sleep_seconds=0.0,
+    )
+
+    def fail_load_dependencies() -> None:
+        raise AssertionError("local model dependencies should not load for vllm_openai")
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model._load_dependencies", fail_load_dependencies)
+
+    policy = _load_policy(args)
+
+    assert isinstance(policy, VLLMOpenAIPolicy)
+
+
+def test_load_policy_rejects_invalid_backend() -> None:
+    args = SimpleNamespace(inference_backend="bad")
+
+    with pytest.raises(SystemExit, match="Unsupported inference_backend"):
+        _load_policy(args)
+
+
+def test_load_policy_rejects_vllm_without_base_urls() -> None:
+    args = SimpleNamespace(
+        inference_backend="vllm_openai",
+        vllm_base_urls=[],
+        vllm_model="macorag-lora",
+        vllm_api_key_env="",
+        system_prompt="sys",
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=0.95,
+        vllm_timeout=30,
+        vllm_retries=2,
+        vllm_retry_sleep_seconds=0.0,
+    )
+
+    with pytest.raises(SystemExit, match="vllm_base_urls"):
+        _load_policy(args)
+
+
+def test_run_predictions_uses_threads_for_vllm_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    samples = [
+        EvalSample("q1", "hotpotqa", "Question 1?", "Answer 1", [], [], {}),
+        EvalSample("q2", "hotpotqa", "Question 2?", "Answer 2", [], [], {}),
+    ]
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, inference_backend="vllm_openai", eval_request_workers=2)
+    entered = threading.Barrier(2, timeout=5)
+    thread_names: set[str] = set()
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.policy = policy
+
+        def run(self, *, question: str, dataset: str):
+            thread_names.add(threading.current_thread().name)
+            entered.wait()
+            return SimpleNamespace(
+                final_answer=question.replace("Question", "Answer").replace("?", ""),
+                trajectory=[{"question": question}],
+                parse_errors=[],
+                state=SimpleNamespace(retrieval_count=0),
+            )
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    predictions = run_predictions(args, samples, FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert [item["qid"] for item in predictions] == ["q1", "q2"]
+    assert len(thread_names) == 2
+    assert [item["qid"] for item in json.loads((tmp_path / "predictions.json").read_text(encoding="utf-8"))] == ["q1", "q2"]
+    assert len((tmp_path / "predictions.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 2
+
+
+def test_run_predictions_keeps_hf_backend_sequential(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    samples = [
+        EvalSample("q1", "hotpotqa", "Question 1?", "Answer 1", [], [], {}),
+        EvalSample("q2", "hotpotqa", "Question 2?", "Answer 2", [], [], {}),
+    ]
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, inference_backend="hf_local", eval_request_workers=2)
+    thread_names: list[str] = []
+
+    class FakeExecutor:
+        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
+            self.max_rounds = max_rounds
+
+        def run(self, *, question: str, dataset: str):
+            thread_names.append(threading.current_thread().name)
+            return SimpleNamespace(
+                final_answer="Answer",
+                trajectory=[{"question": question}],
+                parse_errors=[],
+                state=SimpleNamespace(retrieval_count=0),
+            )
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
+
+    predictions = run_predictions(args, samples, FakePolicy(), FakeRetrievalEnv(), tmp_path)
+
+    assert [item["qid"] for item in predictions] == ["q1", "q2"]
+    assert thread_names == ["MainThread", "MainThread"]
 
 
 def test_main_validates_retrieval_assets_before_loading_model(

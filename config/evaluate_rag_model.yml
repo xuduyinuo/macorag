@@ -1,7 +1,6 @@
-model_path: "model/Qwen2.5-3B-Instruct"
-adapter_path: "outputs/grpo_qwen2.5-3b/adapter"
+model_path: "model/Qwen2.5-7B-Instruct"
 data_root: "data/eval_1000"
-data_files: []
+data_files: [2wiki]
 retrieval_root: "data/eval_1000_retrieval"
 output_dir: "outputs/eval_rag_model"
 fixed_output_dir: false
@@ -40,3 +39,13 @@ load_4bit: true
 gpu_index: 0
 gpu_indices: "1"
 disable_tqdm: false
+
+inference_backend: "vllm_openai"
+vllm_base_urls:
+  - "http://127.0.0.1:8000/v1"
+vllm_model: "macorag"
+vllm_api_key_env: ""
+vllm_timeout: 120
+vllm_retries: 3
+vllm_retry_sleep_seconds: 1.0
+eval_request_workers: 4

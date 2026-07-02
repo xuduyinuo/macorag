@@ -1,9 +1,9 @@
-sample_size: 3000
-output_dir: "data/trajectory_train"
-split: "train"
+sample_size: 1000
+output_dir: "data/eval_1000"
+split: "dev"
 source_root: "data/processed"
 datasets:
   - hotpotqa
   - 2wiki
   - musique
-seed: 42
+seed: 24

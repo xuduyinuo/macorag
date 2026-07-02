@@ -47,6 +47,14 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "judge_retries": 3,
     "judge_retry_sleep_seconds": 2.0,
     "judge_workers": 4,
+    "inference_backend": "hf_local",
+    "vllm_base_urls": (),
+    "vllm_model": "",
+    "vllm_api_key_env": "",
+    "vllm_timeout": 120,
+    "vllm_retries": 3,
+    "vllm_retry_sleep_seconds": 1.0,
+    "eval_request_workers": 1,
 }
 
 BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
@@ -124,6 +132,14 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--judge-retries", type=int, default=defaults["judge_retries"])
     parser.add_argument("--judge-retry-sleep-seconds", type=float, default=defaults["judge_retry_sleep_seconds"])
     parser.add_argument("--judge-workers", type=int, default=defaults["judge_workers"])
+    parser.add_argument("--inference-backend", choices=("hf_local", "vllm_openai"), default=defaults["inference_backend"])
+    parser.add_argument("--vllm-base-urls", nargs="*", default=defaults["vllm_base_urls"])
+    parser.add_argument("--vllm-model", default=defaults["vllm_model"])
+    parser.add_argument("--vllm-api-key-env", default=defaults["vllm_api_key_env"])
+    parser.add_argument("--vllm-timeout", type=int, default=defaults["vllm_timeout"])
+    parser.add_argument("--vllm-retries", type=int, default=defaults["vllm_retries"])
+    parser.add_argument("--vllm-retry-sleep-seconds", type=float, default=defaults["vllm_retry_sleep_seconds"])
+    parser.add_argument("--eval-request-workers", type=int, default=defaults["eval_request_workers"])
     return parser
 
 

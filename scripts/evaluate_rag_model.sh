@@ -11,6 +11,13 @@ export MACORAG_SILENT_RETRIEVAL="${MACORAG_SILENT_RETRIEVAL:-1}"
 
 cd "${REPO_ROOT}"
 
+ENV_FILE="${REPO_ROOT}/.env"
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  source "${ENV_FILE}"
+  set +a
+fi
+
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/evaluate_rag_model.yml}"
 
 EFFECTIVE_GPU_INDICES="$(

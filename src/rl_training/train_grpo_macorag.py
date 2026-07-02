@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import json
 import math
 import os
 import random
@@ -10,13 +9,19 @@ from pathlib import Path
 from typing import Any
 
 from rag import RAGLoopExecutor
-from sft_training.callbacks import _make_timestamped_output_dir
 
 from .config import parse_args
 from .data import RLSample, load_rl_samples
+from .logging_utils import append_jsonl as _append_jsonl
+from .logging_utils import make_timestamped_run_dir
+from .logging_utils import write_json as _write_json
 from .policy import HFSharedPolicy, VLLMSharedPolicy, sequence_logprobs
 from .retrieval import CachedLinearRAGRetrievalEnv
 from .rewards import compute_rl_rewards
+from .runtime import extract_vllm_server_model_paths as _extract_vllm_server_model_paths
+from .runtime import parse_gpu_indices as _parse_gpu_indices
+from .runtime import validate_local_vllm_server_model as _validate_local_vllm_server_model
+from .runtime import validate_vllm_gpu_placement as _validate_vllm_gpu_placement
 from .trainer import compute_grpo_loss, normalize_group_advantages
 from .vllm_client import VLLMGenerationClient
 
@@ -26,101 +31,6 @@ def _configure_visible_gpus(args: Any) -> None:
         return
     gpu_indices = str(getattr(args, "gpu_indices", "") or "").strip()
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices or str(args.gpu_index)
-
-
-def _parse_gpu_indices(value: str | int | None) -> set[str]:
-    if value is None:
-        return set()
-    text = str(value).strip()
-    if not text:
-        return set()
-    return {item.strip() for item in text.split(",") if item.strip()}
-
-
-def _validate_vllm_gpu_placement(args: Any) -> None:
-    if not getattr(args, "use_vllm_generation", False):
-        return
-    trainer_gpus = _parse_gpu_indices(getattr(args, "gpu_indices", None))
-    if not trainer_gpus:
-        trainer_gpus = _parse_gpu_indices(getattr(args, "gpu_index", None))
-    vllm_gpus = _parse_gpu_indices(getattr(args, "vllm_gpu_indices", None))
-    overlap = trainer_gpus & vllm_gpus
-    if overlap:
-        raise SystemExit(
-            "vLLM GPU overlap detected: trainer gpu_indices="
-            f"{sorted(trainer_gpus)} and vllm_gpu_indices={sorted(vllm_gpus)} share {sorted(overlap)}. "
-            "Use separate GPUs for trainer and vLLM generation."
-        )
-
-
-def _is_local_host(host: str | None) -> bool:
-    return str(host or "").strip() in {"", "127.0.0.1", "localhost", "0.0.0.0"}
-
-
-def _iter_proc_cmdlines() -> list[list[str]]:
-    cmdlines: list[list[str]] = []
-    proc_root = Path("/proc")
-    if not proc_root.exists():
-        return cmdlines
-    for entry in proc_root.iterdir():
-        if not entry.name.isdigit():
-            continue
-        try:
-            raw = (entry / "cmdline").read_bytes()
-        except OSError:
-            continue
-        if not raw:
-            continue
-        parts = [part.decode("utf-8", errors="replace") for part in raw.split(b"\0") if part]
-        if parts:
-            cmdlines.append(parts)
-    return cmdlines
-
-
-def _extract_vllm_server_model_paths(cmdlines: list[list[str]]) -> list[str]:
-    model_paths: list[str] = []
-    for cmdline in cmdlines:
-        if "vllm-serve" not in cmdline:
-            continue
-        if not any("trl" in Path(part).name for part in cmdline):
-            continue
-        for index, part in enumerate(cmdline):
-            if part == "--model" and index + 1 < len(cmdline):
-                model_paths.append(cmdline[index + 1])
-            elif part.startswith("--model="):
-                model_paths.append(part.split("=", 1)[1])
-    return model_paths
-
-
-def _same_model_path(left: str, right: str) -> bool:
-    left_path = Path(left)
-    right_path = Path(right)
-    if left_path == right_path:
-        return True
-    try:
-        return left_path.resolve() == right_path.resolve()
-    except OSError:
-        return False
-
-
-def _validate_local_vllm_server_model(args: Any, *, cmdlines: list[list[str]] | None = None) -> None:
-    if not getattr(args, "use_vllm_generation", False):
-        return
-    if not _is_local_host(getattr(args, "vllm_host", None)):
-        return
-    model_path = str(getattr(args, "model_path", "") or "")
-    if not model_path:
-        return
-    server_models = _extract_vllm_server_model_paths(cmdlines if cmdlines is not None else _iter_proc_cmdlines())
-    if not server_models:
-        return
-    if any(_same_model_path(path, model_path) for path in server_models):
-        return
-    raise SystemExit(
-        "vLLM server model mismatch: trainer model_path="
-        f"{model_path!r}, but local trl vllm-serve process uses {server_models!r}. "
-        "Stop the stale vLLM server and restart scripts/run_grpo_vllm_server.sh with the current config."
-    )
 
 
 def _local_rank() -> int:
@@ -139,43 +49,6 @@ def _world_size() -> int:
 
 def _is_main_process() -> bool:
     return _local_rank() == 0
-
-
-def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as file:
-        json.dump(payload, file, ensure_ascii=False, indent=2)
-
-
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-def _write_train_event(
-    path: Path,
-    *,
-    event: str,
-    epoch: int,
-    sample_index: int,
-    sample_total: int,
-    sample_qid: str,
-    sample_dataset: str,
-    step: int,
-    **extra: Any,
-) -> None:
-    payload = {
-        "event": event,
-        "epoch": epoch,
-        "sample": sample_index + 1,
-        "sample_total": sample_total,
-        "qid": sample_qid,
-        "dataset": sample_dataset,
-        "step": step,
-    }
-    payload.update(extra)
-    _append_jsonl(path, payload)
 
 
 def _load_training_dependencies() -> dict[str, Any]:
@@ -373,11 +246,6 @@ def _rollout_group(
     sample: RLSample,
     policy: HFSharedPolicy,
     retrieval_env: CachedLinearRAGRetrievalEnv,
-    event_path: Path | None = None,
-    epoch: int = 0,
-    sample_index: int = 0,
-    sample_total: int = 0,
-    step: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     rollouts: list[dict[str, Any]] = []
     time_rollout_seconds = 0.0
@@ -405,24 +273,6 @@ def _rollout_group(
         time_reward_seconds += time.perf_counter() - reward_start
         rollout["rewards"] = rewards
         rollouts.append(rollout)
-        if event_path is not None and _is_main_process():
-            _write_train_event(
-                event_path,
-                event="rollout_complete",
-                epoch=epoch,
-                sample_index=sample_index,
-                sample_total=sample_total,
-                sample_qid=sample.qid,
-                sample_dataset=sample.dataset,
-                step=step,
-                group_index=group_index,
-                reward_total=rewards["total"],
-                reward_query=rewards["query_reward"],
-                reward_evidence=rewards["evidence_reward"],
-                reward_answer_f1=rewards["answer_f1"],
-                retrieval_count=len(result.trajectory),
-                parse_errors=result.parse_errors,
-            )
     reward_start = time.perf_counter()
     advantages = normalize_group_advantages([item["rewards"]["total"] for item in rollouts])
     for rollout, advantage in zip(rollouts, advantages):
@@ -524,6 +374,63 @@ def _save_checkpoint(raw_policy_model: Any, tokenizer: Any, output_dir: Path, st
     tokenizer.save_pretrained(checkpoint_dir)
 
 
+def _safe_dataset_name(dataset: str) -> str:
+    return "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(dataset).strip()) or "unknown"
+
+
+def _dataset_rollout_path(output_dir: Path, dataset: str) -> Path:
+    """按数据集拆分 rollout 样本，避免所有数据集混在一个 JSONL。"""
+    return output_dir / "rollout_samples" / f"{_safe_dataset_name(dataset)}.jsonl"
+
+
+def _build_train_metrics_payload(
+    *,
+    epoch: int,
+    sample_index: int,
+    sample_total: int,
+    sample: Any,
+    global_step: int,
+    metrics: dict[str, Any],
+    rollouts: list[dict[str, Any]],
+    best_rollout: dict[str, Any],
+    learning_rate: float,
+    rollout_timing: dict[str, Any],
+    time_weight_sync_seconds: float,
+    time_total_seconds: float,
+) -> dict[str, Any]:
+    reward_totals = [item["rewards"]["total"] for item in rollouts]
+    return {
+        "epoch": epoch,
+        "sample": sample_index + 1,
+        "sample_total": sample_total,
+        "qid": sample.qid,
+        "dataset": sample.dataset,
+        "step": global_step,
+        "loss": metrics["loss"],
+        "policy_loss": metrics["policy_loss"],
+        "kl": metrics["kl"],
+        "reward_total": sum(reward_totals) / len(reward_totals),
+        "reward_query": best_rollout["rewards"]["query_reward"],
+        "reward_evidence": best_rollout["rewards"]["evidence_reward"],
+        "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
+        "advantage_mean": sum(item["advantage"] for item in rollouts) / len(rollouts),
+        "gold_answer": sample.answer,
+        "generated_answer": best_rollout["final_answer"],
+        "retrieval_count": len(best_rollout["trajectory"]),
+        "parse_errors": best_rollout["parse_errors"],
+        "learning_rate": learning_rate,
+        "timing": {
+            "rollout_seconds": rollout_timing["time_rollout_seconds"],
+            "vllm_generate_seconds": rollout_timing.get("time_vllm_generate_seconds", 0.0),
+            "reward_seconds": rollout_timing["time_reward_seconds"],
+            "backward_seconds": metrics["time_backward_seconds"],
+            "optimizer_step_seconds": metrics["time_optimizer_step_seconds"],
+            "weight_sync_seconds": time_weight_sync_seconds,
+            "total_seconds": time_total_seconds,
+        },
+    }
+
+
 def _make_progress_bar(args: Any, total: int) -> Any:
     if not _is_main_process() or args.disable_tqdm:
         return None
@@ -576,11 +483,10 @@ def main() -> None:
     retrieval_env = _build_retrieval_env(args)
     policy = _build_policy(args, raw_policy_model, tokenizer)
 
-    base_output_dir = Path(args.output_dir)
-    output_dir = _make_timestamped_output_dir(base_output_dir)
-    log_path = Path(args.log_jsonl_path) if args.log_jsonl_path else output_dir / "train_metrics.jsonl"
-    rollout_path = Path(args.rollout_jsonl_path) if args.rollout_jsonl_path else output_dir / "rollout_samples.jsonl"
-    event_path = output_dir / "train_events.jsonl"
+    base_output_dir = Path(args.output_root)
+    output_dir = make_timestamped_run_dir(base_output_dir)
+    log_path = output_dir / "train_metrics.jsonl"
+    rollout_dir = output_dir / "rollout_samples"
     if _is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(output_dir / "rl_dataset_summary.json", data_summary)
@@ -599,44 +505,12 @@ def main() -> None:
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break
                 sample_start_time = time.perf_counter()
-                if _is_main_process():
-                    _write_train_event(
-                        event_path,
-                        event="sample_start",
-                        epoch=epoch,
-                        sample_index=sample_index,
-                        sample_total=len(samples),
-                        sample_qid=sample.qid,
-                        sample_dataset=sample.dataset,
-                        step=global_step,
-                    )
-                try:
-                    rollouts, rollout_timing = _rollout_group(
-                        args=args,
-                        sample=sample,
-                        policy=policy,
-                        retrieval_env=retrieval_env,
-                        event_path=event_path,
-                        epoch=epoch,
-                        sample_index=sample_index,
-                        sample_total=len(samples),
-                        step=global_step,
-                    )
-                except Exception as exc:
-                    if _is_main_process():
-                        _write_train_event(
-                            event_path,
-                            event="sample_error",
-                            epoch=epoch,
-                            sample_index=sample_index,
-                            sample_total=len(samples),
-                            sample_qid=sample.qid,
-                            sample_dataset=sample.dataset,
-                            step=global_step,
-                            error_type=type(exc).__name__,
-                            error=str(exc),
-                        )
-                    raise
+                rollouts, rollout_timing = _rollout_group(
+                    args=args,
+                    sample=sample,
+                    policy=policy,
+                    retrieval_env=retrieval_env,
+                )
                 metrics = _train_on_rollouts(
                     rollouts=rollouts,
                     train_model=train_model,
@@ -671,56 +545,23 @@ def main() -> None:
                     )
                     progress_bar.update(1)
                 if _is_main_process() and (global_step % args.logging_steps == 0):
-                    payload = {
-                        "epoch": epoch,
-                        "sample": sample_index + 1,
-                        "sample_total": len(samples),
-                        "qid": sample.qid,
-                        "dataset": sample.dataset,
-                        "step": global_step,
-                        "loss": metrics["loss"],
-                        "policy_loss": metrics["policy_loss"],
-                        "kl": metrics["kl"],
-                        "reward_total": sum(reward_totals) / len(reward_totals),
-                        "reward_query": best_rollout["rewards"]["query_reward"],
-                        "reward_evidence": best_rollout["rewards"]["evidence_reward"],
-                        "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
-                        "advantage_mean": sum(item["advantage"] for item in rollouts) / len(rollouts),
-                        "generated_answer": best_rollout["final_answer"],
-                        "retrieval_count": len(best_rollout["trajectory"]),
-                        "parse_errors": best_rollout["parse_errors"],
-                        "learning_rate": args.learning_rate,
-                        "time_rollout_seconds": rollout_timing["time_rollout_seconds"],
-                        "time_vllm_generate_seconds": rollout_timing.get("time_vllm_generate_seconds", 0.0),
-                        "time_reward_seconds": rollout_timing["time_reward_seconds"],
-                        "time_backward_seconds": metrics["time_backward_seconds"],
-                        "time_optimizer_step_seconds": metrics["time_optimizer_step_seconds"],
-                        "time_weight_sync_seconds": time_weight_sync_seconds,
-                        "time_total_seconds": time_total_seconds,
-                    }
-                    _append_jsonl(log_path, payload)
-                    _write_train_event(
-                        event_path,
-                        event="sample_complete",
+                    payload = _build_train_metrics_payload(
                         epoch=epoch,
                         sample_index=sample_index,
                         sample_total=len(samples),
-                        sample_qid=sample.qid,
-                        sample_dataset=sample.dataset,
-                        step=global_step,
-                        loss=metrics["loss"],
-                        reward_total=payload["reward_total"],
-                        kl=metrics["kl"],
-                        time_rollout_seconds=payload["time_rollout_seconds"],
-                        time_vllm_generate_seconds=payload["time_vllm_generate_seconds"],
-                        time_reward_seconds=payload["time_reward_seconds"],
-                        time_backward_seconds=payload["time_backward_seconds"],
-                        time_optimizer_step_seconds=payload["time_optimizer_step_seconds"],
-                        time_weight_sync_seconds=payload["time_weight_sync_seconds"],
-                        time_total_seconds=payload["time_total_seconds"],
+                        sample=sample,
+                        global_step=global_step,
+                        metrics=metrics,
+                        rollouts=rollouts,
+                        best_rollout=best_rollout,
+                        learning_rate=args.learning_rate,
+                        rollout_timing=rollout_timing,
+                        time_weight_sync_seconds=time_weight_sync_seconds,
+                        time_total_seconds=time_total_seconds,
                     )
+                    _append_jsonl(log_path, payload)
                     _append_jsonl(
-                        rollout_path,
+                        _dataset_rollout_path(output_dir, sample.dataset),
                         {
                             "epoch": epoch,
                             "sample": sample_index + 1,
@@ -753,6 +594,7 @@ def main() -> None:
             {
                 "model_path": args.model_path,
                 "sft_adapter_path": args.sft_adapter_path,
+                "output_root": str(base_output_dir),
                 "output_dir": str(output_dir / "adapter"),
                 "rl_data_root": args.rl_data_root,
                 "retrieval_root": args.retrieval_root,
@@ -764,8 +606,7 @@ def main() -> None:
                 "world_size": _world_size(),
                 "global_step": global_step,
                 "log_jsonl_path": str(log_path),
-                "rollout_jsonl_path": str(rollout_path),
-                "event_jsonl_path": str(event_path),
+                "rollout_jsonl_dir": str(rollout_dir),
                 "use_vllm_generation": args.use_vllm_generation,
                 "vllm_host": args.vllm_host,
                 "vllm_port": args.vllm_port,

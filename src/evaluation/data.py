@@ -40,6 +40,9 @@ def _resolve_files(data_root: Path, data_files: list[str] | tuple[str, ...]) -> 
             path = Path(item)
             if not path.is_absolute():
                 path = data_root / path
+            if path.is_dir():
+                paths.extend(_candidate_files(path))
+                continue
             if path.name == "corpus.jsonl":
                 continue
             paths.append(path)

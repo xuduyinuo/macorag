@@ -1,50 +1,40 @@
+# 基础路径
+# output_root 是保存根目录；每次 RL 训练会自动写入 output_root/YYYY-MM-DD_HH-MM-SS/。
 model_path: "model/Qwen2.5-7B-Instruct"
 sft_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
-rl_data_root: "data/rl_train_20"
-rl_data_files: []
-retrieval_root: "data/rl_train_20_retrieval"
-output_dir: "outputs/grpo_qwen2.5-7b"
-system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
-max_samples: null
-seed: 42
+rl_data_root: "data/rl_train_100"
+retrieval_root: "data/rl_train_100_retrieval"
+output_root: "outputs/grpo_qwen2.5-7b"
 
+# rollout 与采样
+# 这些参数是调参时最常改的行为开关：轮数、组大小、步数、生成长度和采样温度。
+max_samples: null
 max_rounds: 3
 group_size: 4
 num_train_epochs: 1.0
-max_steps: 0
-
-learning_rate: 0.00001
-weight_decay: 0.0
-warmup_ratio: 0.0
-per_device_train_batch_size: 1
-gradient_accumulation_steps: 1
-kl_beta: 0.02
-clip_epsilon: 0.2
-
+max_steps: 0 # 0 表示不限制步数
 max_prompt_length: 2048
 max_completion_length: 192
 temperature: 0.8
 top_p: 0.95
 top_k: 5
 
-use_vllm_generation: true
-vllm_host: "127.0.0.1"
-vllm_port: 8000
-vllm_gpu_indices: "0"
-vllm_tensor_parallel_size: 1
-vllm_data_parallel_size: 1
-vllm_gpu_memory_utilization: 0.75
-vllm_max_model_len: 8192
-vllm_dtype: "auto"
-vllm_sync_after_step: true
-vllm_sync_every_steps: 1
-vllm_sync_trainable_only: true
-vllm_timeout_seconds: 120
-vllm_sync_mode: "lora"
-vllm_lora_name: "macorag_train"
-vllm_lora_int_id: 1
-vllm_lora_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
+# GRPO 优化
+# 保留高频调参项；weight_decay/warmup/精度/量化等低频项使用代码默认值。
+learning_rate: 0.00001
+gradient_accumulation_steps: 1
+kl_beta: 0.02
+clip_epsilon: 0.2
 
+# vLLM 生成与权重同步
+# trainer 使用 gpu_indices，vLLM server 使用 vllm_gpu_indices，两者不能重叠。
+use_vllm_generation: true
+vllm_gpu_indices: "0"
+vllm_max_model_len: 8192
+vllm_sync_mode: "lora"
+
+# 检索环境
+# retrieval_embedding_model 必须与 retrieval_root 中已构建索引使用的 embedding 模型一致。
 retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
 retrieval_spacy_model: en_core_web_sm
 retrieval_top_k: 5
@@ -52,17 +42,9 @@ retrieval_max_workers: 4
 retrieval_batch_size: 32
 use_vectorized_retrieval: true
 
+# 日志与检查点
 save_steps: 100
-save_total_limit: 3
 logging_steps: 1
-log_jsonl_path: null
-rollout_jsonl_path: null
 
-bf16: false
-fp16: false
-load_4bit: true
-gradient_checkpointing: true
-gpu_index: 0
+# 运行环境
 gpu_indices: "1"
-check_only: false
-disable_tqdm: false
