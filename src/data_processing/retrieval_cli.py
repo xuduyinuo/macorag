@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from data_processing.process_datasets import DATASETS
-from retrieval_env import (
+from data_processing.retrieval import (
     RETRIEVAL_DEFAULT_ROOT,
     RETRIEVAL_DEFAULT_SPLITS,
     build_linearrag_assets,
@@ -24,7 +24,7 @@ def _resolve_repo_root() -> Path:
 
 
 REPO_ROOT = _resolve_repo_root()
-DEFAULT_RETRIEVAL_CONFIG = REPO_ROOT / "config" / "retrieval_env_build.yml"
+DEFAULT_RETRIEVAL_CONFIG = REPO_ROOT / "config" / "build_retrieval.yml"
 
 
 def _load_yaml_config(path: Union[str, Path]) -> dict[str, Any]:

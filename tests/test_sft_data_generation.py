@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
-from sft_data_generation.generate_teacher_sft import (
+from data_processing.generate_teacher_sft import (
     SFTConfig,
     _retrieve,
     build_answer_messages,
@@ -77,11 +77,13 @@ def test_parse_teacher_json_accepts_fenced_json() -> None:
 
 def test_teacher_sft_script_loads_gitignored_env_file() -> None:
     root = Path(__file__).resolve().parents[1]
-    script = (root / "scripts" / "generate_teacher_sft_test.sh").read_text(encoding="utf-8")
+    script = (root / "scripts" / "generate_teacher_sft.sh").read_text(encoding="utf-8")
     gitignore = (root / ".gitignore").read_text(encoding="utf-8")
 
     assert "ENV_FILE" in script
     assert 'source "${ENV_FILE}"' in script
+    assert "python -m data_processing.generate_teacher_sft" in script
+    assert "config/generate_teacher_sft.yml" in script
     assert ".env" in gitignore.splitlines()
 
 
@@ -250,7 +252,7 @@ def test_generate_sft_dataset_writes_one_record_per_question(monkeypatch, tmp_pa
     def fake_retrieve(config, dataset, query):
         return {"query": query, "passages": ["Evidence A1"], "scores": [1.0]}
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -320,8 +322,8 @@ def test_generate_sft_dataset_reports_filter_reasons(monkeypatch, tmp_path: Path
             "retrieval": {"query": query},
         }
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_plan", fake_dry_plan)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_plan", fake_dry_plan)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -364,8 +366,8 @@ def test_generate_sft_dataset_reports_dataset_stats(monkeypatch, tmp_path: Path)
         query = "Canada country" if example["dataset"] == "beta" else example["question"]
         return {"plan": {"sub_goal": query, "sub_query": query}, "retrieval": {"query": query}}
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_plan", fake_dry_plan)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_plan", fake_dry_plan)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -419,10 +421,10 @@ def test_generate_sft_dataset_counts_filtered_samples_not_error_events(monkeypat
             return ["round 0 has leaked evidence", "round 0 retrieval_count mismatch"]
         return []
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_plan", fake_dry_plan)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_update", fake_dry_update)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft.validate_trajectory_sample", fake_validate)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_plan", fake_dry_plan)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_update", fake_dry_update)
+    monkeypatch.setattr("data_processing.generate_teacher_sft.validate_trajectory_sample", fake_validate)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -469,9 +471,9 @@ def test_generate_sft_dataset_reports_resume_skips_separately(monkeypatch, tmp_p
             "answer": {"can_answer": True, "answer": "A2", "rationale": "Evidence supports it."},
         }
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_plan", fake_dry_plan)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_update", fake_dry_update)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_plan", fake_dry_plan)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_update", fake_dry_update)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -515,8 +517,8 @@ def test_generate_sft_dataset_writes_separate_sft_file_per_dataset(monkeypatch, 
             "answer": {"can_answer": True, "answer": example["answer"], "rationale": "Evidence supports it."},
         }
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_update", fake_dry_update)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_update", fake_dry_update)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -563,8 +565,8 @@ def test_generate_sft_dataset_appends_each_success_before_later_error(monkeypatc
             "answer": {"can_answer": True, "answer": example["answer"], "rationale": "Evidence supports it."},
         }
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_update", fake_dry_update)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_update", fake_dry_update)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -614,8 +616,8 @@ def test_generate_sft_dataset_stops_after_target_valid_per_dataset(monkeypatch, 
             "answer": {"can_answer": True, "answer": example["answer"], "rationale": "Evidence supports it."},
         }
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._retrieve", fake_retrieve)
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft._dry_update", fake_dry_update)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._retrieve", fake_retrieve)
+    monkeypatch.setattr("data_processing.generate_teacher_sft._dry_update", fake_dry_update)
 
     summary = generate_sft_dataset(
         SFTConfig(
@@ -647,7 +649,7 @@ def test_retrieve_suppresses_nested_retrieval_output(monkeypatch, capsys) -> Non
         print("Retrieving: 100%", file=sys.stderr)
         return SimpleNamespace(query=kwargs["query"], passages=["Evidence"], scores=[1.0])
 
-    monkeypatch.setattr("sft_data_generation.generate_teacher_sft.query_linear_rag", noisy_query_linear_rag)
+    monkeypatch.setattr("data_processing.generate_teacher_sft.query_linear_rag", noisy_query_linear_rag)
 
     observation = _retrieve(SFTConfig(), "toyqa", "Q?")
 

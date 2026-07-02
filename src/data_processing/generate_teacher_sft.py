@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from data_processing.io_utils import read_jsonl, write_json, write_jsonl
-from retrieval_env import create_linear_rag_query_engine, query_linear_rag
+from data_processing.retrieval import create_linear_rag_query_engine, query_linear_rag
 
 
 DATASETS = ("hotpotqa", "2wiki", "musique")
@@ -46,7 +46,7 @@ def _resolve_repo_root() -> Path:
 
 
 REPO_ROOT = _resolve_repo_root()
-DEFAULT_CONFIG = REPO_ROOT / "config" / "generate_teacher_sft_test.yml"
+DEFAULT_CONFIG = REPO_ROOT / "config" / "generate_teacher_sft.yml"
 
 
 @dataclass

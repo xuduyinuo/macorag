@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from retrieval_env import build_linearrag_assets
-from retrieval_env.core import _chunk_text_from_row, _resolve_example_path
+from data_processing.retrieval import build_linearrag_assets
+from data_processing.retrieval import _chunk_text_from_row, _resolve_example_path
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -83,3 +83,14 @@ def test_chunk_text_falls_back_to_sentences(tmp_path: Path) -> None:
         _chunk_text_from_row(row)
         == "First sentence.\nSecond sentence."
     )
+
+
+def test_retrieval_scripts_use_data_processing_entrypoints() -> None:
+    root = Path(__file__).resolve().parents[1]
+    build_script = (root / "scripts" / "build_retrieval.sh").read_text(encoding="utf-8")
+    query_script = (root / "scripts" / "query_retrieval.sh").read_text(encoding="utf-8")
+
+    assert "python -m data_processing.retrieval_cli" in build_script
+    assert "config/build_retrieval.yml" in build_script
+    assert "python -m data_processing.retrieval_cli" in query_script
+    assert "config/query_retrieval.yml" in query_script

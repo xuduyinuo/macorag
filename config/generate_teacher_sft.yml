@@ -2,28 +2,26 @@ datasets:
   - hotpotqa
   - 2wiki
   - musique
+
+# 数据、检索索引和生成结果路径。
 source_root: "data/trajectory_train"
 retrieval_root: "data/trajectory_train_retrieval"
 output_dir: "data/sft/teacher_qwen_plus_trajectory_train"
 split: "train"
+
+# 样本规模和 RAG 轨迹轮次。
 max_examples_per_dataset: 3000
 target_valid_per_dataset: 1000
 max_rounds: 5
 retrieval_top_k: 5
-seed: 42
-dry_run: false
 resume: true
-force_final_answer: false
 
+# 教师模型和生成长度。
 model: "qwen-plus"
-endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-api_key_env: "DASHSCOPE_API_KEY"
 temperature: 0.2
 max_tokens: 1200
-request_timeout: 120
-request_retries: 3
-retry_sleep_seconds: 2.0
 
+# 检索模型和并发参数。
 embedding_model: "sentence-transformers/all-mpnet-base-v2"
 spacy_model: "en_core_web_trf"
 sft_sample_workers: 4

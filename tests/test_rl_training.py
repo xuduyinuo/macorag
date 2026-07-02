@@ -1226,10 +1226,14 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
 
     assert "CONFIG_PATH=" in script
     assert "vllm_sync_mode" in script
-    assert "run_grpo_vllm_lora_server.sh" in script
     assert "vllm_gpu_indices" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
     assert "trl vllm-serve" in script
+    assert "rl_training.vllm_lora_server" in script
+    assert "vllm_lora_name" in script
+    assert "vllm_lora_int_id" in script
+    assert "vllm_lora_adapter_path" in script
+    assert "--data-parallel-size" in script
     assert "--model" in script
     assert "--host" in script
     assert "--port" in script
@@ -1237,15 +1241,8 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
     assert "--gpu-memory-utilization" in script
 
 
-def test_run_grpo_vllm_lora_server_script_uses_custom_server_and_lora_config() -> None:
-    script = Path("scripts/run_grpo_vllm_lora_server.sh").read_text(encoding="utf-8")
-
-    assert "rl_training.vllm_lora_server" in script
-    assert "vllm_lora_name" in script
-    assert "vllm_lora_int_id" in script
-    assert "vllm_lora_adapter_path" in script
-    assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
-    assert "--data-parallel-size" in script
+def test_run_grpo_vllm_lora_server_script_removed_after_merging_into_main_launcher() -> None:
+    assert not Path("scripts/run_grpo_vllm_lora_server.sh").exists()
 
 
 def test_compute_answer_f1_uses_normalized_token_overlap_and_aliases() -> None:

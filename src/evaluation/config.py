@@ -9,16 +9,15 @@ from typing import Any
 DEFAULT_CONFIG_PATH = "config/evaluate_rag_model.yml"
 
 DEFAULT_ARG_VALUES: dict[str, Any] = {
+    # 基础路径：评估结果会写入 output_root/时间戳 目录。
     "model_path": "model/Qwen2.5-3B-Instruct",
     "adapter_path": "outputs/grpo_qwen2.5-3b/adapter",
     "data_root": "data/eval_1000",
     "data_files": (),
     "retrieval_root": "data/eval_1000_retrieval",
-    "output_dir": "outputs/eval_rag_model",
-    "fixed_output_dir": False,
-    "system_prompt": "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON.",
+    "output_root": "outputs/eval_rag_model",
+    # 推理采样：top_k 控制模型采样候选 token，不控制检索段落数量。
     "max_samples": None,
-    "seed": 42,
     "max_rounds": 3,
     "max_prompt_length": 4096,
     "max_completion_length": 256,
@@ -28,15 +27,15 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "bf16": False,
     "fp16": False,
     "load_4bit": True,
-    "gpu_index": 0,
     "gpu_indices": "1",
-    "disable_tqdm": False,
+    # 检索配置：retrieval_top_k 才是每次检索返回的段落数量。
     "retrieval_embedding_model": "sentence-transformers/all-mpnet-base-v2",
     "retrieval_spacy_model": "en_core_web_trf",
     "retrieval_top_k": 5,
     "retrieval_max_workers": 4,
     "retrieval_batch_size": 32,
     "use_vectorized_retrieval": True,
+    # 评测配置：默认继续使用百炼兼容 OpenAI 接口进行自动判分。
     "skip_judge": False,
     "judge_model": "qwen-plus",
     "judge_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
@@ -47,6 +46,7 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "judge_retries": 3,
     "judge_retry_sleep_seconds": 2.0,
     "judge_workers": 4,
+    # 推理后端：vLLM 用于并发服务，本地 HF 后端保留给单机适配器评估。
     "inference_backend": "hf_local",
     "vllm_base_urls": (),
     "vllm_model": "",
@@ -99,11 +99,8 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--data-root", default=defaults["data_root"])
     parser.add_argument("--data-files", nargs="*", default=defaults["data_files"])
     parser.add_argument("--retrieval-root", default=defaults["retrieval_root"])
-    parser.add_argument("--output-dir", default=defaults["output_dir"])
-    parser.add_argument("--fixed-output-dir", action=BooleanOptionalAction, default=defaults["fixed_output_dir"])
-    parser.add_argument("--system-prompt", default=defaults["system_prompt"])
+    parser.add_argument("--output-root", default=defaults["output_root"])
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"])
-    parser.add_argument("--seed", type=int, default=defaults["seed"])
     parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     parser.add_argument("--max-prompt-length", type=int, default=defaults["max_prompt_length"])
     parser.add_argument("--max-completion-length", type=int, default=defaults["max_completion_length"])
@@ -113,9 +110,7 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
     parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"])
     parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"])
-    parser.add_argument("--gpu-index", type=int, default=defaults["gpu_index"])
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"])
-    parser.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"])
     parser.add_argument("--retrieval-embedding-model", default=defaults["retrieval_embedding_model"])
     parser.add_argument("--retrieval-spacy-model", default=defaults["retrieval_spacy_model"])
     parser.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])

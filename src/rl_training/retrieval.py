@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from retrieval_env import create_linear_rag_query_engine
+from data_processing.retrieval import create_linear_rag_query_engine
 
 
 class CachedLinearRAGRetrievalEnv:

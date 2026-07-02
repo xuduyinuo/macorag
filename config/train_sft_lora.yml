@@ -1,11 +1,14 @@
+# 基础路径
+# output_root 是保存根目录；每次 SFT 训练会自动写入 output_root/YYYY-MM-DD_HH-MM-SS/。
 model_path: "model/Qwen2.5-3B-Instruct"
 data_root: "data/sft/teacher_qwen_plus_trajectory_train"
-output_dir: "outputs/lora_qwen2.5-3b_trajectory"
-system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
+output_root: "outputs/lora_qwen2.5-3b_trajectory"
+
+# 数据与长度
 max_length: 5120
 max_samples: null
-seed: 42
 
+# LoRA 结构
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
@@ -18,33 +21,21 @@ target_modules:
   - down_proj
   - gate_proj
 
+# 训练调参
 per_device_train_batch_size: 2
 gradient_accumulation_steps: 8
 num_train_epochs: 3.0
 learning_rate: 0.00002
-lr_scheduler_type: "cosine"
-warmup_ratio: 0.03
-weight_decay: 0.01
+max_steps: 0
+
+# 日志、保存与验证
 logging_steps: 1
 save_steps: 100
 eval_steps: 20
-max_steps: 0
-save_total_limit: 3
-eval_split_ratio: 0.05
 validation_split: true
+eval_split_ratio: 0.05
 early_stopping_patience: 3
-early_stopping_threshold: 0.0
-metric_for_best_model: "eval_loss"
-greater_is_better: false
 
-fp16: false
-bf16: false
+# 运行环境
 load_4bit: true
-disable_tqdm: false
-log_jsonl_path: "outputs/lora_qwen2.5-3b_trajectory/train_metrics.jsonl"
-gpu_index: 0
 gpu_indices: "1"
-
-check_only: false
-check_only_max_samples: 20
-train_test_seed: 777

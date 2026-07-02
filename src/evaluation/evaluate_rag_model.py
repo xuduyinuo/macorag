@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import os
-import random
 import threading
 import time
 import urllib.error
@@ -22,11 +21,11 @@ from rag import (
 )
 from rl_training.policy import HFSharedPolicy
 from rl_training.retrieval import CachedLinearRAGRetrievalEnv
-from sft_training.callbacks import _make_timestamped_output_dir
 
 from .bailian_evaluator import BailianJudgeClient, evaluate_predictions
 from .config import parse_args
 from .data import EvalSample, load_eval_samples
+from .output import make_run_dir
 
 
 try:
@@ -35,6 +34,10 @@ except Exception:
 
     def tqdm(iterable, *args, **kwargs):
         return iterable
+
+
+DEFAULT_SYSTEM_PROMPT = "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
+DEFAULT_SEED = 42
 
 
 def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
@@ -46,13 +49,6 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _clear_prediction_artifacts(output_dir: Path) -> None:
-    for file_name in ("predictions.jsonl", "predictions.json", "evaluation_results.json"):
-        path = output_dir / file_name
-        if path.exists():
-            path.unlink()
 
 
 class VLLMOpenAIPolicy:
@@ -275,14 +271,25 @@ def run_predictions(
                 )
                 for index, sample in enumerate(samples)
             ]
-            iterator = tqdm(as_completed(futures), total=len(futures), desc="Evaluating RAG samples", unit="sample", disable=bool(args.disable_tqdm))
+            iterator = tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc="Evaluating RAG samples",
+                unit="sample",
+                disable=bool(getattr(args, "disable_tqdm", False)),
+            )
             for future in iterator:
                 index, prediction = future.result()
                 predictions_by_index[index] = prediction
                 with progress_lock:
                     _append_jsonl(progress_path, prediction)
     else:
-        iterator = tqdm(samples, desc="Evaluating RAG samples", unit="sample", disable=bool(args.disable_tqdm))
+        iterator = tqdm(
+            samples,
+            desc="Evaluating RAG samples",
+            unit="sample",
+            disable=bool(getattr(args, "disable_tqdm", False)),
+        )
         for index, sample in enumerate(iterator):
             _, prediction = _run_one_prediction(
                 index=index,
@@ -302,7 +309,7 @@ def _configure_visible_gpus(args: Any) -> None:
     if os.environ.get("CUDA_VISIBLE_DEVICES") is not None:
         return
     gpu_indices = str(getattr(args, "gpu_indices", "") or "").strip()
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices or str(args.gpu_index)
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices or "0"
 
 
 def _load_dependencies() -> dict[str, Any]:
@@ -365,7 +372,7 @@ def _load_policy(args: Any) -> HFSharedPolicy | VLLMOpenAIPolicy:
             base_urls=list(getattr(args, "vllm_base_urls", []) or []),
             model=getattr(args, "vllm_model", ""),
             api_key_env=getattr(args, "vllm_api_key_env", ""),
-            system_prompt=args.system_prompt,
+            system_prompt=getattr(args, "system_prompt", DEFAULT_SYSTEM_PROMPT),
             max_completion_length=args.max_completion_length,
             temperature=args.temperature,
             top_p=args.top_p,
@@ -392,7 +399,7 @@ def _load_policy(args: Any) -> HFSharedPolicy | VLLMOpenAIPolicy:
     return HFSharedPolicy(
         model=model,
         tokenizer=tokenizer,
-        system_prompt=args.system_prompt,
+        system_prompt=getattr(args, "system_prompt", DEFAULT_SYSTEM_PROMPT),
         max_prompt_length=args.max_prompt_length,
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
@@ -434,11 +441,7 @@ def validate_retrieval_assets(retrieval_root: str | Path, datasets: list[str] | 
 
 
 def _resolved_output_dir(args: Any) -> Path:
-    output_dir = Path(args.output_dir)
-    if args.fixed_output_dir:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        return output_dir
-    return _make_timestamped_output_dir(str(output_dir))
+    return make_run_dir(args.output_root)
 
 
 def _args_to_jsonable(args: Any) -> dict[str, Any]:
@@ -452,9 +455,11 @@ def _args_to_jsonable(args: Any) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     _configure_visible_gpus(args)
-    random.seed(args.seed)
+    # 固定随机种子保持历史评估顺序和采样行为稳定，配置文件无需暴露该低频参数。
+    import random
+
+    random.seed(DEFAULT_SEED)
     output_dir = _resolved_output_dir(args)
-    _clear_prediction_artifacts(output_dir)
     _write_json(output_dir / "run_config.json", _args_to_jsonable(args))
 
     samples, sample_summary = load_eval_samples(

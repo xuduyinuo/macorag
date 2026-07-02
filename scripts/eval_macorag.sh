@@ -18,7 +18,7 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 
-CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/evaluate_rag_model.yml}"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/eval_macorag.yml}"
 
 EFFECTIVE_GPU_INDICES="$(
   "${PYTHON:-python}" - "${CONFIG_PATH}" "$@" <<'PY'
@@ -32,7 +32,7 @@ gpu_indices = str(getattr(args, "gpu_indices", "") or "").strip()
 if gpu_indices:
     print(gpu_indices)
 else:
-    print(getattr(args, "gpu_index", 0))
+    print("0")
 PY
 )"
 

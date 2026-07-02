@@ -7,6 +7,7 @@ from .schema import AgentRole, RAGLoopResult, RAGState, RetrievalEnv, SharedPoli
 
 
 def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    """统一检索返回格式，保证后续按 passage_id 选择证据时有稳定索引。"""
     passages = []
     for index, passage in enumerate(observation.get("passages", []) or []):
         item = dict(passage) if isinstance(passage, dict) else {"text": str(passage)}
@@ -18,6 +19,7 @@ def normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
 
 
 def _selected_evidence(update: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, Any]]:
+    """根据 evidence_updater 输出的 passage_id 提取本轮选中的证据。"""
     passages = observation.get("passages", []) or []
     evidence: list[dict[str, Any]] = []
     for passage_id in update.get("selected_passage_ids", []) or []:
@@ -55,6 +57,7 @@ class RAGLoopExecutor:
         final_answer: str | None = None
 
         for round_index in range(self.max_rounds):
+            # 每一轮都从当前状态快照开始，避免模型生成过程意外修改历史状态。
             state_before = RAGState(
                 question=state.question,
                 current_sub_goal=state.current_sub_goal,
@@ -63,6 +66,7 @@ class RAGLoopExecutor:
                 retrieval_count=state.retrieval_count,
             )
             try:
+                # query_retriever 只决定检索 query；真正返回多少段落由检索环境的 top_k 控制。
                 query_text = self.policy.generate(
                     role=AgentRole.QUERY_RETRIEVER,
                     question=question,
@@ -85,6 +89,7 @@ class RAGLoopExecutor:
                     retrieval_count=state_before.retrieval_count,
                 )
 
+                # evidence_updater 只把本轮检索结果中有用的 passage 合并进证据池。
                 update_text = self.policy.generate(
                     role=AgentRole.EVIDENCE_UPDATER,
                     question=question,
@@ -111,6 +116,7 @@ class RAGLoopExecutor:
                     retrieval_count=state_before.retrieval_count + (1 if query else 0),
                 )
 
+                # answer_generator 可以在任意一轮给出最终答案；can_answer=true 时提前结束。
                 answer_text = self.policy.generate(
                     role=AgentRole.ANSWER_GENERATOR,
                     question=question,

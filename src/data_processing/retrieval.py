@@ -27,11 +27,11 @@ REQUIRED_INDEX_FILES = (
 
 
 def _resolve_spacy_model(preferred_model: Optional[str]) -> str:
-    """Return an installed spaCy model name, falling back to lightweight defaults."""
+    """解析可用的 spaCy 模型；优先使用配置值，缺失时尝试轻量模型。"""
     try:
         import spacy
     except Exception as exc:
-        raise RuntimeError("spaCy is required for retrieval_env. Install it with `python -m pip install spacy`.") from exc
+        raise RuntimeError("spaCy is required for retrieval building/querying. Install it with `python -m pip install spacy`.") from exc
 
     candidates: list[str] = []
     if preferred_model:
@@ -204,7 +204,7 @@ def build_linearrag_assets(
     datasets: list[str],
     splits: list[str],
 ) -> dict[str, dict[str, Any]]:
-    """Build LinearRAG-style `questions.json` and `chunks.json` from processed data."""
+    """从标准处理数据构建 LinearRAG 需要的 questions/chunks 文件。"""
     summary: dict[str, dict[str, Any]] = {}
     for dataset in tqdm(datasets, desc="Building retrieval corpora", unit="dataset"):
         source_dir = _dataset_dir(processed_root, dataset)

@@ -14,6 +14,8 @@ import pytest
 from rag import RAGState
 from evaluation.config import parse_args
 from evaluation.data import EvalSample, load_eval_samples
+from evaluation.output import make_run_dir
+from evaluation.vllm_servers import build_commands, parse_args as parse_vllm_server_args
 from evaluation.evaluate_rag_model import (
     _build_retrieval_env,
     _configure_visible_gpus,
@@ -84,23 +86,18 @@ def test_evaluate_shell_script_uses_cli_gpu_indices_override_for_cuda_visibility
 
 
 def test_vllm_server_helper_script_exists() -> None:
-    script = Path("scripts/model_vllm_servers.sh")
+    script = Path("scripts/eval_vllm_server.sh")
 
     text = script.read_text(encoding="utf-8")
 
-    assert "vllm serve" in text
-    assert "--enable-lora" in text
-    assert "--lora-modules" in text
-    assert "model_path" in text
-    assert "adapter_path" in text
-    assert "vllm_model" in text
-    assert "vllm_bin" in text
-    assert "config/model_vllm_servers.yml" in text
-    assert "MACORAG_VLLM_DRY_RUN" in text
+    assert "config/eval_vllm_server.yml" in text
+    assert "-m evaluation.vllm_servers" in text
+    assert "vllm serve" not in text
+    assert "argparse" not in text
 
 
 def test_model_vllm_server_config_file_exists() -> None:
-    config = Path("config/model_vllm_servers.yml")
+    config = Path("config/eval_vllm_server.yml")
 
     text = config.read_text(encoding="utf-8")
 
@@ -112,13 +109,52 @@ def test_model_vllm_server_config_file_exists() -> None:
     assert "vllm_base_urls:" in text
     assert "max_model_len:" in text
     assert "max_model_len: null" not in text
-    assert "environment:" in text
-    assert 'VLLM_USE_FLASHINFER_SAMPLER: "0"' in text
-    assert 'VLLM_ATTENTION_BACKEND: "FLASH_ATTN"' in text
+    assert "host:" not in text
+    assert "trust_remote_code:" not in text
+    assert "environment:" not in text
+
+
+def test_vllm_server_module_builds_commands_from_config_and_cli(tmp_path: Path) -> None:
+    config = tmp_path / "eval_vllm_server.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'vllm_bin: "/opt/vllm/bin/vllm"',
+                'model_path: "model/base"',
+                'adapter_path: "outputs/adapter"',
+                'vllm_model: "adapter-name"',
+                'gpu_indices: "2,3"',
+                "vllm_base_urls:",
+                '  - "http://127.0.0.1:8100/v1"',
+                '  - "http://127.0.0.1:8101/v1"',
+                'dtype: "float16"',
+                "gpu_memory_utilization: 0.8",
+                "max_model_len: 2048",
+                "extra_args:",
+                '  - "--max-num-seqs"',
+                '  - "32"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_vllm_server_args(["--config", str(config)])
+    commands = build_commands(args)
+
+    assert commands[0][0] == "2"
+    assert commands[0][1]["VLLM_USE_FLASHINFER_SAMPLER"] == "0"
+    assert commands[0][1]["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
+    assert commands[0][2][:6] == ["/opt/vllm/bin/vllm", "serve", "model/base", "--host", "127.0.0.1", "--port"]
+    assert commands[0][2][6] == "8100"
+    assert "--enable-lora" in commands[0][2]
+    assert f"adapter-name=outputs/adapter" in commands[0][2]
+    assert "--max-num-seqs" in commands[0][2]
+    assert commands[1][0] == "3"
+    assert commands[1][2][6] == "8101"
 
 
 def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> None:
-    config = tmp_path / "model_vllm_servers.yml"
+    config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
@@ -149,7 +185,7 @@ def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> 
     env["MACORAG_VLLM_DRY_RUN"] = "1"
 
     result = subprocess.run(
-        ["bash", "scripts/model_vllm_servers.sh", "--config", str(config)],
+        ["bash", "scripts/eval_vllm_server.sh", "--config", str(config)],
         check=True,
         capture_output=True,
         text=True,
@@ -165,7 +201,7 @@ def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> 
 
 
 def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
-    config = tmp_path / "model_vllm_servers.yml"
+    config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
@@ -186,7 +222,7 @@ def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
     result = subprocess.run(
         [
             "bash",
-            "scripts/model_vllm_servers.sh",
+            "scripts/eval_vllm_server.sh",
             "--config",
             str(config),
             "--gpu-indices",
@@ -205,7 +241,7 @@ def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
 
 
 def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path: Path) -> None:
-    config = tmp_path / "model_vllm_servers.yml"
+    config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
@@ -224,7 +260,7 @@ def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path
     env["MACORAG_VLLM_DRY_RUN"] = "1"
 
     result = subprocess.run(
-        ["bash", "scripts/model_vllm_servers.sh", "--config", str(config)],
+        ["bash", "scripts/eval_vllm_server.sh", "--config", str(config)],
         check=True,
         capture_output=True,
         text=True,
@@ -239,7 +275,7 @@ def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path
 
 
 def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    args = SimpleNamespace(gpu_indices="1", gpu_index=0)
+    args = SimpleNamespace(gpu_indices="1")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
 
     _configure_visible_gpus(args)
@@ -349,11 +385,8 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
         data_root="data/eval_1000",
         data_files=[],
         retrieval_root="data/eval_1000_retrieval",
-        output_dir=str(tmp_path / "outputs"),
-        fixed_output_dir=True,
-        system_prompt="sys",
+        output_root=str(tmp_path / "outputs"),
         max_samples=None,
-        seed=42,
         max_rounds=3,
         max_prompt_length=128,
         max_completion_length=16,
@@ -363,9 +396,7 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
         bf16=False,
         fp16=False,
         load_4bit=False,
-        gpu_index=0,
         gpu_indices="1",
-        disable_tqdm=True,
         retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
         retrieval_spacy_model="en_core_web_trf",
         retrieval_top_k=5,
@@ -455,7 +486,7 @@ def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
                 'adapter_path: "outputs/grpo/adapter"',
                 'data_root: "data/eval_1000"',
                 'retrieval_root: "data/eval_1000_retrieval"',
-                'output_dir: "outputs/eval"',
+                'output_root: "outputs/eval"',
                 'judge_model: "qwen-plus"',
                 'judge_api_key_env: "DASHSCOPE_API_KEY"',
                 "max_samples: 20",
@@ -474,7 +505,7 @@ def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
     assert args.adapter_path == "outputs/grpo/adapter"
     assert args.data_root == "data/eval_1000"
     assert args.retrieval_root == "data/eval_1000_retrieval"
-    assert args.output_dir == "outputs/eval"
+    assert args.output_root == "outputs/eval"
     assert args.judge_model == "qwen-plus"
     assert args.judge_api_key_env == "DASHSCOPE_API_KEY"
     assert args.max_samples == 3
@@ -524,11 +555,27 @@ def test_parse_eval_config_rejects_unknown_yaml_keys(tmp_path: Path) -> None:
         parse_args(["--config", str(config)])
 
 
+@pytest.mark.parametrize("removed_key", ["output_dir", "fixed_output_dir", "gpu_index", "seed", "system_prompt", "disable_tqdm"])
+def test_parse_eval_config_rejects_removed_yaml_keys(tmp_path: Path, removed_key: str) -> None:
+    config = tmp_path / "evaluate_rag_model.yml"
+    config.write_text(f"{removed_key}: old\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="Unknown evaluation config keys"):
+        parse_args(["--config", str(config)])
+
+
 def test_parse_eval_config_rejects_missing_explicit_config_with_equals(tmp_path: Path) -> None:
     missing = tmp_path / "no_such_config.yml"
 
     with pytest.raises(SystemExit, match="Evaluation config not found"):
         parse_args([f"--config={missing}"])
+
+
+def test_make_run_dir_creates_timestamped_child(tmp_path: Path) -> None:
+    run_dir = make_run_dir(tmp_path / "eval_root", timestamp="2026-07-02_12-34-56")
+
+    assert run_dir == tmp_path / "eval_root" / "2026-07-02_12-34-56"
+    assert run_dir.is_dir()
 
 
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
@@ -1215,11 +1262,8 @@ def test_main_validates_retrieval_assets_before_loading_model(
         data_root="data/eval_1000",
         data_files=[],
         retrieval_root=str(retrieval_root),
-        output_dir=str(tmp_path / "outputs"),
-        fixed_output_dir=True,
-        system_prompt="sys",
+        output_root=str(tmp_path / "outputs"),
         max_samples=None,
-        seed=42,
         max_rounds=3,
         max_prompt_length=128,
         max_completion_length=16,
@@ -1229,9 +1273,7 @@ def test_main_validates_retrieval_assets_before_loading_model(
         bf16=False,
         fp16=False,
         load_4bit=False,
-        gpu_index=0,
         gpu_indices="1",
-        disable_tqdm=True,
         retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
         retrieval_spacy_model="en_core_web_trf",
         retrieval_top_k=5,
@@ -1278,18 +1320,15 @@ def test_main_validates_retrieval_assets_before_loading_model(
         main([])
 
 
-def test_main_clears_stale_progress_before_startup_failure(
+def test_main_uses_timestamped_output_root_before_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    output_dir = tmp_path / "eval_run"
-    output_dir.mkdir(parents=True)
-    stale_progress = output_dir / "predictions.jsonl"
-    stale_progress.write_text('{"qid": "stale"}\n', encoding="utf-8")
-    stale_predictions = output_dir / "predictions.json"
-    stale_predictions.write_text('[{"qid": "stale"}]\n', encoding="utf-8")
-    stale_results = output_dir / "evaluation_results.json"
-    stale_results.write_text('{"llm_accuracy": 1.0}\n', encoding="utf-8")
+    output_root = tmp_path / "eval_root"
+    stale_parent_file = output_root / "predictions.jsonl"
+    stale_parent_file.parent.mkdir(parents=True)
+    stale_parent_file.write_text('{"qid": "stale"}\n', encoding="utf-8")
+    run_dir = output_root / "2026-07-02_12-34-56"
     retrieval_root = tmp_path / "retrieval"
     dataset_dir = retrieval_root / "hotpotqa"
     dataset_dir.mkdir(parents=True)
@@ -1307,11 +1346,8 @@ def test_main_clears_stale_progress_before_startup_failure(
         data_root="data/eval_1000",
         data_files=[],
         retrieval_root=str(retrieval_root),
-        output_dir=str(output_dir),
-        fixed_output_dir=True,
-        system_prompt="sys",
+        output_root=str(output_root),
         max_samples=None,
-        seed=42,
         max_rounds=3,
         max_prompt_length=128,
         max_completion_length=16,
@@ -1321,9 +1357,7 @@ def test_main_clears_stale_progress_before_startup_failure(
         bf16=False,
         fp16=False,
         load_4bit=False,
-        gpu_index=0,
         gpu_indices="1",
-        disable_tqdm=True,
         retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
         retrieval_spacy_model="en_core_web_trf",
         retrieval_top_k=5,
@@ -1355,7 +1389,7 @@ def test_main_clears_stale_progress_before_startup_failure(
 
     monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
     monkeypatch.setattr("evaluation.evaluate_rag_model._configure_visible_gpus", lambda parsed_args: None)
-    monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: output_dir)
+    monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: run_dir)
     monkeypatch.setattr(
         "evaluation.evaluate_rag_model.load_eval_samples",
         lambda **kwargs: (samples, {"loaded_samples": 1}),
@@ -1368,6 +1402,6 @@ def test_main_clears_stale_progress_before_startup_failure(
     with pytest.raises(RuntimeError, match="model load failed"):
         main([])
 
-    assert not stale_progress.exists()
-    assert not stale_predictions.exists()
-    assert not stale_results.exists()
+    assert stale_parent_file.exists()
+    assert (run_dir / "run_config.json").exists()
+    assert (run_dir / "data_summary.json").exists()

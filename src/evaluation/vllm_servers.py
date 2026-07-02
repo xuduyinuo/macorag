@@ -1,33 +1,23 @@
-#!/usr/bin/env bash
-set -euo pipefail
+from __future__ import annotations
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
-
-cd "${REPO_ROOT}"
-
-CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/model_vllm_servers.yml}"
-
-"${PYTHON:-python}" - "${CONFIG_PATH}" "$@" <<'PY'
 import argparse
 import os
 import shlex
 import signal
 import subprocess
-import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-import yaml
+from typing import Any
 
 
-DEFAULTS = {
+DEFAULT_CONFIG_PATH = "config/eval_vllm_server.yml"
+
+DEFAULTS: dict[str, Any] = {
     "vllm_bin": "/data/conda/envs/vllm/bin/vllm",
     "model_path": "model/Qwen2.5-7B-Instruct",
-    "adapter_path": "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter",
-    "vllm_model": "macorag-lora",
+    "adapter_path": None,
+    "vllm_model": "macorag",
     "gpu_indices": "0",
     "vllm_base_urls": ["http://127.0.0.1:8000/v1"],
     "host": "127.0.0.1",
@@ -43,20 +33,26 @@ DEFAULTS = {
 }
 
 
-def _load_config(config_path: str) -> dict:
+def load_config(config_path: str | Path) -> dict[str, Any]:
+    """读取 vLLM 服务配置，并用代码默认值补齐稳定参数。"""
     path = Path(config_path)
     if not path.exists():
         raise SystemExit(f"vLLM server config does not exist: {path}")
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:
+        raise SystemExit("PyYAML is required to load vLLM server config.") from exc
+
     with path.open("r", encoding="utf-8") as handle:
         loaded = yaml.safe_load(handle) or {}
     if not isinstance(loaded, dict):
         raise SystemExit(f"vLLM server config must be a mapping: {path}")
     config = dict(DEFAULTS)
-    config.update(loaded)
+    config.update({str(key).replace("-", "_"): value for key, value in loaded.items()})
     return config
 
 
-def _as_list(value) -> list[str]:
+def _as_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, (list, tuple)):
@@ -64,7 +60,7 @@ def _as_list(value) -> list[str]:
     return [str(value)]
 
 
-def _is_present(value) -> bool:
+def _is_present(value: Any) -> bool:
     if value is None:
         return False
     text = str(value).strip()
@@ -83,7 +79,7 @@ def _ports_from_urls(urls: list[str]) -> list[int]:
     return ports
 
 
-def _as_env(value) -> dict[str, str]:
+def _as_env(value: Any) -> dict[str, str]:
     if value is None:
         return {}
     if not isinstance(value, dict):
@@ -106,11 +102,11 @@ def _env_from_cli(values: list[str] | None) -> dict[str, str] | None:
     return result
 
 
-def _parse_args(default_config_path: str, cli_args: list[str]) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None, *, default_config_path: str = DEFAULT_CONFIG_PATH) -> argparse.Namespace:
     config_parser = argparse.ArgumentParser(add_help=False)
     config_parser.add_argument("--config", default=default_config_path)
-    config_args, _ = config_parser.parse_known_args(cli_args)
-    config = _load_config(config_args.config)
+    config_args, _ = config_parser.parse_known_args(argv)
+    config = load_config(config_args.config)
 
     parser = argparse.ArgumentParser(description="Start one or more vLLM OpenAI-compatible servers for MACORAG.")
     parser.add_argument("--config", default=config_args.config)
@@ -128,7 +124,7 @@ def _parse_args(default_config_path: str, cli_args: list[str]) -> argparse.Names
     parser.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
     parser.add_argument("--env", action="append", default=None, help="Set an environment variable for vLLM, formatted as KEY=VALUE.")
     parser.add_argument("--extra-arg", action="append", default=None)
-    args = parser.parse_args(cli_args)
+    args = parser.parse_args(argv)
     args.environment = _env_from_cli(args.env)
     if args.environment is None:
         args.environment = _as_env(config.get("environment"))
@@ -136,8 +132,8 @@ def _parse_args(default_config_path: str, cli_args: list[str]) -> argparse.Names
     return args
 
 
-def _build_commands(args: argparse.Namespace) -> list[tuple[str, dict[str, str], list[str]]]:
-    # Starts vllm serve processes with matching ports from vllm_base_urls.
+def build_commands(args: argparse.Namespace) -> list[tuple[str, dict[str, str], list[str]]]:
+    """按 GPU 和端口展开 vLLM 启动命令；这里只构造命令，不启动进程。"""
     gpus = [item.strip() for item in str(args.gpu_indices).split(",") if item.strip()]
     if not gpus:
         gpus = ["0"]
@@ -154,13 +150,7 @@ def _build_commands(args: argparse.Namespace) -> list[tuple[str, dict[str, str],
             str(port),
         ]
         if _is_present(args.adapter_path):
-            argv.extend(
-                [
-                    "--enable-lora",
-                    "--lora-modules",
-                    f"{args.vllm_model}={args.adapter_path}",
-                ]
-            )
+            argv.extend(["--enable-lora", "--lora-modules", f"{args.vllm_model}={args.adapter_path}"])
         elif _is_present(args.vllm_model):
             argv.extend(["--served-model-name", str(args.vllm_model)])
         if args.dtype:
@@ -176,14 +166,15 @@ def _build_commands(args: argparse.Namespace) -> list[tuple[str, dict[str, str],
     return commands
 
 
-def _print_dry_run(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
+def print_dry_run(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
     for gpu_index, extra_env, argv in commands:
         env_parts = [f"CUDA_VISIBLE_DEVICES={gpu_index}", *[f"{key}={value}" for key, value in extra_env.items()]]
         print(f"{' '.join(env_parts)} {shlex.join(argv)}")
 
 
-def _run(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
-    processes = []
+def run_commands(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
+    """启动多个 vLLM 服务，并在收到退出信号时统一终止子进程。"""
+    processes: list[subprocess.Popen] = []
 
     def stop_processes(signum=None, frame=None) -> None:
         for process in processes:
@@ -205,15 +196,15 @@ def _run(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
     raise SystemExit(exit_code)
 
 
-def main() -> None:
-    args = _parse_args(sys.argv[1], sys.argv[2:])
-    commands = _build_commands(args)
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    commands = build_commands(args)
     if os.environ.get("MACORAG_VLLM_DRY_RUN", "0") == "1":
-        _print_dry_run(commands)
-        return
-    _run(commands)
+        print_dry_run(commands)
+        return 0
+    run_commands(commands)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
-PY
+    raise SystemExit(main())

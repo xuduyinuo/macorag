@@ -13,8 +13,7 @@ from .callbacks import (
     _make_eval_metrics_callback,
     _make_jsonl_logging_callback,
     _make_sample_progress_callback,
-    _make_timestamped_output_dir,
-    _resolve_run_log_path,
+    make_run_dir,
 )
 from .config import DEFAULT_ARG_VALUES, DEFAULT_CONFIG_PATH, DEFAULT_SYSTEM_PROMPT, parse_args
 from .data import (
@@ -40,7 +39,7 @@ def _configure_visible_gpus(args: Any) -> None:
     if gpu_indices:
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices
     else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu_index)
+        os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 
 def _local_rank() -> int:
@@ -259,9 +258,9 @@ def main() -> None:
     val_records = flatten_training_samples(val_samples)
     train_source_sample_count = len(train_samples)
 
-    base_output_dir = Path(args.output_dir)
-    output_dir = _make_timestamped_output_dir(base_output_dir)
-    log_jsonl_path = _resolve_run_log_path(args.log_jsonl_path, base_output_dir, output_dir)
+    base_output_dir = Path(args.output_root)
+    output_dir = make_run_dir(base_output_dir)
+    log_jsonl_path = output_dir / "train_metrics.jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
     if _is_main_process():
         print(f"Run output directory: {output_dir}")
@@ -403,7 +402,7 @@ def main() -> None:
             "gpu_indices": args.gpu_indices,
             "world_size": _world_size(),
             "output_dir": str(output_dir / "adapter"),
-            "base_output_dir": str(base_output_dir),
+            "output_root": str(base_output_dir),
             "log_jsonl_path": str(log_jsonl_path),
             "max_length": args.max_length,
             "seed": args.seed,

@@ -1,4 +1,6 @@
 command: build
+
+# 输入为标准处理后的数据，输出为 LinearRAG 可直接读取的检索目录。
 processed_root: "data/eval_1000"
 retrieval_root: "data/eval_1000_retrieval"
 datasets:
@@ -7,7 +9,11 @@ datasets:
   - musique
 splits:
   - dev
+
+# 是否同时构建向量和图索引。
 build_index: true
+
+# 检索索引构建参数。
 embedding_model: "sentence-transformers/all-mpnet-base-v2"
 spacy_model: "en_core_web_sm"
 max_workers: 16

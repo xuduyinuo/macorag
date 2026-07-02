@@ -7,29 +7,10 @@ from pathlib import Path
 from typing import Any
 
 
-def _make_timestamped_output_dir(output_dir: str | Path, timestamp: str | None = None) -> Path:
-    base = Path(output_dir)
-    run_timestamp = timestamp or datetime.now().strftime("%Y%m%d_%H%M%S")
-    return base.with_name(f"{base.name}_{run_timestamp}")
-
-
-def _resolve_run_log_path(log_jsonl_path: str | None, base_output_dir: Path, run_output_dir: Path) -> Path:
-    if not log_jsonl_path:
-        return run_output_dir / "train_metrics.jsonl"
-
-    path = Path(log_jsonl_path)
-    if not path.is_absolute():
-        try:
-            relative_to_base = path.relative_to(base_output_dir)
-        except ValueError:
-            return path
-        return run_output_dir / relative_to_base
-
-    try:
-        relative_to_base = path.relative_to(base_output_dir.resolve())
-    except ValueError:
-        return path
-    return run_output_dir.resolve() / relative_to_base
+def make_run_dir(output_root: str | Path, timestamp: str | None = None) -> Path:
+    """按训练阶段统一规范生成运行目录：保存根目录/时间戳。"""
+    run_timestamp = timestamp or datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    return Path(output_root) / run_timestamp
 
 
 def _is_main_process(args: Any) -> bool:

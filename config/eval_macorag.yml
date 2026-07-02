@@ -1,20 +1,22 @@
+# 基础路径：每次评估会自动写入 output_root/时间戳 目录。
 model_path: "model/Qwen2.5-7B-Instruct"
 data_root: "data/eval_1000"
 data_files: [2wiki]
 retrieval_root: "data/eval_1000_retrieval"
-output_dir: "outputs/eval_rag_model"
-fixed_output_dir: false
-system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
-max_samples: null
-seed: 42
+output_root: "outputs/eval_rag_model"
 
+# 样本与 RAG 轮次。
+max_samples: null
 max_rounds: 3
+
+# 生成采样参数：top_k 是模型 token 采样候选数，不是检索段落数量。
 max_prompt_length: 4096
 max_completion_length: 256
 temperature: 0.0
 top_p: 0.95
 top_k: 5
 
+# 检索参数：retrieval_top_k 控制每次检索返回的段落数量。
 retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
 retrieval_spacy_model: en_core_web_trf
 retrieval_top_k: 5
@@ -22,30 +24,17 @@ retrieval_max_workers: 4
 retrieval_batch_size: 32
 use_vectorized_retrieval: true
 
+# 自动评测。
 skip_judge: false
 judge_model: "qwen-plus"
-judge_endpoint: "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-judge_api_key_env: "DASHSCOPE_API_KEY"
-judge_temperature: 0.0
-judge_max_tokens: 8
-judge_timeout: 120
-judge_retries: 3
-judge_retry_sleep_seconds: 2.0
 judge_workers: 4
 
-bf16: false
-fp16: false
-load_4bit: true
-gpu_index: 0
-gpu_indices: "1"
-disable_tqdm: false
-
+# 推理后端。
 inference_backend: "vllm_openai"
 vllm_base_urls:
   - "http://127.0.0.1:8000/v1"
 vllm_model: "macorag"
-vllm_api_key_env: ""
-vllm_timeout: 120
-vllm_retries: 3
-vllm_retry_sleep_seconds: 1.0
 eval_request_workers: 4
+
+# 设备选择：脚本会写入 CUDA_VISIBLE_DEVICES。
+gpu_indices: "1"

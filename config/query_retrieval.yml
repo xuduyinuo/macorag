@@ -1,7 +1,11 @@
 command: query
+
+# 查询一个已构建好的 LinearRAG 检索目录。
 dataset: 2wiki
 retrieval_root: "data/trajectory_test_retrieval"
 query: "Who is the director of film The Tripper?"
+
+# 查询时使用的检索模型和返回段落数。
 embedding_model: "sentence-transformers/all-mpnet-base-v2"
 spacy_model: "en_core_web_sm"
 top_k: 5

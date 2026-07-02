@@ -21,7 +21,7 @@ import yaml
 
 config_path = Path(sys.argv[1])
 config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-gpu_indices = str(config.get("gpu_indices") or config.get("gpu_index") or "0").strip()
+gpu_indices = str(config.get("gpu_indices") or "0").strip()
 gpu_list = [item.strip() for item in gpu_indices.split(",") if item.strip()]
 nproc = max(1, len(gpu_list))
 print(gpu_indices, nproc)

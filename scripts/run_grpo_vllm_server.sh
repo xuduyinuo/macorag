@@ -11,7 +11,7 @@ cd "${REPO_ROOT}"
 
 CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_grpo.yml}"
 
-read -r YAML_SYNC_MODE YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE < <(
+read -r YAML_SYNC_MODE YAML_MODEL_PATH YAML_HOST YAML_PORT YAML_VLLM_GPU_INDICES YAML_TP YAML_GPU_UTIL YAML_MAX_LEN YAML_DTYPE YAML_LORA_NAME YAML_LORA_INT_ID YAML_LORA_ADAPTER_PATH YAML_DP < <(
   "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
 import sys
 from pathlib import Path
@@ -29,12 +29,29 @@ print(
     float(config.get("vllm_gpu_memory_utilization", 0.75)),
     int(config.get("vllm_max_model_len", 4608)),
     config.get("vllm_dtype", "auto"),
+    config.get("vllm_lora_name", "macorag_train"),
+    int(config.get("vllm_lora_int_id", 1)),
+    config.get("vllm_lora_adapter_path") or config.get("sft_adapter_path", ""),
+    int(config.get("vllm_data_parallel_size", 1)),
 )
 PY
 )
 
 if [[ "${YAML_SYNC_MODE}" == "lora" ]]; then
-  exec "${SCRIPT_DIR}/run_grpo_vllm_lora_server.sh" "$@"
+  export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"
+  exec "${PYTHON:-python}" -m rl_training.vllm_lora_server \
+    --model "${YAML_MODEL_PATH}" \
+    --host "${YAML_HOST}" \
+    --port "${YAML_PORT}" \
+    --tensor-parallel-size "${YAML_TP}" \
+    --gpu-memory-utilization "${YAML_GPU_UTIL}" \
+    --max-model-len "${YAML_MAX_LEN}" \
+    --dtype "${YAML_DTYPE}" \
+    --lora-name "${YAML_LORA_NAME}" \
+    --lora-int-id "${YAML_LORA_INT_ID}" \
+    --data-parallel-size "${YAML_DP}" \
+    --lora-adapter-path "${YAML_LORA_ADAPTER_PATH}" \
+    "$@"
 fi
 
 export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"

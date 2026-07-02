@@ -8,8 +8,7 @@ from sft_training.train_sft_lora_macorag import (
     TrajectoryRecord,
     _make_eval_metrics_callback,
     _make_jsonl_logging_callback,
-    _make_timestamped_output_dir,
-    _resolve_run_log_path,
+    make_run_dir,
     _tokenize_records,
     parse_args,
     trajectory_to_sft_records,
@@ -131,7 +130,7 @@ def test_parse_args_loads_yaml_config(tmp_path) -> None:
             [
                 'model_path: "model/from-yaml"',
                 'data_root: "data/from-yaml"',
-                'output_dir: "outputs/from-yaml"',
+                'output_root: "outputs/from-yaml"',
                 "max_length: 1234",
                 "max_samples: 5",
                 "lora_r: 8",
@@ -152,7 +151,6 @@ def test_parse_args_loads_yaml_config(tmp_path) -> None:
                 "bf16: true",
                 "load_4bit: true",
                 "disable_tqdm: false",
-                'log_jsonl_path: "outputs/from-yaml/train_metrics.jsonl"',
                 'gpu_indices: "0,1"',
             ]
         ),
@@ -163,7 +161,7 @@ def test_parse_args_loads_yaml_config(tmp_path) -> None:
 
     assert args.model_path == "model/from-yaml"
     assert args.data_root == "data/from-yaml"
-    assert args.output_dir == "outputs/from-yaml"
+    assert args.output_root == "outputs/from-yaml"
     assert args.max_length == 1234
     assert args.max_samples == 5
     assert args.lora_r == 8
@@ -182,8 +180,29 @@ def test_parse_args_loads_yaml_config(tmp_path) -> None:
     assert args.bf16 is True
     assert args.load_4bit is True
     assert args.disable_tqdm is False
-    assert args.log_jsonl_path == "outputs/from-yaml/train_metrics.jsonl"
     assert args.gpu_indices == "0,1"
+
+
+def test_parse_args_rejects_removed_output_and_log_keys(tmp_path) -> None:
+    config = tmp_path / "train.yml"
+    config.write_text(
+        "\n".join(
+            [
+                'output_dir: "outputs/from-yaml"',
+                'log_jsonl_path: "outputs/from-yaml/train_metrics.jsonl"',
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        parse_args(["--config", str(config)])
+    except SystemExit as exc:
+        message = str(exc)
+        assert "output_dir" in message
+        assert "log_jsonl_path" in message
+    else:
+        raise AssertionError("expected removed SFT output/log keys to fail")
 
 
 def test_parse_args_cli_overrides_yaml_config(tmp_path) -> None:
@@ -191,7 +210,7 @@ def test_parse_args_cli_overrides_yaml_config(tmp_path) -> None:
     config.write_text(
         "\n".join(
             [
-                'output_dir: "outputs/from-yaml"',
+                'output_root: "outputs/from-yaml"',
                 "max_length: 1024",
                 "max_samples: 5",
                 "validation_split: false",
@@ -206,7 +225,7 @@ def test_parse_args_cli_overrides_yaml_config(tmp_path) -> None:
         [
             "--config",
             str(config),
-            "--output-dir",
+            "--output-root",
             "outputs/from-cli",
             "--max-length",
             "2048",
@@ -219,7 +238,7 @@ def test_parse_args_cli_overrides_yaml_config(tmp_path) -> None:
         ]
     )
 
-    assert args.output_dir == "outputs/from-cli"
+    assert args.output_root == "outputs/from-cli"
     assert args.max_length == 2048
     assert args.max_samples == 2
     assert args.validation_split is True
@@ -356,21 +375,64 @@ def test_eval_metrics_callback_writes_one_line_per_eval(tmp_path) -> None:
     ]
 
 
-def test_timestamped_output_dir_uses_base_name_and_timestamp() -> None:
-    assert _make_timestamped_output_dir("outputs/lora_qwen2.5-7b_trajectory", "20260625_153012").as_posix() == (
-        "outputs/lora_qwen2.5-7b_trajectory_20260625_153012"
+def test_run_dir_uses_output_root_child_timestamp() -> None:
+    assert make_run_dir("outputs/lora_qwen2.5-7b_trajectory", "2026-07-02_12-34-56").as_posix() == (
+        "outputs/lora_qwen2.5-7b_trajectory/2026-07-02_12-34-56"
     )
 
 
-def test_run_log_path_moves_base_log_into_timestamped_run_dir() -> None:
-    base_output_dir = "outputs/lora_qwen2.5-7b_trajectory"
-    run_output_dir = _make_timestamped_output_dir("outputs/lora_qwen2.5-7b_trajectory", "20260625_153012")
+def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:
+    import yaml
 
-    assert _resolve_run_log_path(
-        "outputs/lora_qwen2.5-7b_trajectory/train_metrics.jsonl",
-        Path(base_output_dir),
-        run_output_dir,
-    ).as_posix() == "outputs/lora_qwen2.5-7b_trajectory_20260625_153012/train_metrics.jsonl"
+    config = yaml.safe_load(Path("config/train_sft_lora.yml").read_text(encoding="utf-8"))
+
+    for key in [
+        "model_path",
+        "data_root",
+        "output_root",
+        "max_length",
+        "max_samples",
+        "lora_r",
+        "lora_alpha",
+        "lora_dropout",
+        "target_modules",
+        "per_device_train_batch_size",
+        "gradient_accumulation_steps",
+        "num_train_epochs",
+        "learning_rate",
+        "max_steps",
+        "logging_steps",
+        "save_steps",
+        "eval_steps",
+        "validation_split",
+        "eval_split_ratio",
+        "early_stopping_patience",
+        "load_4bit",
+        "gpu_indices",
+    ]:
+        assert key in config
+
+    for key in [
+        "output_dir",
+        "system_prompt",
+        "seed",
+        "lr_scheduler_type",
+        "warmup_ratio",
+        "weight_decay",
+        "save_total_limit",
+        "early_stopping_threshold",
+        "metric_for_best_model",
+        "greater_is_better",
+        "fp16",
+        "bf16",
+        "disable_tqdm",
+        "log_jsonl_path",
+        "gpu_index",
+        "check_only",
+        "check_only_max_samples",
+        "train_test_seed",
+    ]:
+        assert key not in config
 
 
 def _record(qid: str, action_type: str) -> TrajectoryRecord:
@@ -442,6 +504,7 @@ def test_training_shell_script_derives_gpu_visibility_from_yaml() -> None:
     assert 'CUDA_VISIBLE_DEVICES="0,1"' not in script
     assert "yaml.safe_load" in script
     assert "YAML_GPU_INDICES" in script
+    assert "gpu_index" not in script
     assert "NPROC_PER_NODE" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"' in script
     assert "torchrun" in script

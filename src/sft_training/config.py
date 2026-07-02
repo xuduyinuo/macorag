@@ -10,19 +10,31 @@ DEFAULT_SYSTEM_PROMPT = (
     "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
 )
 
-DEFAULT_CONFIG_PATH = "config/train_sft_lora.yml"
-DEFAULT_ARG_VALUES: dict[str, Any] = {
+# 基础路径：模型、SFT 数据和运行输出根目录。
+PATH_DEFAULTS: dict[str, Any] = {
     "model_path": "model/Qwen2.5-7B-Instruct",
     "data_root": "data/sft/teacher_qwen_plus_trajectory_train",
-    "output_dir": "outputs/lora_qwen2.5-7b_trajectory",
+    "output_root": "outputs/lora_qwen2.5-7b_trajectory",
+}
+
+# 数据与样本：控制样本上限和单条训练样本最大 token 长度。
+DATA_DEFAULTS: dict[str, Any] = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_length": 4096,
     "max_samples": None,
     "seed": 42,
+}
+
+# LoRA 结构：保留常用 adapter 调参项。
+LORA_DEFAULTS: dict[str, Any] = {
     "lora_r": 16,
     "lora_alpha": 32,
     "lora_dropout": 0.05,
     "target_modules": ("q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj", "gate_proj"),
+}
+
+# 优化参数：保持训练执行逻辑不变，仅分组提升可读性。
+OPTIM_DEFAULTS: dict[str, Any] = {
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 8,
     "num_train_epochs": 3.0,
@@ -32,25 +44,41 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "weight_decay": 0.01,
     "logging_steps": 20,
     "save_steps": 100,
-    "eval_steps": 100,
     "max_steps": 0,
     "save_total_limit": 3,
+}
+
+# 验证与早停：按原样驱动 validation split 和 EarlyStoppingCallback。
+EVAL_DEFAULTS: dict[str, Any] = {
+    "eval_steps": 100,
     "eval_split_ratio": 0.05,
     "validation_split": True,
     "early_stopping_patience": 3,
     "early_stopping_threshold": 0.0,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": False,
+}
+
+# 运行环境：launcher 只读取 gpu_indices；check_only 用于数据快速检查。
+RUNTIME_DEFAULTS: dict[str, Any] = {
     "fp16": False,
     "bf16": False,
     "load_4bit": False,
     "disable_tqdm": False,
-    "log_jsonl_path": None,
-    "gpu_index": 0,
     "gpu_indices": "0,1",
     "check_only": False,
     "check_only_max_samples": 20,
     "train_test_seed": 777,
+}
+
+DEFAULT_CONFIG_PATH = "config/train_sft_lora.yml"
+DEFAULT_ARG_VALUES: dict[str, Any] = {
+    **PATH_DEFAULTS,
+    **DATA_DEFAULTS,
+    **LORA_DEFAULTS,
+    **OPTIM_DEFAULTS,
+    **EVAL_DEFAULTS,
+    **RUNTIME_DEFAULTS,
 }
 
 
@@ -93,7 +121,7 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config file with training arguments.")
     parser.add_argument("--model-path", default=defaults["model_path"], help="Path to the base model.")
     parser.add_argument("--data-root", default=defaults["data_root"], help="SFT trajectory directory.")
-    parser.add_argument("--output-dir", default=defaults["output_dir"], help="Output directory for checkpoints and adapters.")
+    parser.add_argument("--output-root", default=defaults["output_root"], help="Output root for timestamped SFT runs.")
     parser.add_argument("--system-prompt", default=defaults["system_prompt"], help="System prompt for training examples.")
     parser.add_argument("--max-length", type=int, default=defaults["max_length"], help="Max input length after prompt+target tokenization.")
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"], help="Optional original-sample cap for smoke tests.")
@@ -126,8 +154,6 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"], help="Use bf16.")
     parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"], help="Enable 4-bit quantized loading (requires bitsandbytes).")
     parser.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"], help="Disable tqdm progress bars.")
-    parser.add_argument("--log-jsonl-path", default=defaults["log_jsonl_path"], help="Path for JSONL training/eval metric logs.")
-    parser.add_argument("--gpu-index", type=int, default=defaults["gpu_index"], help="Single-GPU fallback index when gpu_indices is not used.")
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"], help="Comma-separated GPU indices exposed to the training process.")
     parser.add_argument("--check-only", action=BooleanOptionalAction, default=defaults["check_only"], help="Only validate data and print stats.")
     parser.add_argument("--check-only-max-samples", type=int, default=defaults["check_only_max_samples"], help="Max samples to display for checks.")
