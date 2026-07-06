@@ -5,10 +5,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
-DEFAULT_SYSTEM_PROMPT = (
-    "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
-)
+from prompt_config import DEFAULT_SYSTEM_PROMPT
 
 # 基础路径：模型、SFT 数据和运行输出根目录。
 PATH_DEFAULTS: dict[str, Any] = {

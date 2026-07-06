@@ -10,23 +10,17 @@ DEFAULT_CONFIG_PATH = "config/evaluate_rag_model.yml"
 
 DEFAULT_ARG_VALUES: dict[str, Any] = {
     # 基础路径：评估结果会写入 output_root/时间戳 目录。
-    "model_path": "model/Qwen2.5-3B-Instruct",
-    "adapter_path": "outputs/grpo_qwen2.5-3b/adapter",
     "data_root": "data/eval_1000",
     "data_files": (),
     "retrieval_root": "data/eval_1000_retrieval",
     "output_root": "outputs/eval_rag_model",
-    # 推理采样：top_k 控制模型采样候选 token，不控制检索段落数量。
+    # 推理采样。
     "max_samples": None,
     "max_rounds": 3,
     "max_prompt_length": 4096,
     "max_completion_length": 256,
     "temperature": 0.0,
     "top_p": 0.95,
-    "top_k": 5,
-    "bf16": False,
-    "fp16": False,
-    "load_4bit": True,
     "gpu_indices": "1",
     # 检索配置：retrieval_top_k 才是每次检索返回的段落数量。
     "retrieval_embedding_model": "sentence-transformers/all-mpnet-base-v2",
@@ -46,8 +40,7 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "judge_retries": 3,
     "judge_retry_sleep_seconds": 2.0,
     "judge_workers": 4,
-    # 推理后端：vLLM 用于并发服务，本地 HF 后端保留给单机适配器评估。
-    "inference_backend": "hf_local",
+    # 推理服务：评估端只调用 OpenAI-compatible vLLM 服务，模型加载由服务端配置负责。
     "vllm_base_urls": (),
     "vllm_model": "",
     "vllm_api_key_env": "",
@@ -94,8 +87,6 @@ def _defaults_from_config(config_path: str, *, explicit_config: bool) -> dict[st
 def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate a MACORAG SFT/RL adapter with the configured RAG loop.")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH, help="YAML config file.")
-    parser.add_argument("--model-path", default=defaults["model_path"])
-    parser.add_argument("--adapter-path", default=defaults["adapter_path"])
     parser.add_argument("--data-root", default=defaults["data_root"])
     parser.add_argument("--data-files", nargs="*", default=defaults["data_files"])
     parser.add_argument("--retrieval-root", default=defaults["retrieval_root"])
@@ -106,10 +97,6 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--max-completion-length", type=int, default=defaults["max_completion_length"])
     parser.add_argument("--temperature", type=float, default=defaults["temperature"])
     parser.add_argument("--top-p", type=float, default=defaults["top_p"])
-    parser.add_argument("--top-k", type=int, default=defaults["top_k"])
-    parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
-    parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"])
-    parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"])
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"])
     parser.add_argument("--retrieval-embedding-model", default=defaults["retrieval_embedding_model"])
     parser.add_argument("--retrieval-spacy-model", default=defaults["retrieval_spacy_model"])
@@ -127,7 +114,6 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--judge-retries", type=int, default=defaults["judge_retries"])
     parser.add_argument("--judge-retry-sleep-seconds", type=float, default=defaults["judge_retry_sleep_seconds"])
     parser.add_argument("--judge-workers", type=int, default=defaults["judge_workers"])
-    parser.add_argument("--inference-backend", choices=("hf_local", "vllm_openai"), default=defaults["inference_backend"])
     parser.add_argument("--vllm-base-urls", nargs="*", default=defaults["vllm_base_urls"])
     parser.add_argument("--vllm-model", default=defaults["vllm_model"])
     parser.add_argument("--vllm-api-key-env", default=defaults["vllm_api_key_env"])

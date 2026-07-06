@@ -172,6 +172,28 @@ def print_dry_run(commands: list[tuple[str, dict[str, str], list[str]]]) -> None
         print(f"{' '.join(env_parts)} {shlex.join(argv)}")
 
 
+def _argv_value(argv: list[str], option: str, default: str = "") -> str:
+    try:
+        index = argv.index(option)
+    except ValueError:
+        return default
+    value_index = index + 1
+    if value_index >= len(argv):
+        return default
+    return str(argv[value_index])
+
+
+def _command_model(argv: list[str]) -> str:
+    try:
+        serve_index = argv.index("serve")
+    except ValueError:
+        return ""
+    model_index = serve_index + 1
+    if model_index >= len(argv):
+        return ""
+    return str(argv[model_index])
+
+
 def run_commands(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
     """启动多个 vLLM 服务，并在收到退出信号时统一终止子进程。"""
     processes: list[subprocess.Popen] = []
@@ -184,15 +206,26 @@ def run_commands(commands: list[tuple[str, dict[str, str], list[str]]]) -> None:
     signal.signal(signal.SIGINT, stop_processes)
     signal.signal(signal.SIGTERM, stop_processes)
 
-    for gpu_index, extra_env, argv in commands:
+    total = len(commands)
+    for index, (gpu_index, extra_env, argv) in enumerate(commands):
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = gpu_index
         env.update(extra_env)
+        port = _argv_value(argv, "--port", "unknown")
+        model = _command_model(argv)
+        print(
+            f"[eval-vllm] starting server {index + 1}/{total} "
+            f"gpu={gpu_index} port={port} model={model}",
+            flush=True,
+        )
         processes.append(subprocess.Popen(argv, env=env))
 
     exit_code = 0
     for process in processes:
-        exit_code = max(exit_code, process.wait())
+        process_exit_code = process.wait()
+        if process_exit_code != 0:
+            print(f"[eval-vllm] server exited with code {process_exit_code}", flush=True)
+        exit_code = max(exit_code, process_exit_code)
     raise SystemExit(exit_code)
 
 

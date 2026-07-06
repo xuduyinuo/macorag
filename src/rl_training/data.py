@@ -112,9 +112,10 @@ def load_rl_samples(
             if sample is None:
                 skipped += 1
                 continue
-            if max_samples is None or len(samples) < max_samples:
+            dataset_count = counts_by_dataset.get(sample.dataset, 0)
+            if max_samples is None or dataset_count < max_samples:
                 samples.append(sample)
-                counts_by_dataset[sample.dataset] = counts_by_dataset.get(sample.dataset, 0) + 1
+                counts_by_dataset[sample.dataset] = dataset_count + 1
 
     if not samples:
         raise ValueError(f"No valid RL samples found in {root}")
@@ -125,5 +126,6 @@ def load_rl_samples(
         "skipped_samples": skipped,
         "counts_by_dataset": counts_by_dataset,
         "max_samples": max_samples,
+        "max_samples_per_dataset": max_samples,
     }
     return samples, summary

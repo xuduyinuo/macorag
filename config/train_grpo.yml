@@ -1,15 +1,15 @@
 # 基础路径
 # output_root 是保存根目录；每次 RL 训练会自动写入 output_root/YYYY-MM-DD_HH-MM-SS/。
 model_path: "model/Qwen2.5-7B-Instruct"
-sft_adapter_path: "outputs/lora_qwen2.5-7b_trajectory_20260627_203027/adapter"
-rl_data_root: "data/rl_train_100"
-retrieval_root: "data/rl_train_100_retrieval"
+sft_adapter_path: "outputs/sft_qwen2.5-7b-instruct/2026-07-02_15-07-02/adapter"
+rl_data_root: "data/rl_train_2000"
+retrieval_root: "data/rl_train_2000_retrieval"
 output_root: "outputs/grpo_qwen2.5-7b"
 
 # rollout 与采样
-# 这些参数是调参时最常改的行为开关：轮数、组大小、步数、生成长度和采样温度。
-max_samples: null
-max_rounds: 3
+# 这些参数是调参时最常改的行为开关：每个数据集最多样本数、轮数、组大小、步数、生成长度和采样温度。
+max_samples: 500
+max_rounds: 4
 group_size: 4
 num_train_epochs: 1.0
 max_steps: 0 # 0 表示不限制步数

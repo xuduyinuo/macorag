@@ -10,7 +10,7 @@ export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:T
 
 cd "${REPO_ROOT}"
 
-CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_sft_lora.yml}"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/train_sft.yml}"
 
 read -r YAML_GPU_INDICES YAML_NPROC_PER_NODE < <(
   "${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'

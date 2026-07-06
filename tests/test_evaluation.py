@@ -15,13 +15,11 @@ from rag import RAGState
 from evaluation.config import parse_args
 from evaluation.data import EvalSample, load_eval_samples
 from evaluation.output import make_run_dir
-from evaluation.vllm_servers import build_commands, parse_args as parse_vllm_server_args
+from evaluation.vllm_servers import build_commands, parse_args as parse_vllm_server_args, run_commands
 from evaluation.evaluate_rag_model import (
     _build_retrieval_env,
     _configure_visible_gpus,
     _load_policy,
-    _model_kwargs,
-    _torch_dtype,
     VLLMOpenAIPolicy,
     format_prediction,
     main,
@@ -29,7 +27,13 @@ from evaluation.evaluate_rag_model import (
 )
 
 
-from evaluation.bailian_evaluator import calculate_contain, calculate_llm_accuracy, evaluate_predictions
+from evaluation.bailian_evaluator import (
+    calculate_contain,
+    calculate_exact_match,
+    calculate_f1,
+    calculate_llm_accuracy,
+    evaluate_predictions,
+)
 
 
 def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> str:
@@ -37,7 +41,7 @@ def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> s
     env["CONFIG_PATH"] = str(config_path)
     env["MACORAG_EVAL_DRY_RUN"] = "1"
     result = subprocess.run(
-        ["bash", "scripts/evaluate_rag_model.sh", *extra_args],
+        ["bash", "scripts/eval_macorag.sh", *extra_args],
         check=True,
         capture_output=True,
         text=True,
@@ -48,7 +52,7 @@ def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> s
 
 
 def test_evaluate_shell_script_derives_gpu_visibility_from_yaml() -> None:
-    script = Path("scripts/evaluate_rag_model.sh").read_text(encoding="utf-8")
+    script = Path("scripts/eval_macorag.sh").read_text(encoding="utf-8")
 
     assert "CONFIG_PATH=" in script
     assert 'ENV_FILE="${REPO_ROOT}/.env"' in script
@@ -101,7 +105,7 @@ def test_model_vllm_server_config_file_exists() -> None:
 
     text = config.read_text(encoding="utf-8")
 
-    assert 'vllm_bin: "/data/conda/envs/vllm/bin/vllm"' in text
+    assert 'vllm_bin: "/data/conda/envs/macorag/bin/vllm"' in text
     assert 'model_path: "model/Qwen2.5-7B-Instruct"' in text
     assert "adapter_path:" in text
     assert "vllm_model:" in text
@@ -109,9 +113,23 @@ def test_model_vllm_server_config_file_exists() -> None:
     assert "vllm_base_urls:" in text
     assert "max_model_len:" in text
     assert "max_model_len: null" not in text
+    assert "gpu_memory_utilization: 0.85" in text
+    assert '--disable-log-requests' in text
     assert "host:" not in text
     assert "trust_remote_code:" not in text
     assert "environment:" not in text
+
+
+def test_eval_macorag_config_is_vllm_client_only() -> None:
+    text = Path("config/eval_macorag.yml").read_text(encoding="utf-8")
+    eval_args = parse_args(["--config", "config/eval_macorag.yml"])
+
+    assert "model_path:" not in text
+    assert "adapter_path:" not in text
+    assert "inference_backend:" not in text
+    assert not hasattr(eval_args, "model_path")
+    assert not hasattr(eval_args, "adapter_path")
+    assert not hasattr(eval_args, "inference_backend")
 
 
 def test_vllm_server_module_builds_commands_from_config_and_cli(tmp_path: Path) -> None:
@@ -274,6 +292,39 @@ def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path
     assert "--lora-modules" not in result.stdout
 
 
+def test_vllm_server_run_commands_leaves_process_output_on_console(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class FakeProcess:
+        def poll(self) -> int | None:
+            return 0
+
+        def wait(self) -> int:
+            return 0
+
+    def fake_popen(argv, *, env):
+        calls.append({"argv": argv, "env": env})
+        return FakeProcess()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    commands = [
+        (
+            "2",
+            {"VLLM_ATTENTION_BACKEND": "FLASH_ATTN"},
+            ["/opt/vllm/bin/vllm", "serve", "model/base", "--port", "8100"],
+        )
+    ]
+
+    with pytest.raises(SystemExit) as exc:
+        run_commands(commands)
+
+    assert exc.value.code == 0
+    assert calls[0]["argv"] == ["/opt/vllm/bin/vllm", "serve", "model/base", "--port", "8100"]
+    assert calls[0]["env"]["CUDA_VISIBLE_DEVICES"] == "2"
+    assert calls[0]["env"]["VLLM_ATTENTION_BACKEND"] == "FLASH_ATTN"
+
+
 def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pytest.MonkeyPatch) -> None:
     args = SimpleNamespace(gpu_indices="1")
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
@@ -361,14 +412,14 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    captured: dict[str, object] = {}
+    captured: dict[str, object] = {"prediction_dirs": [], "evaluation_paths": []}
 
     class FakeJudgeClient:
         def __init__(self, **kwargs) -> None:
             captured["judge_client_kwargs"] = kwargs
 
     def fake_evaluate_predictions(predictions_path: Path, *, client, max_workers: int, judge_metadata=None):
-        captured["predictions_path"] = predictions_path
+        captured["evaluation_paths"].append(predictions_path)
         captured["client"] = client
         captured["max_workers"] = max_workers
         captured["judge_metadata"] = judge_metadata
@@ -418,14 +469,36 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
     monkeypatch.setattr("evaluation.evaluate_rag_model._configure_visible_gpus", lambda parsed_args: None)
     monkeypatch.setattr("evaluation.evaluate_rag_model._resolved_output_dir", lambda parsed_args: tmp_path / "eval_run")
-    monkeypatch.setattr("evaluation.evaluate_rag_model.load_eval_samples", lambda **kwargs: ([], {"loaded_samples": 0}))
+    samples = [
+        EvalSample("h1", "hotpotqa", "Question h?", "Answer h", [], [], {}),
+        EvalSample("m1", "musique", "Question m?", "Answer m", [], [], {}),
+    ]
+    monkeypatch.setattr(
+        "evaluation.evaluate_rag_model.load_eval_samples",
+        lambda **kwargs: (samples, {"loaded_samples": 2}),
+    )
     monkeypatch.setattr("evaluation.evaluate_rag_model._load_policy", lambda parsed_args: object())
     monkeypatch.setattr("evaluation.evaluate_rag_model._build_retrieval_env", lambda parsed_args: object())
-    monkeypatch.setattr("evaluation.evaluate_rag_model.run_predictions", lambda *args, **kwargs: [])
+
+    def fake_run_predictions(parsed_args, dataset_samples, policy, retrieval_env, output_dir):
+        captured["prediction_dirs"].append((output_dir, [sample.qid for sample in dataset_samples]))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "predictions.jsonl").write_text("{}", encoding="utf-8")
+        return []
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model.run_predictions", fake_run_predictions)
     monkeypatch.setattr("evaluation.evaluate_rag_model.BailianJudgeClient", FakeJudgeClient)
     monkeypatch.setattr("evaluation.evaluate_rag_model.evaluate_predictions", fake_evaluate_predictions)
 
     assert main([]) == 0
+    assert captured["prediction_dirs"] == [
+        (tmp_path / "eval_run" / "hotpotqa", ["h1"]),
+        (tmp_path / "eval_run" / "musique", ["m1"]),
+    ]
+    assert captured["evaluation_paths"] == [
+        tmp_path / "eval_run" / "hotpotqa" / "predictions.jsonl",
+        tmp_path / "eval_run" / "musique" / "predictions.jsonl",
+    ]
     assert captured["judge_metadata"] == {
         "judge_model": "qwen-plus",
         "judge_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
@@ -440,50 +513,11 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     assert captured["max_workers"] == 4
 
 
-def test_evaluate_torch_dtype_uses_float32_on_cpu_when_no_precision_flag_is_set() -> None:
-    fake_torch = SimpleNamespace(
-        cuda=SimpleNamespace(is_available=lambda: False),
-        float16="float16",
-        float32="float32",
-        bfloat16="bfloat16",
-    )
-    args = SimpleNamespace(fp16=False, bf16=False)
-
-    assert _torch_dtype(args, fake_torch) == fake_torch.float32
-
-
-def test_evaluate_model_kwargs_skips_4bit_quantization_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
-    class FakeBitsAndBytesConfig:
-        def __init__(self, **kwargs) -> None:
-            self.kwargs = kwargs
-
-    fake_transformers = SimpleNamespace(BitsAndBytesConfig=FakeBitsAndBytesConfig)
-    fake_bitsandbytes = SimpleNamespace()
-    fake_torch = SimpleNamespace(
-        cuda=SimpleNamespace(is_available=lambda: False),
-        float16="float16",
-        float32="float32",
-        bfloat16="bfloat16",
-    )
-    args = SimpleNamespace(load_4bit=True, bf16=False, fp16=False)
-
-    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
-    monkeypatch.setitem(sys.modules, "bitsandbytes", fake_bitsandbytes)
-
-    kwargs = _model_kwargs(args, fake_torch)
-
-    assert kwargs["torch_dtype"] == fake_torch.float32
-    assert "quantization_config" not in kwargs
-    assert "device_map" not in kwargs
-
-
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
     config = tmp_path / "evaluate_rag_model.yml"
     config.write_text(
         "\n".join(
             [
-                'model_path: "model/base"',
-                'adapter_path: "outputs/grpo/adapter"',
                 'data_root: "data/eval_1000"',
                 'retrieval_root: "data/eval_1000_retrieval"',
                 'output_root: "outputs/eval"',
@@ -501,8 +535,6 @@ def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
 
     args = parse_args(["--config", str(config), "--max-samples", "3", "--skip-judge"])
 
-    assert args.model_path == "model/base"
-    assert args.adapter_path == "outputs/grpo/adapter"
     assert args.data_root == "data/eval_1000"
     assert args.retrieval_root == "data/eval_1000_retrieval"
     assert args.output_root == "outputs/eval"
@@ -520,7 +552,6 @@ def test_parse_eval_config_loads_vllm_backend_fields(tmp_path: Path) -> None:
     config.write_text(
         "\n".join(
             [
-                'inference_backend: "vllm_openai"',
                 "vllm_base_urls:",
                 '  - "http://127.0.0.1:8000/v1"',
                 '  - "http://127.0.0.1:8001/v1"',
@@ -537,7 +568,6 @@ def test_parse_eval_config_loads_vllm_backend_fields(tmp_path: Path) -> None:
 
     args = parse_args(["--config", str(config), "--eval-request-workers", "4"])
 
-    assert args.inference_backend == "vllm_openai"
     assert args.vllm_base_urls == ["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"]
     assert args.vllm_model == "macorag-lora"
     assert args.vllm_api_key_env == ""
@@ -555,7 +585,10 @@ def test_parse_eval_config_rejects_unknown_yaml_keys(tmp_path: Path) -> None:
         parse_args(["--config", str(config)])
 
 
-@pytest.mark.parametrize("removed_key", ["output_dir", "fixed_output_dir", "gpu_index", "seed", "system_prompt", "disable_tqdm"])
+@pytest.mark.parametrize(
+    "removed_key",
+    ["output_dir", "fixed_output_dir", "gpu_index", "seed", "system_prompt", "disable_tqdm", "top_k"],
+)
 def test_parse_eval_config_rejects_removed_yaml_keys(tmp_path: Path, removed_key: str) -> None:
     config = tmp_path / "evaluate_rag_model.yml"
     config.write_text(f"{removed_key}: old\n", encoding="utf-8")
@@ -755,54 +788,63 @@ def test_bailian_evaluator_maps_correct_response_and_contain_accuracy() -> None:
 
     assert llm_acc == 1.0
     assert calculate_contain("The answer is David Arquette.", "David Arquette") == 1
+    assert calculate_contain("London", "London, England, United Kingdom") == 1
     assert calculate_contain("The answer is Wes Craven.", "David Arquette") == 0
+    assert calculate_exact_match("The David Arquette", "David Arquette") == 1
+    assert calculate_exact_match("London", "London, England") == 0
+    assert calculate_f1("London", "London, England") == pytest.approx(2 / 3)
+    assert calculate_f1("David Arquette", "David Arquette") == 1.0
+    assert calculate_f1("", "David Arquette") == 0.0
     assert "Respond with ONLY 'correct' or 'incorrect'." in client.messages[0][1]["content"]
 
 
-def test_evaluate_predictions_updates_prediction_file_and_summary(tmp_path: Path) -> None:
-    predictions_path = tmp_path / "predictions.json"
-    predictions_path.write_text(
-        json.dumps(
-            [
+def test_evaluate_predictions_reads_jsonl_and_writes_summary_without_rewriting_predictions(tmp_path: Path) -> None:
+    predictions_path = tmp_path / "predictions.jsonl"
+    original_text = "\n".join(
+        [
+            json.dumps(
                 {"qid": "q1", "dataset": "hotpotqa", "pred_answer": "David Arquette", "gold_answer": "David Arquette"},
-                {"qid": "q2", "dataset": "musique", "pred_answer": "wrong", "gold_answer": "Right"},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {"qid": "q2", "dataset": "hotpotqa", "pred_answer": "wrong", "gold_answer": "Right"},
+                ensure_ascii=False,
+            ),
+            json.dumps(
                 {"qid": "q3", "dataset": "hotpotqa", "pred_answer": "Right", "gold_answer": "Right"},
-            ],
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
+                ensure_ascii=False,
+            ),
+            "",
+        ]
     )
+    predictions_path.write_text(original_text, encoding="utf-8")
     client = FakeJudgeClient(["correct", "incorrect", "correct"])
 
     summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
 
-    updated = json.loads(predictions_path.read_text(encoding="utf-8"))
     assert summary["llm_accuracy"] == pytest.approx(2 / 3)
     assert summary["contain_accuracy"] == pytest.approx(2 / 3)
+    assert summary["exact_match"] == pytest.approx(2 / 3)
+    assert summary["f1"] == pytest.approx(2 / 3)
     assert summary["num_samples"] == 3
-    assert summary["by_dataset"] == {
-        "hotpotqa": {"llm_accuracy": 1.0, "contain_accuracy": 1.0, "num_samples": 2},
-        "musique": {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 1},
-    }
-    assert updated[0]["llm_accuracy"] == 1.0
-    assert updated[1]["llm_accuracy"] == 0.0
-    assert updated[2]["llm_accuracy"] == 1.0
-    assert (tmp_path / "evaluation_results.json").exists()
-    hotpotqa_predictions = json.loads((tmp_path / "predictions_hotpotqa.json").read_text(encoding="utf-8"))
-    musique_predictions = json.loads((tmp_path / "predictions_musique.json").read_text(encoding="utf-8"))
-    assert [item["qid"] for item in hotpotqa_predictions] == ["q1", "q3"]
-    assert [item["qid"] for item in musique_predictions] == ["q2"]
+    assert predictions_path.read_text(encoding="utf-8") == original_text
+    evaluation_results = json.loads((tmp_path / "evaluation_results.json").read_text(encoding="utf-8"))
+    assert evaluation_results["llm_accuracy"] == pytest.approx(2 / 3)
+    assert evaluation_results["contain_accuracy"] == pytest.approx(2 / 3)
+    assert evaluation_results["exact_match"] == pytest.approx(2 / 3)
+    assert evaluation_results["f1"] == pytest.approx(2 / 3)
+    assert not (tmp_path / "predictions.json").exists()
 
 
 def test_evaluate_predictions_preserves_falsy_answers(tmp_path: Path) -> None:
-    predictions_path = tmp_path / "predictions.json"
+    predictions_path = tmp_path / "predictions.jsonl"
     predictions_path.write_text(
-        json.dumps(
+        "\n".join(
             [
-                {"qid": "q0", "pred_answer": 0, "gold_answer": 0},
-                {"qid": "q1", "pred_answer": False, "gold_answer": False},
-            ],
-            ensure_ascii=False,
+                json.dumps({"qid": "q0", "pred_answer": 0, "gold_answer": 0}, ensure_ascii=False),
+                json.dumps({"qid": "q1", "pred_answer": False, "gold_answer": False}, ensure_ascii=False),
+                "",
+            ]
         ),
         encoding="utf-8",
     )
@@ -810,10 +852,7 @@ def test_evaluate_predictions_preserves_falsy_answers(tmp_path: Path) -> None:
 
     summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
 
-    updated = json.loads(predictions_path.read_text(encoding="utf-8"))
     assert summary["contain_accuracy"] == 1.0
-    assert updated[0]["contain_accuracy"] == 1
-    assert updated[1]["contain_accuracy"] == 1
 
 
 class _FakeHTTPResponse:
@@ -876,6 +915,7 @@ def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPat
         model="macorag-lora",
         api_key_env="",
         system_prompt="sys",
+        max_prompt_length=128,
         max_completion_length=32,
         temperature=0.0,
         top_p=0.95,
@@ -898,6 +938,7 @@ def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPat
     assert payload["temperature"] == 0.0
     assert payload["top_p"] == 0.95
     assert payload["max_tokens"] == 32
+    assert payload["truncate_prompt_tokens"] == 128
     assert response == '<answer>{"can_answer": true}</answer>'
 
 
@@ -914,6 +955,7 @@ def test_vllm_policy_round_robins_base_urls(monkeypatch: pytest.MonkeyPatch) -> 
         model="macorag-lora",
         api_key_env="",
         system_prompt="sys",
+        max_prompt_length=128,
         max_completion_length=16,
         temperature=0.0,
         top_p=0.95,
@@ -1013,10 +1055,10 @@ def test_run_predictions_flushes_jsonl_progress(tmp_path: Path, monkeypatch: pyt
     predictions = run_predictions(args, [sample], FakePolicy(), FakeRetrievalEnv(), tmp_path)
 
     assert predictions[0]["pred_answer"] == "Answer"
-    assert json.loads((tmp_path / "predictions.json").read_text(encoding="utf-8"))[0]["qid"] == "q1"
     progress_lines = (tmp_path / "predictions.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(progress_lines) == 1
     assert json.loads(progress_lines[0])["qid"] == "q1"
+    assert not (tmp_path / "predictions.json").exists()
 
 
 def test_run_predictions_truncates_stale_progress_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1129,9 +1171,8 @@ def test_run_predictions_re_raises_vllm_service_errors(tmp_path: Path, monkeypat
     assert not (tmp_path / "predictions.jsonl").exists()
 
 
-def test_load_policy_uses_vllm_without_loading_local_model(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_policy_uses_vllm_without_loading_local_model() -> None:
     args = SimpleNamespace(
-        inference_backend="vllm_openai",
         vllm_base_urls=["http://127.0.0.1:8000/v1"],
         vllm_model="macorag-lora",
         vllm_api_key_env="",
@@ -1144,26 +1185,13 @@ def test_load_policy_uses_vllm_without_loading_local_model(monkeypatch: pytest.M
         vllm_retry_sleep_seconds=0.0,
     )
 
-    def fail_load_dependencies() -> None:
-        raise AssertionError("local model dependencies should not load for vllm_openai")
-
-    monkeypatch.setattr("evaluation.evaluate_rag_model._load_dependencies", fail_load_dependencies)
-
     policy = _load_policy(args)
 
     assert isinstance(policy, VLLMOpenAIPolicy)
 
 
-def test_load_policy_rejects_invalid_backend() -> None:
-    args = SimpleNamespace(inference_backend="bad")
-
-    with pytest.raises(SystemExit, match="Unsupported inference_backend"):
-        _load_policy(args)
-
-
 def test_load_policy_rejects_vllm_without_base_urls() -> None:
     args = SimpleNamespace(
-        inference_backend="vllm_openai",
         vllm_base_urls=[],
         vllm_model="macorag-lora",
         vllm_api_key_env="",
@@ -1180,12 +1208,15 @@ def test_load_policy_rejects_vllm_without_base_urls() -> None:
         _load_policy(args)
 
 
-def test_run_predictions_uses_threads_for_vllm_backend(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_run_predictions_uses_threads_when_multiple_eval_workers_are_configured(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     samples = [
         EvalSample("q1", "hotpotqa", "Question 1?", "Answer 1", [], [], {}),
         EvalSample("q2", "hotpotqa", "Question 2?", "Answer 2", [], [], {}),
     ]
-    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, inference_backend="vllm_openai", eval_request_workers=2)
+    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, eval_request_workers=2)
     entered = threading.Barrier(2, timeout=5)
     thread_names: set[str] = set()
 
@@ -1209,37 +1240,8 @@ def test_run_predictions_uses_threads_for_vllm_backend(tmp_path: Path, monkeypat
 
     assert [item["qid"] for item in predictions] == ["q1", "q2"]
     assert len(thread_names) == 2
-    assert [item["qid"] for item in json.loads((tmp_path / "predictions.json").read_text(encoding="utf-8"))] == ["q1", "q2"]
     assert len((tmp_path / "predictions.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 2
-
-
-def test_run_predictions_keeps_hf_backend_sequential(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    samples = [
-        EvalSample("q1", "hotpotqa", "Question 1?", "Answer 1", [], [], {}),
-        EvalSample("q2", "hotpotqa", "Question 2?", "Answer 2", [], [], {}),
-    ]
-    args = SimpleNamespace(max_rounds=1, disable_tqdm=True, inference_backend="hf_local", eval_request_workers=2)
-    thread_names: list[str] = []
-
-    class FakeExecutor:
-        def __init__(self, *, policy, retrieval_env, max_rounds: int) -> None:
-            self.max_rounds = max_rounds
-
-        def run(self, *, question: str, dataset: str):
-            thread_names.append(threading.current_thread().name)
-            return SimpleNamespace(
-                final_answer="Answer",
-                trajectory=[{"question": question}],
-                parse_errors=[],
-                state=SimpleNamespace(retrieval_count=0),
-            )
-
-    monkeypatch.setattr("evaluation.evaluate_rag_model.RAGLoopExecutor", FakeExecutor)
-
-    predictions = run_predictions(args, samples, FakePolicy(), FakeRetrievalEnv(), tmp_path)
-
-    assert [item["qid"] for item in predictions] == ["q1", "q2"]
-    assert thread_names == ["MainThread", "MainThread"]
+    assert not (tmp_path / "predictions.json").exists()
 
 
 def test_main_validates_retrieval_assets_before_loading_model(

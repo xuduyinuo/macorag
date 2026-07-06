@@ -1,0 +1,1 @@
+system_prompt: "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."

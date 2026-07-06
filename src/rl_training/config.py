@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from prompt_config import DEFAULT_SYSTEM_PROMPT
+
 
 DEFAULT_CONFIG_PATH = "config/train_grpo.yml"
 
@@ -20,7 +22,7 @@ PATH_DEFAULTS: dict[str, Any] = {
 
 # rollout 与采样：控制每个样本的 RAG 交互轮数、组内采样数和生成截断。
 ROLLOUT_DEFAULTS: dict[str, Any] = {
-    "system_prompt": "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON.",
+    "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_samples": None,
     "seed": 42,
     "max_rounds": 3,

@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from rag import AgentRole, RAGState
+from prompt_config import load_system_prompt
 from rl_training.config import parse_args
 from rl_training.data import load_rl_samples
 from rl_training.policy import HFSharedPolicy
@@ -71,6 +72,12 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.gradient_accumulation_steps == 2
     assert args.gpu_indices == "0,1"
     assert args.disable_tqdm is False
+
+
+def test_rl_default_system_prompt_comes_from_shared_prompt_file() -> None:
+    args = parse_args(["--config", "config/train_grpo.yml", "--max-samples", "1"])
+
+    assert args.system_prompt == load_system_prompt()
 
 
 def test_parse_args_supports_output_root(tmp_path: Path) -> None:
@@ -1183,6 +1190,55 @@ def test_load_rl_samples_reads_existing_extracted_files(tmp_path: Path) -> None:
     assert summary["counts_by_dataset"] == {"hotpotqa": 1}
 
 
+def test_load_rl_samples_limits_max_samples_per_dataset(tmp_path: Path) -> None:
+    data_root = tmp_path / "rl"
+    _write_jsonl(
+        data_root / "hotpotqa_train.jsonl",
+        [
+            {
+                "qid": "h1",
+                "dataset": "hotpotqa",
+                "question": "Question h1?",
+                "answer": "Answer h1",
+                "supporting_facts": [{"title": "h", "text": "Answer h1"}],
+            },
+            {
+                "qid": "h2",
+                "dataset": "hotpotqa",
+                "question": "Question h2?",
+                "answer": "Answer h2",
+                "supporting_facts": [{"title": "h", "text": "Answer h2"}],
+            },
+        ],
+    )
+    _write_jsonl(
+        data_root / "musique_train.jsonl",
+        [
+            {
+                "qid": "m1",
+                "dataset": "musique",
+                "question": "Question m1?",
+                "answer": "Answer m1",
+                "supporting_facts": [{"title": "m", "text": "Answer m1"}],
+            },
+            {
+                "qid": "m2",
+                "dataset": "musique",
+                "question": "Question m2?",
+                "answer": "Answer m2",
+                "supporting_facts": [{"title": "m", "text": "Answer m2"}],
+            },
+        ],
+    )
+
+    samples, summary = load_rl_samples(data_root=data_root, data_files=[], max_samples=1)
+
+    assert [sample.qid for sample in samples] == ["h1", "m1"]
+    assert summary["loaded_samples"] == 2
+    assert summary["counts_by_dataset"] == {"hotpotqa": 1, "musique": 1}
+    assert summary["max_samples"] == 1
+
+
 def test_load_rl_samples_default_files_ignore_corpus_jsonl(tmp_path: Path) -> None:
     data_root = tmp_path / "rl"
     _write_jsonl(
@@ -1295,8 +1351,64 @@ def test_compute_rl_rewards_scores_query_evidence_and_final_answer() -> None:
     assert rewards["query_reward"] > 0.0
     assert rewards["evidence_reward"] > 0.0
     assert rewards["answer_f1"] == 1.0
-    assert rewards["answer_reward"] == 1.0
-    assert rewards["total"] > 2.0
+    assert rewards["answer_reward"] == 2.0
+    assert rewards["support_coverage"] == 1.0
+    assert rewards["retrieval_hit_reward"] == 0.5
+    assert rewards["total"] > 3.0
+
+
+def test_compute_rl_rewards_caps_duplicate_support_evidence_and_penalizes_repeated_queries() -> None:
+    rollout = {
+        "trajectory": [
+            {
+                "query_retriever": {"sub_goal": "find director", "query": "Bullitt film director"},
+                "observation": {
+                    "passages": [
+                        {
+                            "passage_id": 0,
+                            "doc_id": "d1",
+                            "title": "Bullitt",
+                            "text": "Bullitt was directed by Peter Yates.",
+                        }
+                    ]
+                },
+                "update_evidence": {"selected_passage_ids": [0]},
+                "answer": {"can_answer": False, "answer": None},
+            },
+            {
+                "query_retriever": {"sub_goal": "find director again", "query": "Bullitt film director"},
+                "observation": {
+                    "passages": [
+                        {
+                            "passage_id": 0,
+                            "doc_id": "d1",
+                            "title": "Bullitt",
+                            "text": "Bullitt was directed by Peter Yates.",
+                        }
+                    ]
+                },
+                "update_evidence": {"selected_passage_ids": [0]},
+                "answer": {"can_answer": True, "answer": "Peter Yates"},
+            },
+        ],
+        "parse_errors": [],
+        "final_answer": "Peter Yates",
+    }
+    sample = {
+        "answer": "Peter Yates",
+        "answer_aliases": [],
+        "supporting_facts": [
+            {"doc_id": "d1", "title": "Bullitt", "text": "Bullitt was directed by Peter Yates."}
+        ],
+    }
+
+    rewards = compute_rl_rewards(rollout=rollout, sample=sample)
+
+    assert rewards["support_facts_covered"] == 1.0
+    assert rewards["support_coverage"] == 1.0
+    assert rewards["evidence_reward"] == 1.0
+    assert rewards["repeated_query_penalty"] == -0.2
+    assert rewards["retrieval_cost"] == -0.2
 
 
 def test_compute_rl_rewards_penalizes_wrong_premature_multihop_answer() -> None:
@@ -1339,7 +1451,51 @@ def test_compute_rl_rewards_penalizes_wrong_premature_multihop_answer() -> None:
     assert rewards["answer_f1"] == 0.0
     assert rewards["support_facts_required"] == 2.0
     assert rewards["support_facts_covered"] == 1.0
+    assert rewards["support_coverage"] == 0.5
     assert rewards["premature_answer_penalty"] == -1.0
+
+
+def test_compute_rl_rewards_discounts_correct_answer_with_incomplete_support() -> None:
+    rollout = {
+        "trajectory": [
+            {
+                "query_retriever": {"sub_goal": "find director", "query": "Bullitt film director"},
+                "observation": {
+                    "passages": [
+                        {
+                            "passage_id": 0,
+                            "doc_id": "d1",
+                            "title": "Bullitt",
+                            "text": "Bullitt was directed by Peter Yates.",
+                        }
+                    ]
+                },
+                "update_evidence": {"selected_passage_ids": [0]},
+                "answer": {"can_answer": True, "answer": "Aldershot"},
+            }
+        ],
+        "parse_errors": [],
+        "final_answer": "Aldershot",
+    }
+    sample = {
+        "answer": "Aldershot",
+        "answer_aliases": [],
+        "supporting_facts": [
+            {"doc_id": "d1", "title": "Bullitt", "text": "Bullitt was directed by Peter Yates."},
+            {
+                "doc_id": "d2",
+                "title": "Peter Yates",
+                "text": "Peter Yates was born in Aldershot, Hampshire.",
+            },
+        ],
+    }
+
+    rewards = compute_rl_rewards(rollout=rollout, sample=sample)
+
+    assert rewards["answer_f1"] == 1.0
+    assert rewards["support_coverage"] == 0.5
+    assert rewards["premature_answer_penalty"] == -0.25
+    assert rewards["total"] < 3.5
 
 
 def test_compute_rl_rewards_does_not_penalize_correct_or_sufficient_multihop_answer() -> None:

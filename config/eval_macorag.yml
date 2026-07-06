@@ -1,20 +1,18 @@
-# 基础路径：每次评估会自动写入 output_root/时间戳 目录。
-model_path: "model/Qwen2.5-7B-Instruct"
+# 基础路径：每次评估会自动写入 output_root/时间戳 目录。模型由 vLLM 服务端配置加载。
 data_root: "data/eval_1000"
-data_files: [2wiki]
+data_files: []
 retrieval_root: "data/eval_1000_retrieval"
-output_root: "outputs/eval_rag_model"
+output_root: "outputs/eval"
 
 # 样本与 RAG 轮次。
 max_samples: null
-max_rounds: 3
+max_rounds: 4
 
-# 生成采样参数：top_k 是模型 token 采样候选数，不是检索段落数量。
+# 生成采样参数。
 max_prompt_length: 4096
 max_completion_length: 256
-temperature: 0.0
+temperature: 0.2
 top_p: 0.95
-top_k: 5
 
 # 检索参数：retrieval_top_k 控制每次检索返回的段落数量。
 retrieval_embedding_model: "sentence-transformers/all-mpnet-base-v2"
@@ -29,8 +27,7 @@ skip_judge: false
 judge_model: "qwen-plus"
 judge_workers: 4
 
-# 推理后端。
-inference_backend: "vllm_openai"
+# vLLM 推理服务。
 vllm_base_urls:
   - "http://127.0.0.1:8000/v1"
 vllm_model: "macorag"

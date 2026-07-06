@@ -13,6 +13,7 @@ from sft_training.train_sft_lora_macorag import (
     parse_args,
     trajectory_to_sft_records,
 )
+from prompt_config import load_system_prompt
 from sft_training.data import (
     TrainingSample,
     flatten_training_samples,
@@ -181,6 +182,12 @@ def test_parse_args_loads_yaml_config(tmp_path) -> None:
     assert args.load_4bit is True
     assert args.disable_tqdm is False
     assert args.gpu_indices == "0,1"
+
+
+def test_sft_default_system_prompt_comes_from_shared_prompt_file() -> None:
+    args = parse_args(["--config", "config/train_sft.yml", "--max-samples", "1"])
+
+    assert args.system_prompt == load_system_prompt()
 
 
 def test_parse_args_rejects_removed_output_and_log_keys(tmp_path) -> None:
@@ -384,7 +391,7 @@ def test_run_dir_uses_output_root_child_timestamp() -> None:
 def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:
     import yaml
 
-    config = yaml.safe_load(Path("config/train_sft_lora.yml").read_text(encoding="utf-8"))
+    config = yaml.safe_load(Path("config/train_sft.yml").read_text(encoding="utf-8"))
 
     for key in [
         "model_path",
@@ -499,7 +506,7 @@ def test_ordered_trainer_train_sampler_accepts_transformers_dataset_argument() -
 
 
 def test_training_shell_script_derives_gpu_visibility_from_yaml() -> None:
-    script = Path("scripts/run_train_sft_lora_gpu1.sh").read_text(encoding="utf-8")
+    script = Path("scripts/run_train_sft.sh").read_text(encoding="utf-8")
 
     assert 'CUDA_VISIBLE_DEVICES="0,1"' not in script
     assert "yaml.safe_load" in script

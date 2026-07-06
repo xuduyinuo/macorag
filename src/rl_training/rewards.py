@@ -125,13 +125,17 @@ def _selected_passages(trajectory: list[dict[str, Any]]) -> list[dict[str, Any]]
     return selected
 
 
-def _covered_supporting_fact_count(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> int:
+def _covered_supporting_fact_indices(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> set[int]:
     selected = _selected_passages(trajectory)
-    count = 0
-    for support in _supporting_fact_items(sample):
+    covered: set[int] = set()
+    for index, support in enumerate(_supporting_fact_items(sample)):
         if any(_matches_supporting_fact_item(passage, support) for passage in selected):
-            count += 1
-    return count
+            covered.add(index)
+    return covered
+
+
+def _covered_supporting_fact_count(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> int:
+    return len(_covered_supporting_fact_indices(trajectory, sample))
 
 
 def _truthy(value: Any) -> bool:
@@ -143,7 +147,6 @@ def _truthy(value: Any) -> bool:
 
 
 def _query_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> float:
-    support_texts = _supporting_fact_texts(sample)
     reward = 0.0
     seen_queries: set[str] = set()
     for turn in trajectory:
@@ -158,19 +161,40 @@ def _query_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> f
         if normalized_query and normalized_query not in seen_queries:
             reward += 0.15
             seen_queries.add(normalized_query)
-        elif normalized_query:
-            reward -= 0.25
         else:
             reward -= 0.5
-        passages = (turn.get("observation") or {}).get("passages") or []
-        if any(isinstance(item, dict) and _matches_supporting_fact(item, support_texts) for item in passages):
-            reward += 0.75
     return reward
 
 
-def _evidence_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> float:
+def _query_penalties(trajectory: list[dict[str, Any]]) -> tuple[float, float]:
+    seen_queries: set[str] = set()
+    repeated_query_penalty = 0.0
+    retrieval_cost = 0.0
+    for turn in trajectory:
+        query = str((turn.get("query_retriever") or {}).get("query") or "").strip()
+        normalized_query = _normalize_answer(query)
+        if not normalized_query:
+            continue
+        retrieval_cost -= 0.1
+        if normalized_query in seen_queries:
+            repeated_query_penalty -= 0.2
+        seen_queries.add(normalized_query)
+    return repeated_query_penalty, retrieval_cost
+
+
+def _retrieval_hit_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> float:
     support_texts = _supporting_fact_texts(sample)
+    for turn in trajectory:
+        passages = (turn.get("observation") or {}).get("passages") or []
+        if any(isinstance(item, dict) and _matches_supporting_fact(item, support_texts) for item in passages):
+            return 0.5
+    return 0.0
+
+
+def _evidence_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> float:
     reward = 0.0
+    covered_support_indices: set[int] = set()
+    supporting_facts = _supporting_fact_items(sample)
     for turn in trajectory:
         passages = (turn.get("observation") or {}).get("passages") or []
         passage_by_id = {str(item.get("passage_id")): item for item in passages if isinstance(item, dict)}
@@ -185,10 +209,19 @@ def _evidence_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -
             if passage is None:
                 reward -= 0.5
                 continue
-            if _matches_supporting_fact(passage, support_texts):
-                reward += 1.0
-            else:
+            matched_index = next(
+                (
+                    index
+                    for index, support in enumerate(supporting_facts)
+                    if _matches_supporting_fact_item(passage, support)
+                ),
+                None,
+            )
+            if matched_index is None:
                 reward -= 0.1
+            elif matched_index not in covered_support_indices:
+                covered_support_indices.add(matched_index)
+                reward += 1.0
     return reward
 
 
@@ -201,21 +234,33 @@ def compute_rl_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> di
     answer_f1 = compute_answer_f1(final_answer, sample.get("answer"), sample.get("answer_aliases") or [])
     query_reward = _query_reward(trajectory, sample)
     evidence_reward = _evidence_reward(trajectory, sample)
-    answer_reward = answer_f1
+    answer_reward = 2.0 * answer_f1
     format_reward = 0.0 if parse_errors else 0.25
     support_groups = _supporting_fact_groups(sample)
     support_facts_required = 2 if len(support_groups) >= 2 else len(support_groups)
     support_facts_covered = _covered_supporting_fact_count(trajectory, sample)
+    support_coverage = (
+        min(1.0, support_facts_covered / support_facts_required)
+        if support_facts_required > 0
+        else 0.0
+    )
+    retrieval_hit_reward = _retrieval_hit_reward(trajectory, sample)
+    repeated_query_penalty, retrieval_cost = _query_penalties(trajectory)
     last_answer = (trajectory[-1].get("answer") or {}) if trajectory else {}
     premature_answer_penalty = 0.0
-    if (
-        support_facts_required >= 2
-        and support_facts_covered < support_facts_required
-        and _truthy(last_answer.get("can_answer"))
-        and answer_f1 <= 0.0
-    ):
-        premature_answer_penalty = -1.0
-    total = query_reward + evidence_reward + answer_reward + format_reward + premature_answer_penalty
+    if support_facts_required >= 2 and support_facts_covered < support_facts_required and _truthy(last_answer.get("can_answer")):
+        premature_answer_penalty = -1.0 if answer_f1 <= 0.0 else -0.25
+    total = (
+        (0.25 * query_reward)
+        + (0.25 * evidence_reward)
+        + answer_reward
+        + support_coverage
+        + retrieval_hit_reward
+        + format_reward
+        + repeated_query_penalty
+        + retrieval_cost
+        + premature_answer_penalty
+    )
     if parse_errors:
         total -= float(len(parse_errors))
     return {
@@ -226,6 +271,10 @@ def compute_rl_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> di
         "format_reward": float(format_reward),
         "support_facts_required": float(support_facts_required),
         "support_facts_covered": float(support_facts_covered),
+        "support_coverage": float(support_coverage),
+        "retrieval_hit_reward": float(retrieval_hit_reward),
+        "repeated_query_penalty": float(repeated_query_penalty),
+        "retrieval_cost": float(retrieval_cost),
         "premature_answer_penalty": float(premature_answer_penalty),
         "total": float(total),
     }

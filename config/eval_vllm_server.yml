@@ -1,7 +1,7 @@
 # vLLM 可执行文件和模型路径。
-vllm_bin: "/data/conda/envs/vllm/bin/vllm"
+vllm_bin: "/data/conda/envs/macorag/bin/vllm"
 model_path: "model/Qwen2.5-7B-Instruct"
-adapter_path: null
+adapter_path: "outputs/grpo_qwen2.5-7b/2026-07-04_17-28-19/adapter"
 vllm_model: "macorag"
 
 # 每个 base_url 的端口会启动一个服务，GPU 按顺序轮询分配。
@@ -9,10 +9,13 @@ gpu_indices: "1"
 vllm_base_urls:
   - "http://127.0.0.1:8000/v1"
 
+
 # 常用性能参数。
 dtype: "auto"
-gpu_memory_utilization: 0.7
+gpu_memory_utilization: 0.85
 max_model_len: 8192
 
 # 额外 vLLM 参数，按需追加。
-extra_args: []
+# 关闭逐请求 prompt 明细日志；启动状态和错误仍会直接显示在控制台。
+extra_args:
+  - "--disable-log-requests"

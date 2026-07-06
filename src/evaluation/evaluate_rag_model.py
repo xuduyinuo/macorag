@@ -19,7 +19,6 @@ from rag import (
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
 )
-from rl_training.policy import HFSharedPolicy
 from rl_training.retrieval import CachedLinearRAGRetrievalEnv
 
 from .bailian_evaluator import BailianJudgeClient, evaluate_predictions
@@ -51,6 +50,26 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _dataset_name_for_path(value: Any) -> str:
+    dataset = str(value or "unknown").strip() or "unknown"
+    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in dataset)
+
+
+def _group_samples_by_dataset(samples: list[EvalSample]) -> list[tuple[str, list[EvalSample]]]:
+    grouped: dict[str, list[EvalSample]] = {}
+    order: list[str] = []
+    for sample in samples:
+        if sample.dataset not in grouped:
+            grouped[sample.dataset] = []
+            order.append(sample.dataset)
+        grouped[sample.dataset].append(sample)
+    return [(dataset, grouped[dataset]) for dataset in order]
+
+
+def _dataset_output_dir(output_dir: Path, dataset: str) -> Path:
+    return output_dir / _dataset_name_for_path(dataset)
+
+
 class VLLMOpenAIPolicy:
     def __init__(
         self,
@@ -59,6 +78,7 @@ class VLLMOpenAIPolicy:
         model: str,
         api_key_env: str,
         system_prompt: str,
+        max_prompt_length: int | None,
         max_completion_length: int,
         temperature: float,
         top_p: float,
@@ -71,9 +91,10 @@ class VLLMOpenAIPolicy:
             raise SystemExit("vllm_base_urls must contain at least one OpenAI-compatible endpoint.")
         self.model = str(model or "").strip()
         if not self.model:
-            raise SystemExit("vllm_model must be set when inference_backend is vllm_openai.")
+            raise SystemExit("vllm_model must be set for evaluation.")
         self.api_key_env = str(api_key_env or "").strip()
         self.system_prompt = system_prompt
+        self.max_prompt_length = max_prompt_length
         self.max_completion_length = max_completion_length
         self.temperature = temperature
         self.top_p = top_p
@@ -158,6 +179,8 @@ class VLLMOpenAIPolicy:
             "top_p": self.top_p,
             "max_tokens": self.max_completion_length,
         }
+        if self.max_prompt_length is not None and int(self.max_prompt_length) > 0:
+            payload["truncate_prompt_tokens"] = int(self.max_prompt_length)
         response = self._post_chat_completion(payload)
         try:
             return str(response["choices"][0]["message"]["content"])
@@ -253,10 +276,12 @@ def run_predictions(
     progress_path = output_dir / "predictions.jsonl"
     if progress_path.exists():
         progress_path.unlink()
+    predictions_json_path = output_dir / "predictions.json"
+    if predictions_json_path.exists():
+        predictions_json_path.unlink()
     predictions_by_index: dict[int, dict[str, Any]] = {}
-    backend = str(getattr(args, "inference_backend", "hf_local") or "hf_local")
     eval_workers = max(1, int(getattr(args, "eval_request_workers", 1) or 1))
-    use_threads = backend == "vllm_openai" and eval_workers > 1
+    use_threads = eval_workers > 1
     if use_threads:
         progress_lock = threading.Lock()
         with ThreadPoolExecutor(max_workers=eval_workers) as executor:
@@ -301,7 +326,6 @@ def run_predictions(
             predictions_by_index[index] = prediction
             _append_jsonl(progress_path, prediction)
     predictions = [predictions_by_index[index] for index in range(len(samples))]
-    _write_json(output_dir / "predictions.json", predictions)
     return predictions
 
 
@@ -312,99 +336,19 @@ def _configure_visible_gpus(args: Any) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices or "0"
 
 
-def _load_dependencies() -> dict[str, Any]:
-    try:
-        import torch
-        from peft import PeftModel
-        from transformers import AutoModelForCausalLM, AutoTokenizer
-    except ModuleNotFoundError as exc:
-        raise SystemExit(
-            f"Missing dependency: {exc.name}. Install transformers, peft, torch and optional bitsandbytes "
-            "in the MACORAG runtime environment."
-        ) from exc
-    return {
-        "torch": torch,
-        "AutoModelForCausalLM": AutoModelForCausalLM,
-        "AutoTokenizer": AutoTokenizer,
-        "PeftModel": PeftModel,
-    }
-
-
-def _torch_dtype(args: Any, torch: Any) -> Any:
-    if args.bf16:
-        return torch.bfloat16
-    if args.fp16:
-        return torch.float16
-    if not torch.cuda.is_available():
-        return getattr(torch, "float32", torch.float16)
-    return torch.float16
-
-
-def _model_kwargs(args: Any, torch: Any) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"torch_dtype": _torch_dtype(args, torch)}
-    if not args.load_4bit or not torch.cuda.is_available():
-        return kwargs
-    try:
-        from transformers import BitsAndBytesConfig
-        import bitsandbytes  # type: ignore  # noqa: F401
-    except ModuleNotFoundError as exc:
-        raise SystemExit(f"4-bit quantization requested but dependency missing: {exc.name}.") from exc
-    kwargs["quantization_config"] = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=_torch_dtype(args, torch),
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_use_double_quant=True,
-    )
-    kwargs["device_map"] = "auto"
-    return kwargs
-
-
-def _device(torch: Any) -> Any:
-    if torch.cuda.is_available():
-        return torch.device("cuda:0")
-    return torch.device("cpu")
-
-
-def _load_policy(args: Any) -> HFSharedPolicy | VLLMOpenAIPolicy:
-    backend = str(getattr(args, "inference_backend", "hf_local") or "hf_local")
-    if backend == "vllm_openai":
-        return VLLMOpenAIPolicy(
-            base_urls=list(getattr(args, "vllm_base_urls", []) or []),
-            model=getattr(args, "vllm_model", ""),
-            api_key_env=getattr(args, "vllm_api_key_env", ""),
-            system_prompt=getattr(args, "system_prompt", DEFAULT_SYSTEM_PROMPT),
-            max_completion_length=args.max_completion_length,
-            temperature=args.temperature,
-            top_p=args.top_p,
-            timeout=args.vllm_timeout,
-            retries=args.vllm_retries,
-            retry_sleep_seconds=args.vllm_retry_sleep_seconds,
-        )
-    if backend != "hf_local":
-        raise SystemExit("Unsupported inference_backend. Expected one of: hf_local, vllm_openai.")
-    deps = _load_dependencies()
-    torch = deps["torch"]
-    AutoModelForCausalLM = deps["AutoModelForCausalLM"]
-    AutoTokenizer = deps["AutoTokenizer"]
-    PeftModel = deps["PeftModel"]
-
-    tokenizer = AutoTokenizer.from_pretrained(args.adapter_path, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(args.model_path, **_model_kwargs(args, torch))
-    model = PeftModel.from_pretrained(base_model, args.adapter_path, is_trainable=False)
-    model.eval()
-    if not args.load_4bit:
-        model.to(_device(torch))
-    return HFSharedPolicy(
-        model=model,
-        tokenizer=tokenizer,
+def _load_policy(args: Any) -> VLLMOpenAIPolicy:
+    return VLLMOpenAIPolicy(
+        base_urls=list(getattr(args, "vllm_base_urls", []) or []),
+        model=getattr(args, "vllm_model", ""),
+        api_key_env=getattr(args, "vllm_api_key_env", ""),
         system_prompt=getattr(args, "system_prompt", DEFAULT_SYSTEM_PROMPT),
-        max_prompt_length=args.max_prompt_length,
+        max_prompt_length=getattr(args, "max_prompt_length", 4096),
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
         top_p=args.top_p,
-        top_k=args.top_k,
+        timeout=args.vllm_timeout,
+        retries=args.vllm_retries,
+        retry_sleep_seconds=args.vllm_retry_sleep_seconds,
     )
 
 
@@ -471,8 +415,9 @@ def main(argv: list[str] | None = None) -> int:
     validate_retrieval_assets(args.retrieval_root, [sample.dataset for sample in samples])
     policy = _load_policy(args)
     retrieval_env = _build_retrieval_env(args)
-    run_predictions(args, samples, policy, retrieval_env, output_dir)
 
+    client = None
+    judge_metadata = None
     if not args.skip_judge:
         client = BailianJudgeClient(
             model=args.judge_model,
@@ -495,12 +440,17 @@ def main(argv: list[str] | None = None) -> int:
             "judge_retry_sleep_seconds": args.judge_retry_sleep_seconds,
             "judge_workers": args.judge_workers,
         }
-        evaluate_predictions(
-            output_dir / "predictions.json",
-            client=client,
-            max_workers=args.judge_workers,
-            judge_metadata=judge_metadata,
-        )
+
+    for dataset, dataset_samples in _group_samples_by_dataset(samples):
+        dataset_dir = _dataset_output_dir(output_dir, dataset)
+        run_predictions(args, dataset_samples, policy, retrieval_env, dataset_dir)
+        if client is not None:
+            evaluate_predictions(
+                dataset_dir / "predictions.jsonl",
+                client=client,
+                max_workers=args.judge_workers,
+                judge_metadata=judge_metadata,
+            )
 
     print(f"Evaluation artifacts written to {output_dir}")
     return 0

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import Counter
 import json
 import os
 import re
@@ -118,14 +119,42 @@ def calculate_contain(pre_answer: str | None, gold_answer: str | None) -> int:
         return 0
     if gold_answer is None or str(gold_answer).strip() == "":
         return 0
-    return 1 if normalize_answer(str(gold_answer)) in normalize_answer(str(pre_answer)) else 0
+    normalized_pred = normalize_answer(str(pre_answer))
+    normalized_gold = normalize_answer(str(gold_answer))
+    return 1 if normalized_gold in normalized_pred or normalized_pred in normalized_gold else 0
+
+
+def calculate_exact_match(pre_answer: str | None, gold_answer: str | None) -> int:
+    if pre_answer is None or str(pre_answer).strip() == "":
+        return 0
+    if gold_answer is None or str(gold_answer).strip() == "":
+        return 0
+    return 1 if normalize_answer(str(pre_answer)) == normalize_answer(str(gold_answer)) else 0
+
+
+def calculate_f1(pre_answer: str | None, gold_answer: str | None) -> float:
+    if pre_answer is None or str(pre_answer).strip() == "":
+        return 0.0
+    if gold_answer is None or str(gold_answer).strip() == "":
+        return 0.0
+    pred_tokens = normalize_answer(str(pre_answer)).split()
+    gold_tokens = normalize_answer(str(gold_answer)).split()
+    if not pred_tokens or not gold_tokens:
+        return 0.0
+    common = Counter(pred_tokens) & Counter(gold_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+    precision = num_same / len(pred_tokens)
+    recall = num_same / len(gold_tokens)
+    return 2 * precision * recall / (precision + recall)
 
 
 def _coerce_answer(value: Any) -> str:
     return "" if value is None else str(value)
 
 
-def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[int, float, int, str | None]:
+def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[int, float, int, int, float, str | None]:
     try:
         pre_answer = _coerce_answer(prediction.get("pred_answer"))
         gold_answer = _coerce_answer(prediction.get("gold_answer"))
@@ -133,45 +162,56 @@ def _evaluate_one(index: int, prediction: dict[str, Any], client: Any) -> tuple[
             index,
             calculate_llm_accuracy(client, pre_answer, gold_answer),
             calculate_contain(pre_answer, gold_answer),
+            calculate_exact_match(pre_answer, gold_answer),
+            calculate_f1(pre_answer, gold_answer),
             None,
         )
     except Exception as exc:
         pre_answer = _coerce_answer(prediction.get("pred_answer"))
         gold_answer = _coerce_answer(prediction.get("gold_answer"))
-        return index, 0.0, calculate_contain(pre_answer, gold_answer), str(exc)
+        return (
+            index,
+            0.0,
+            calculate_contain(pre_answer, gold_answer),
+            calculate_exact_match(pre_answer, gold_answer),
+            calculate_f1(pre_answer, gold_answer),
+            str(exc),
+        )
 
 
-def _dataset_name(prediction: dict[str, Any]) -> str:
-    dataset = str(prediction.get("dataset") or "unknown").strip()
-    return dataset or "unknown"
+def _load_predictions(path: Path) -> list[dict[str, Any]]:
+    if path.suffix == ".jsonl":
+        predictions = []
+        with path.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                if not isinstance(payload, dict):
+                    raise ValueError(f"Invalid prediction line at {path}: expected a JSON object.")
+                predictions.append(payload)
+        return predictions
+    predictions = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(predictions, list):
+        raise ValueError(f"Invalid predictions format at {path}: expected a JSON list.")
+    return predictions
 
 
-def _summarize_predictions(predictions: list[dict[str, Any]]) -> dict[str, Any]:
-    if not predictions:
-        return {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0}
-    llm_scores = [float(prediction.get("llm_accuracy", 0.0) or 0.0) for prediction in predictions]
-    contain_scores = [int(prediction.get("contain_accuracy", 0) or 0) for prediction in predictions]
+def _summarize_scores(
+    llm_scores: list[float],
+    contain_scores: list[int],
+    exact_match_scores: list[int],
+    f1_scores: list[float],
+) -> dict[str, Any]:
+    if not llm_scores:
+        return {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "exact_match": 0.0, "f1": 0.0, "num_samples": 0}
     return {
         "llm_accuracy": sum(llm_scores) / len(llm_scores),
         "contain_accuracy": sum(contain_scores) / len(contain_scores),
-        "num_samples": len(predictions),
+        "exact_match": sum(exact_match_scores) / len(exact_match_scores),
+        "f1": sum(f1_scores) / len(f1_scores),
+        "num_samples": len(llm_scores),
     }
-
-
-def _write_dataset_prediction_files(output_dir: Path, predictions: list[dict[str, Any]]) -> dict[str, Any]:
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for prediction in predictions:
-        grouped.setdefault(_dataset_name(prediction), []).append(prediction)
-    by_dataset = {
-        dataset: _summarize_predictions(dataset_predictions)
-        for dataset, dataset_predictions in sorted(grouped.items())
-    }
-    for dataset, dataset_predictions in sorted(grouped.items()):
-        (output_dir / f"predictions_{dataset}.json").write_text(
-            json.dumps(dataset_predictions, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    return by_dataset
 
 
 def evaluate_predictions(
@@ -182,11 +222,9 @@ def evaluate_predictions(
     judge_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     path = Path(predictions_path)
-    predictions = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(predictions, list):
-        raise ValueError(f"Invalid predictions format at {path}: expected a JSON list.")
+    predictions = _load_predictions(path)
     if not predictions:
-        summary = {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "num_samples": 0, "by_dataset": {}}
+        summary = {"llm_accuracy": 0.0, "contain_accuracy": 0.0, "exact_match": 0.0, "f1": 0.0, "num_samples": 0}
         if judge_metadata is not None:
             summary["judge_metadata"] = judge_metadata
         (path.parent / "evaluation_results.json").write_text(
@@ -196,25 +234,23 @@ def evaluate_predictions(
 
     llm_scores = [0.0] * len(predictions)
     contain_scores = [0] * len(predictions)
+    exact_match_scores = [0] * len(predictions)
+    f1_scores = [0.0] * len(predictions)
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = [
             executor.submit(_evaluate_one, index, prediction, client)
             for index, prediction in enumerate(predictions)
         ]
         for future in as_completed(futures):
-            index, llm_acc, contain_acc, error = future.result()
+            index, llm_acc, contain_acc, exact_match, f1, _error = future.result()
             llm_scores[index] = llm_acc
             contain_scores[index] = contain_acc
-            predictions[index]["llm_accuracy"] = llm_acc
-            predictions[index]["contain_accuracy"] = contain_acc
-            if error is not None:
-                predictions[index]["evaluation_error"] = error
+            exact_match_scores[index] = exact_match
+            f1_scores[index] = f1
 
-    summary = _summarize_predictions(predictions)
-    summary["by_dataset"] = _write_dataset_prediction_files(path.parent, predictions)
+    summary = _summarize_scores(llm_scores, contain_scores, exact_match_scores, f1_scores)
     if judge_metadata is not None:
         summary["judge_metadata"] = judge_metadata
-    path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2), encoding="utf-8")
     (path.parent / "evaluation_results.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
     )

@@ -2,10 +2,10 @@
 # output_root 是保存根目录；每次 SFT 训练会自动写入 output_root/YYYY-MM-DD_HH-MM-SS/。
 model_path: "model/Qwen2.5-3B-Instruct"
 data_root: "data/sft/teacher_qwen_plus_trajectory_train"
-output_root: "outputs/lora_qwen2.5-3b_trajectory"
+output_root: "outputs/sft_qwen2.5-3b-instruct"
 
 # 数据与长度
-max_length: 5120
+max_length: 6400
 max_samples: null
 
 # LoRA 结构
@@ -22,7 +22,7 @@ target_modules:
   - gate_proj
 
 # 训练调参
-per_device_train_batch_size: 2
+per_device_train_batch_size: 1
 gradient_accumulation_steps: 8
 num_train_epochs: 3.0
 learning_rate: 0.00002
