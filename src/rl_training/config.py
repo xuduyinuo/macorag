@@ -49,6 +49,9 @@ OPTIMIZATION_DEFAULTS: dict[str, Any] = {
     "fp16": False,
     "load_4bit": True,
     "gradient_checkpointing": True,
+    "query_local_credit_weight": 0.75,
+    "evidence_local_credit_weight": 0.70,
+    "answer_local_credit_weight": 0.30,
 }
 
 # 运行环境：launcher 会优先读取 gpu_indices，gpu_index 仅作为兼容回退。
@@ -183,6 +186,21 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         "--gradient-checkpointing",
         action=BooleanOptionalAction,
         default=defaults["gradient_checkpointing"],
+    )
+    optimization.add_argument(
+        "--query-local-credit-weight",
+        type=float,
+        default=defaults["query_local_credit_weight"],
+    )
+    optimization.add_argument(
+        "--evidence-local-credit-weight",
+        type=float,
+        default=defaults["evidence_local_credit_weight"],
+    )
+    optimization.add_argument(
+        "--answer-local-credit-weight",
+        type=float,
+        default=defaults["answer_local_credit_weight"],
     )
 
     vllm = parser.add_argument_group("vLLM 生成与权重同步")

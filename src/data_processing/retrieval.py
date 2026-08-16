@@ -103,7 +103,15 @@ class LinearRAGQueryEngine:
                 + ", ".join(str(path) for path in candidate_index_dirs)
             )
 
-        model = SentenceTransformer(embedding_model)
+        try:
+            model = SentenceTransformer(embedding_model, local_files_only=True)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to load retrieval embedding model from local cache: "
+                f"{embedding_model!r}. The query path runs offline to avoid Hugging Face/proxy failures during "
+                "long RL jobs. Pre-download the model into the Hugging Face cache or set retrieval_embedding_model "
+                "to a local model directory."
+            ) from exc
         resolved_spacy_model = _resolve_spacy_model(spacy_model)
         config = LinearRAGConfig(
             dataset_name=dataset,

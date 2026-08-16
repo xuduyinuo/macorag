@@ -47,3 +47,39 @@ def normalize_group_advantages(rewards: list[float]) -> list[float]:
     variance = sum((item - mean) ** 2 for item in rewards) / len(rewards)
     std = math.sqrt(max(variance, 1e-12))
     return [(item - mean) / std for item in rewards]
+
+
+def assign_action_advantages(
+    rollouts: list[dict[str, Any]],
+    *,
+    local_weights: dict[str, float],
+) -> None:
+    buckets: dict[tuple[str, int], list[Any]] = {}
+    for rollout in rollouts:
+        reward_by_key = {
+            (str(item["role"]), int(item["round_index"])): float(item["local_reward"])
+            for item in rollout.get("action_rewards", [])
+        }
+        terminal_reward = float(rollout.get("terminal_reward", 0.0))
+        for action in rollout.get("actions", []):
+            role_name = getattr(action.role, "value", str(action.role))
+            key = (role_name, int(action.round_index))
+            action.local_reward = reward_by_key.get(key, 0.0)
+            action.terminal_reward = terminal_reward
+            buckets.setdefault(key, []).append(action)
+
+    for (role_name, _), actions in buckets.items():
+        local_weight = float(local_weights.get(role_name, 0.5))
+        if not 0.0 <= local_weight <= 1.0:
+            raise ValueError(f"Local credit weight for {role_name} must be between 0 and 1.")
+        local_advantages = normalize_group_advantages([action.local_reward for action in actions])
+        terminal_advantages = normalize_group_advantages([action.terminal_reward for action in actions])
+        for action, local_advantage, terminal_advantage in zip(
+            actions,
+            local_advantages,
+            terminal_advantages,
+        ):
+            action.advantage = (
+                local_weight * local_advantage
+                + (1.0 - local_weight) * terminal_advantage
+            )

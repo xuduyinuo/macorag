@@ -225,19 +225,191 @@ def _evidence_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -
     return reward
 
 
+def _matched_supporting_fact_index(
+    passage: dict[str, Any],
+    supporting_facts: list[dict[str, str]],
+) -> int | None:
+    return next(
+        (
+            index
+            for index, support in enumerate(supporting_facts)
+            if _matches_supporting_fact_item(passage, support)
+        ),
+        None,
+    )
+
+
+def _support_facts_required(sample: dict[str, Any]) -> int:
+    return len(_supporting_fact_groups(sample))
+
+
+def _legacy_support_facts_required(sample: dict[str, Any]) -> int:
+    support_count = _support_facts_required(sample)
+    return 2 if support_count >= 2 else support_count
+
+
+def compute_action_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
+    trajectory = rollout.get("trajectory") or []
+    supporting_facts = _supporting_fact_items(sample)
+    support_required = _support_facts_required(sample)
+    seen_queries: set[str] = set()
+    retrieved_support_indices: set[int] = set()
+    selected_support_indices: set[int] = set()
+    action_rewards: list[dict[str, Any]] = []
+
+    for fallback_round_index, turn in enumerate(trajectory):
+        round_index = int(turn.get("round", fallback_round_index))
+        generated_roles = set(
+            turn.get("generated_roles")
+            or ("query_retriever", "evidence_updater", "answer_generator")
+        )
+        parse_error_role = str(turn.get("parse_error_role") or "")
+        query_action = turn.get("query_retriever") or {}
+        query = str(query_action.get("query") or "").strip()
+        sub_goal = str(query_action.get("sub_goal") or "").strip()
+        normalized_query = _normalize_answer(query)
+        query_components = {
+            "structure": 0.25 if query and sub_goal else 0.0,
+            "length": 0.25 if 3 <= len(query.split()) <= 32 else 0.0,
+            "novelty": 0.15 if normalized_query and normalized_query not in seen_queries else -0.5,
+            "retrieval_cost": -0.1 if normalized_query else 0.0,
+            "support_gain": 0.0,
+            "parse_error": -1.0 if parse_error_role == "query_retriever" else 0.0,
+        }
+        if normalized_query:
+            seen_queries.add(normalized_query)
+        passages = (turn.get("observation") or {}).get("passages") or []
+        current_retrieved = {
+            matched_index
+            for passage in passages
+            if isinstance(passage, dict)
+            for matched_index in [_matched_supporting_fact_index(passage, supporting_facts)]
+            if matched_index is not None
+        }
+        new_retrieved = current_retrieved - retrieved_support_indices
+        query_components["support_gain"] = 0.5 * len(new_retrieved)
+        retrieved_support_indices.update(current_retrieved)
+        if "query_retriever" in generated_roles:
+            action_rewards.append(
+                {
+                    "role": "query_retriever",
+                    "round_index": round_index,
+                    "local_reward": float(sum(query_components.values())),
+                    "components": query_components,
+                }
+            )
+
+        passage_by_id = {
+            str(item.get("passage_id")): item
+            for item in passages
+            if isinstance(item, dict)
+        }
+        selected_ids = (turn.get("update_evidence") or {}).get("selected_passage_ids") or []
+        evidence_components = {
+            "empty_selection": -0.25 if not selected_ids else 0.0,
+            "excess_selection": -0.15 * max(0, len(selected_ids) - 5),
+            "invalid_selection": 0.0,
+            "irrelevant_selection": 0.0,
+            "support_gain": 0.0,
+            "redundancy": 0.0,
+            "parse_error": -1.0 if parse_error_role == "evidence_updater" else 0.0,
+        }
+        for selected_id in selected_ids:
+            passage = passage_by_id.get(str(selected_id))
+            if passage is None:
+                evidence_components["invalid_selection"] -= 0.5
+                continue
+            matched_index = _matched_supporting_fact_index(passage, supporting_facts)
+            if matched_index is None:
+                evidence_components["irrelevant_selection"] -= 0.1
+            elif matched_index in selected_support_indices:
+                evidence_components["redundancy"] -= 0.1
+            else:
+                selected_support_indices.add(matched_index)
+                evidence_components["support_gain"] += 1.0
+        if "evidence_updater" in generated_roles:
+            action_rewards.append(
+                {
+                    "role": "evidence_updater",
+                    "round_index": round_index,
+                    "local_reward": float(sum(evidence_components.values())),
+                    "components": evidence_components,
+                }
+            )
+
+        answer = turn.get("answer") or {}
+        can_answer = _truthy(answer.get("can_answer"))
+        answer_f1 = compute_answer_f1(
+            answer.get("answer"),
+            sample.get("answer"),
+            sample.get("answer_aliases") or [],
+        )
+        has_support_supervision = support_required > 0
+        evidence_sufficient = has_support_supervision and len(selected_support_indices) >= support_required
+        answer_components = {
+            "answer_correctness": 2.0 * answer_f1 if can_answer else 0.0,
+            "correct_wait": 0.25 if not can_answer and has_support_supervision and not evidence_sufficient else 0.0,
+            "false_abstention": -0.5 if not can_answer and evidence_sufficient else 0.0,
+            "premature_answer": 0.0,
+            "parse_error": -1.0 if parse_error_role == "answer_generator" else 0.0,
+        }
+        if can_answer and has_support_supervision and not evidence_sufficient:
+            answer_components["premature_answer"] = -0.25 if answer_f1 > 0.0 else -1.0
+        if "answer_generator" in generated_roles:
+            action_rewards.append(
+                {
+                    "role": "answer_generator",
+                    "round_index": round_index,
+                    "local_reward": float(sum(answer_components.values())),
+                    "components": answer_components,
+                }
+            )
+
+    final_answer = rollout.get("final_answer")
+    if final_answer is None and trajectory:
+        last_answer = trajectory[-1].get("answer") or {}
+        if _truthy(last_answer.get("can_answer")):
+            final_answer = last_answer.get("answer")
+    final_answer_f1 = compute_answer_f1(
+        final_answer,
+        sample.get("answer"),
+        sample.get("answer_aliases") or [],
+    )
+    support_coverage = (
+        min(1.0, len(selected_support_indices) / support_required)
+        if support_required > 0
+        else 0.0
+    )
+    last_answer = (trajectory[-1].get("answer") or {}) if trajectory else {}
+    terminal_premature_penalty = 0.0
+    if support_required > 0 and len(selected_support_indices) < support_required and _truthy(last_answer.get("can_answer")):
+        terminal_premature_penalty = -1.0 if final_answer_f1 <= 0.0 else -0.25
+    terminal_reward = (
+        (2.0 * final_answer_f1)
+        + support_coverage
+        + terminal_premature_penalty
+        - float(len(rollout.get("parse_errors") or []))
+    )
+    return {
+        "action_rewards": action_rewards,
+        "terminal_reward": float(terminal_reward),
+    }
+
+
 def compute_rl_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> dict[str, float]:
     trajectory = rollout.get("trajectory") or []
     parse_errors = rollout.get("parse_errors") or []
     final_answer = rollout.get("final_answer")
     if final_answer is None and trajectory:
-        final_answer = (trajectory[-1].get("answer") or {}).get("answer")
+        last_answer = trajectory[-1].get("answer") or {}
+        if _truthy(last_answer.get("can_answer")):
+            final_answer = last_answer.get("answer")
     answer_f1 = compute_answer_f1(final_answer, sample.get("answer"), sample.get("answer_aliases") or [])
     query_reward = _query_reward(trajectory, sample)
     evidence_reward = _evidence_reward(trajectory, sample)
     answer_reward = 2.0 * answer_f1
     format_reward = 0.0 if parse_errors else 0.25
-    support_groups = _supporting_fact_groups(sample)
-    support_facts_required = 2 if len(support_groups) >= 2 else len(support_groups)
+    support_facts_required = _legacy_support_facts_required(sample)
     support_facts_covered = _covered_supporting_fact_count(trajectory, sample)
     support_coverage = (
         min(1.0, support_facts_covered / support_facts_required)

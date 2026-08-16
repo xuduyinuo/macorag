@@ -56,6 +56,14 @@ class CachedLinearRAGRetrievalEnv:
                 self._engines_by_dataset[dataset] = engine
             return engine
 
+    def prewarm(self, datasets: list[str] | tuple[str, ...] | set[str]) -> None:
+        seen: set[str] = set()
+        for dataset in datasets:
+            if dataset in seen:
+                continue
+            self._engine(dataset)
+            seen.add(dataset)
+
     def query(self, dataset: str, query: str) -> dict[str, Any]:
         lock = self._dataset_lock(dataset)
         with lock:

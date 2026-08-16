@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from argparse import Namespace
 from pathlib import Path
+import sys
+import types
 
 import torch
 
@@ -12,6 +14,8 @@ from rl_training.config import parse_args
 from rl_training.data import load_rl_samples
 from rl_training.policy import HFSharedPolicy
 from rl_training.policy import sequence_logprobs
+import rl_training.rewards as reward_module
+import rl_training.trainer as trainer_module
 from rl_training.rewards import compute_answer_f1, compute_rl_rewards
 from rl_training.train_grpo_macorag import _parse_gpu_indices
 from rl_training.train_grpo_macorag import _build_policy
@@ -72,6 +76,26 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.gradient_accumulation_steps == 2
     assert args.gpu_indices == "0,1"
     assert args.disable_tqdm is False
+
+
+def test_parse_args_loads_role_credit_weights(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                "query_local_credit_weight: 0.8",
+                "evidence_local_credit_weight: 0.6",
+                "answer_local_credit_weight: 0.2",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.query_local_credit_weight == 0.8
+    assert args.evidence_local_credit_weight == 0.6
+    assert args.answer_local_credit_weight == 0.2
 
 
 def test_rl_default_system_prompt_comes_from_shared_prompt_file() -> None:
@@ -171,6 +195,56 @@ def test_train_grpo_yaml_has_documented_sections() -> None:
         assert heading in text
 
 
+def test_single_gpu_script_forces_hf_offline_mode() -> None:
+    script = Path("src/rl_single/run_train_grpo_single.sh").read_text(encoding="utf-8")
+
+    assert "HF_HUB_OFFLINE" in script
+    assert "TRANSFORMERS_OFFLINE" in script
+
+
+def test_linear_rag_query_engine_loads_sentence_transformer_offline(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeSentenceTransformer:
+        def __init__(self, model_name: str, **kwargs: object) -> None:
+            captured["model_name"] = model_name
+            captured["kwargs"] = kwargs
+
+    fake_st_module = types.ModuleType("sentence_transformers")
+    fake_st_module.SentenceTransformer = FakeSentenceTransformer
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_st_module)
+
+    class FakeLinearRAGConfig:
+        def __init__(self, **kwargs: object) -> None:
+            captured["config"] = kwargs
+
+    class FakeLinearRAG:
+        def __init__(self, config: object) -> None:
+            self.config = config
+
+    import data_processing.retrieval as retrieval
+
+    monkeypatch.setattr(retrieval, "_load_linearrag_modules", lambda: (FakeLinearRAGConfig, FakeLinearRAG))
+    monkeypatch.setattr(retrieval, "_resolve_spacy_model", lambda model: model or "en_core_web_sm")
+    index_dir = tmp_path / "hotpotqa"
+    index_dir.mkdir(parents=True)
+    for filename in ("passage_embedding.parquet", "entity_embedding.parquet", "sentence_embedding.parquet"):
+        (index_dir / filename).write_text("placeholder", encoding="utf-8")
+
+    retrieval.LinearRAGQueryEngine(
+        retrieval_root=tmp_path,
+        dataset="hotpotqa",
+        embedding_model="sentence-transformers/all-mpnet-base-v2",
+        spacy_model=None,
+    )
+
+    assert captured["model_name"] == "sentence-transformers/all-mpnet-base-v2"
+    assert captured["kwargs"]["local_files_only"] is True
+
+
 def test_train_grpo_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:
     import yaml
 
@@ -233,8 +307,8 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         },
     }
     rollouts = [
-        {"advantage": -1.0, "rewards": {"total": 1.0}},
-        {"advantage": 1.0, "rewards": {"total": 3.0}},
+        {"advantage": -1.0, "rewards": {"total": 1.0}, "actions": [Namespace(advantage=-0.5)]},
+        {"advantage": 1.0, "rewards": {"total": 3.0}, "actions": [Namespace(advantage=1.0)]},
     ]
     metrics = {
         "loss": 0.2,
@@ -266,6 +340,7 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
 
     assert payload["gold_answer"] == "Gold answer"
     assert payload["generated_answer"] == "Predicted answer"
+    assert payload["action_advantage_mean"] == 0.25
     assert payload["timing"] == {
         "rollout_seconds": 10.0,
         "vllm_generate_seconds": 6.0,
@@ -1087,12 +1162,21 @@ def test_vllm_shared_policy_generates_and_records_trace() -> None:
         question="Who?",
         state=RAGState(question="Who?"),
     )
+    policy.generate(
+        role=AgentRole.QUERY_RETRIEVER,
+        question="Who?",
+        state=RAGState(question="Who?"),
+    )
 
     assert response == "decoded response"
-    assert len(client.prompts) == 1
-    assert len(policy.trace.actions) == 1
+    assert len(client.prompts) == 2
+    assert len(policy.trace.actions) == 2
     action = policy.trace.actions[0]
     assert action.role == AgentRole.QUERY_RETRIEVER
+    assert [item.round_index for item in policy.trace.actions] == [0, 1]
+    assert action.local_reward == 0.0
+    assert action.terminal_reward == 0.0
+    assert action.advantage == 0.0
     assert action.completion_ids == [10, 11]
     assert action.response == "decoded response"
     assert action.old_logprobs.shape == (2,)
@@ -1130,6 +1214,7 @@ def test_train_on_rollouts_reports_optimizer_step_flag() -> None:
             "prompt_ids": [1, 2],
             "completion_ids": [3],
             "old_logprobs": torch.zeros(1),
+            "advantage": 1.0,
         },
     )()
     rollouts = [{"advantage": 1.0, "actions": [action]}]
@@ -1306,6 +1391,181 @@ def test_compute_answer_f1_uses_normalized_token_overlap_and_aliases() -> None:
     assert compute_answer_f1("Arquette", "David Arquette", ["Arquette"]) == 1.0
     assert compute_answer_f1("David", "David Arquette", []) == 2 / 3
     assert compute_answer_f1("", "David Arquette", []) == 0.0
+
+
+def test_compute_action_rewards_assigns_distinct_role_round_credit() -> None:
+    support_d1 = {
+        "passage_id": 0,
+        "doc_id": "d1",
+        "title": "Bullitt",
+        "text": "Bullitt was directed by Peter Yates.",
+    }
+    support_d2 = {
+        "passage_id": 1,
+        "doc_id": "d2",
+        "title": "Peter Yates",
+        "text": "Peter Yates was born in Aldershot, Hampshire.",
+    }
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "query_retriever": {"sub_goal": "find director", "query": "Bullitt film director"},
+                "observation": {"passages": [support_d1, support_d2]},
+                "update_evidence": {"selected_passage_ids": [0]},
+                "answer": {"can_answer": False, "answer": None},
+            },
+            {
+                "round": 1,
+                "query_retriever": {"sub_goal": "repeat director", "query": "Bullitt film director"},
+                "observation": {"passages": [support_d1]},
+                "update_evidence": {"selected_passage_ids": [0]},
+                "answer": {"can_answer": True, "answer": "Aldershot"},
+            },
+        ],
+        "parse_errors": [],
+        "final_answer": "Aldershot",
+    }
+    sample = {
+        "answer": "Aldershot",
+        "answer_aliases": [],
+        "supporting_facts": [support_d1, support_d2],
+    }
+
+    rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    by_key = {
+        (item["role"], item["round_index"]): item["local_reward"]
+        for item in rewards["action_rewards"]
+    }
+
+    assert set(by_key) == {
+        ("query_retriever", 0),
+        ("evidence_updater", 0),
+        ("answer_generator", 0),
+        ("query_retriever", 1),
+        ("evidence_updater", 1),
+        ("answer_generator", 1),
+    }
+    assert by_key[("query_retriever", 0)] > by_key[("query_retriever", 1)]
+    assert by_key[("evidence_updater", 0)] > by_key[("evidence_updater", 1)]
+    assert by_key[("answer_generator", 0)] != by_key[("answer_generator", 1)]
+    assert rewards["terminal_reward"] == 2.25
+
+
+def test_compute_action_rewards_does_not_infer_sufficiency_without_support_labels() -> None:
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "query_retriever": {"sub_goal": "find person", "query": "Ada Lovelace biography"},
+                "observation": {"passages": []},
+                "update_evidence": {"selected_passage_ids": []},
+                "answer": {"can_answer": False, "answer": None},
+            }
+        ],
+        "parse_errors": [],
+        "final_answer": None,
+    }
+    sample = {"answer": "Ada Lovelace", "answer_aliases": [], "supporting_facts": []}
+
+    rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    answer_reward = next(
+        item["local_reward"]
+        for item in rewards["action_rewards"]
+        if item["role"] == "answer_generator"
+    )
+
+    assert answer_reward == 0.0
+
+
+def test_compute_action_rewards_assigns_parse_failure_to_failed_role() -> None:
+    support = {
+        "passage_id": 0,
+        "doc_id": "d1",
+        "title": "Bullitt",
+        "text": "Bullitt was directed by Peter Yates.",
+    }
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "generated_roles": ["query_retriever", "evidence_updater"],
+                "parse_error_role": "evidence_updater",
+                "query_retriever": {"sub_goal": "find director", "query": "Bullitt film director"},
+                "observation": {"passages": [support]},
+                "update_evidence": {},
+                "answer": {},
+            }
+        ],
+        "parse_errors": ["Missing required tag: update-evidence"],
+        "final_answer": None,
+    }
+    sample = {"answer": "Peter Yates", "answer_aliases": [], "supporting_facts": [support]}
+
+    rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    by_role = {item["role"]: item["local_reward"] for item in rewards["action_rewards"]}
+
+    assert set(by_role) == {"query_retriever", "evidence_updater"}
+    assert by_role["query_retriever"] > 0.0
+    assert by_role["evidence_updater"] < -1.0
+
+
+def test_compute_action_rewards_ignores_answer_text_when_can_answer_is_false() -> None:
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "query_retriever": {"sub_goal": "find person", "query": "Ada Lovelace biography"},
+                "observation": {"passages": []},
+                "update_evidence": {"selected_passage_ids": []},
+                "answer": {"can_answer": False, "answer": "Ada Lovelace"},
+            }
+        ],
+        "parse_errors": [],
+        "final_answer": None,
+    }
+    sample = {"answer": "Ada Lovelace", "answer_aliases": [], "supporting_facts": []}
+
+    rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    aggregate_rewards = compute_rl_rewards(rollout=rollout, sample=sample)
+
+    assert rewards["terminal_reward"] == 0.0
+    assert aggregate_rewards["answer_f1"] == 0.0
+
+
+def test_compute_action_rewards_requires_all_labeled_support_facts() -> None:
+    supports = [
+        {
+            "passage_id": index,
+            "doc_id": f"d{index}",
+            "title": f"Doc {index}",
+            "text": f"Supporting fact {index}.",
+        }
+        for index in range(3)
+    ]
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "query_retriever": {"sub_goal": "collect facts", "query": "collect supporting facts"},
+                "observation": {"passages": supports},
+                "update_evidence": {"selected_passage_ids": [0, 1]},
+                "answer": {"can_answer": False, "answer": None},
+            }
+        ],
+        "parse_errors": [],
+        "final_answer": None,
+    }
+    sample = {"answer": "result", "answer_aliases": [], "supporting_facts": supports}
+
+    rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    answer_reward = next(
+        item for item in rewards["action_rewards"] if item["role"] == "answer_generator"
+    )
+
+    assert answer_reward["components"]["correct_wait"] == 0.25
+    assert answer_reward["components"]["false_abstention"] == 0.0
+    assert rewards["terminal_reward"] == 2 / 3
 
 
 def test_compute_rl_rewards_scores_query_evidence_and_final_answer() -> None:
@@ -1570,6 +1830,48 @@ def test_compute_grpo_loss_uses_advantages_clipping_and_kl() -> None:
     assert metrics["loss"] == float(loss.item())
 
 
+def test_assign_action_advantages_normalizes_by_role_and_round() -> None:
+    class Action:
+        def __init__(self, role: AgentRole, round_index: int) -> None:
+            self.role = role
+            self.round_index = round_index
+            self.local_reward = 0.0
+            self.terminal_reward = 0.0
+            self.advantage = 0.0
+
+    first_q0 = Action(AgentRole.QUERY_RETRIEVER, 0)
+    first_q1 = Action(AgentRole.QUERY_RETRIEVER, 1)
+    second_q0 = Action(AgentRole.QUERY_RETRIEVER, 0)
+    rollouts = [
+        {
+            "actions": [first_q0, first_q1],
+            "terminal_reward": 4.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 1.0},
+                {"role": "query_retriever", "round_index": 1, "local_reward": 5.0},
+            ],
+        },
+        {
+            "actions": [second_q0],
+            "terminal_reward": 2.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 3.0},
+            ],
+        },
+    ]
+
+    trainer_module.assign_action_advantages(
+        rollouts,
+        local_weights={"query_retriever": 0.75},
+    )
+
+    assert first_q0.local_reward == 1.0
+    assert first_q0.terminal_reward == 4.0
+    assert first_q0.advantage == -0.5
+    assert second_q0.advantage == 0.5
+    assert first_q1.advantage == 0.0
+
+
 def test_policy_generate_disables_cache_for_gradient_checkpointing(monkeypatch) -> None:
     class DummyTokenizer:
         pad_token_id = 0
@@ -1664,6 +1966,7 @@ def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) 
             self.prompt_ids = [1, 2]
             self.completion_ids = [3]
             self.old_logprobs = torch.tensor([value], dtype=torch.float32)
+            self.advantage = 1.0
 
     class DummyOptimizer:
         def __init__(self) -> None:
@@ -1719,3 +2022,49 @@ def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) 
     assert "time_backward_seconds" in metrics
     assert "time_optimizer_step_seconds" in metrics
     assert "time_train_seconds" not in metrics
+
+
+def test_train_on_rollouts_uses_each_actions_own_advantage(monkeypatch) -> None:
+    class DummyAction:
+        def __init__(self, advantage: float) -> None:
+            self.prompt_ids = [1, 2]
+            self.completion_ids = [3]
+            self.old_logprobs = torch.zeros(1)
+            self.advantage = advantage
+
+    class Args:
+        gradient_accumulation_steps = 1
+        clip_epsilon = 0.2
+        kl_beta = 0.02
+
+    captured_advantages: list[float] = []
+
+    def fake_sequence_logprobs(**kwargs):
+        return torch.zeros(1, requires_grad=True)
+
+    def fake_grpo_loss(*, current_logprobs, advantages, **kwargs):
+        captured_advantages.append(float(advantages.item()))
+        loss = current_logprobs.sum() * 0.0
+        return loss, {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "clip_fraction": 0.0}
+
+    monkeypatch.setattr("rl_training.train_grpo_macorag.sequence_logprobs", fake_sequence_logprobs)
+    monkeypatch.setattr("rl_training.train_grpo_macorag.compute_grpo_loss", fake_grpo_loss)
+
+    _train_on_rollouts(
+        rollouts=[
+            {
+                "advantage": 9.0,
+                "actions": [DummyAction(-0.75), DummyAction(0.5)],
+            }
+        ],
+        train_model=object(),
+        raw_policy_model=object(),
+        ref_model=object(),
+        optimizer=object(),
+        args=Args(),
+        torch=torch,
+        device=torch.device("cpu"),
+        should_step=False,
+    )
+
+    assert captured_advantages == [-0.75, 0.5]

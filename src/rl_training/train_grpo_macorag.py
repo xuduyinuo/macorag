@@ -17,12 +17,12 @@ from .logging_utils import make_timestamped_run_dir
 from .logging_utils import write_json as _write_json
 from .policy import HFSharedPolicy, VLLMSharedPolicy, sequence_logprobs
 from .retrieval import CachedLinearRAGRetrievalEnv
-from .rewards import compute_rl_rewards
+from .rewards import compute_action_rewards, compute_rl_rewards
 from .runtime import extract_vllm_server_model_paths as _extract_vllm_server_model_paths
 from .runtime import parse_gpu_indices as _parse_gpu_indices
 from .runtime import validate_local_vllm_server_model as _validate_local_vllm_server_model
 from .runtime import validate_vllm_gpu_placement as _validate_vllm_gpu_placement
-from .trainer import compute_grpo_loss, normalize_group_advantages
+from .trainer import assign_action_advantages, compute_grpo_loss, normalize_group_advantages
 from .vllm_client import VLLMGenerationClient
 
 
@@ -270,13 +270,24 @@ def _rollout_group(
         }
         reward_start = time.perf_counter()
         rewards = compute_rl_rewards(rollout=rollout, sample=sample.to_reward_sample())
+        action_credit = compute_action_rewards(rollout=rollout, sample=sample.to_reward_sample())
         time_reward_seconds += time.perf_counter() - reward_start
         rollout["rewards"] = rewards
+        rollout["action_rewards"] = action_credit["action_rewards"]
+        rollout["terminal_reward"] = action_credit["terminal_reward"]
         rollouts.append(rollout)
     reward_start = time.perf_counter()
     advantages = normalize_group_advantages([item["rewards"]["total"] for item in rollouts])
     for rollout, advantage in zip(rollouts, advantages):
         rollout["advantage"] = advantage
+    assign_action_advantages(
+        rollouts,
+        local_weights={
+            "query_retriever": float(getattr(args, "query_local_credit_weight", 0.75)),
+            "evidence_updater": float(getattr(args, "evidence_local_credit_weight", 0.70)),
+            "answer_generator": float(getattr(args, "answer_local_credit_weight", 0.30)),
+        },
+    )
     time_reward_seconds += time.perf_counter() - reward_start
     return rollouts, {
         "time_rollout_seconds": time_rollout_seconds,
@@ -321,7 +332,7 @@ def _train_on_rollouts(
     did_optimizer_step = False
     metrics_list: list[dict[str, float]] = []
     for rollout, action in trainable_actions:
-        advantage = torch.tensor([float(rollout["advantage"])], dtype=torch.float32, device=device)
+        advantage = torch.tensor([float(action.advantage)], dtype=torch.float32, device=device)
         current = sequence_logprobs(
             model=train_model,
             prompt_ids=action.prompt_ids,
@@ -399,6 +410,11 @@ def _build_train_metrics_payload(
     time_total_seconds: float,
 ) -> dict[str, Any]:
     reward_totals = [item["rewards"]["total"] for item in rollouts]
+    action_advantages = [
+        float(action.advantage)
+        for rollout in rollouts
+        for action in rollout.get("actions", [])
+    ]
     return {
         "epoch": epoch,
         "sample": sample_index + 1,
@@ -414,6 +430,11 @@ def _build_train_metrics_payload(
         "reward_evidence": best_rollout["rewards"]["evidence_reward"],
         "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
         "advantage_mean": sum(item["advantage"] for item in rollouts) / len(rollouts),
+        "action_advantage_mean": (
+            sum(action_advantages) / len(action_advantages)
+            if action_advantages
+            else 0.0
+        ),
         "gold_answer": sample.answer,
         "generated_answer": best_rollout["final_answer"],
         "retrieval_count": len(best_rollout["trajectory"]),
@@ -481,6 +502,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     retrieval_env = _build_retrieval_env(args)
+    retrieval_env.prewarm(sorted({sample.dataset for sample in samples}))
     policy = _build_policy(args, raw_policy_model, tokenizer)
 
     base_output_dir = Path(args.output_root)
@@ -570,6 +592,17 @@ def main() -> None:
                             "question": sample.question,
                             "gold_answer": sample.answer,
                             "best_reward": best_rollout["rewards"],
+                            "terminal_reward": best_rollout["terminal_reward"],
+                            "action_credit": [
+                                {
+                                    "role": getattr(action.role, "value", str(action.role)),
+                                    "round_index": action.round_index,
+                                    "local_reward": action.local_reward,
+                                    "terminal_reward": action.terminal_reward,
+                                    "advantage": action.advantage,
+                                }
+                                for action in best_rollout["actions"]
+                            ],
                             "trajectory": best_rollout["trajectory"],
                         },
                     )
@@ -603,6 +636,9 @@ def main() -> None:
                 "max_rounds": args.max_rounds,
                 "kl_beta": args.kl_beta,
                 "clip_epsilon": args.clip_epsilon,
+                "query_local_credit_weight": args.query_local_credit_weight,
+                "evidence_local_credit_weight": args.evidence_local_credit_weight,
+                "answer_local_credit_weight": args.answer_local_credit_weight,
                 "world_size": _world_size(),
                 "global_step": global_step,
                 "log_jsonl_path": str(log_path),

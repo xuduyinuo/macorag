@@ -20,6 +20,10 @@ class GeneratedAction:
     prompt_ids: list[int]
     completion_ids: list[int]
     old_logprobs: Any
+    round_index: int = 0
+    local_reward: float = 0.0
+    terminal_reward: float = 0.0
+    advantage: float = 0.0
 
 
 @dataclass
@@ -52,6 +56,9 @@ class HFSharedPolicy:
 
     def reset_trace(self) -> None:
         self.trace = RolloutTrace()
+
+    def _next_round_index(self, role: AgentRole) -> int:
+        return sum(1 for action in self.trace.actions if action.role == role)
 
     def _prompt_for(
         self,
@@ -130,6 +137,7 @@ class HFSharedPolicy:
                 prompt_ids=prompt_ids,
                 completion_ids=completion,
                 old_logprobs=old_logprobs,
+                round_index=self._next_round_index(role),
             )
         )
         return response
@@ -187,6 +195,7 @@ class VLLMSharedPolicy(HFSharedPolicy):
                 prompt_ids=prompt_ids,
                 completion_ids=completion,
                 old_logprobs=old_logprobs,
+                round_index=self._next_round_index(role),
             )
         )
         return response

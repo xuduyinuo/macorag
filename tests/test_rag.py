@@ -165,6 +165,39 @@ def test_rag_executor_reuses_one_policy_for_both_agent_roles() -> None:
     assert result.state.retrieval_count == 1
 
 
+def test_rag_executor_records_partial_round_and_parse_error_role() -> None:
+    class FakePolicy:
+        def generate(self, *, role, question, state, observation=None):
+            if role == AgentRole.QUERY_RETRIEVER:
+                return '<query-retriever>{"sub_goal":"find director","query":"Bullitt director"}</query-retriever>'
+            return "invalid evidence output"
+
+    class FakeRetrievalEnv:
+        def query(self, dataset: str, query: str) -> dict:
+            return {
+                "query": query,
+                "passages": [
+                    {
+                        "passage_id": 0,
+                        "doc_id": "d1",
+                        "title": "Bullitt",
+                        "text": "Bullitt was directed by Peter Yates.",
+                    }
+                ],
+            }
+
+    result = RAGLoopExecutor(policy=FakePolicy(), retrieval_env=FakeRetrievalEnv(), max_rounds=2).run(
+        question="Who directed Bullitt?",
+        dataset="hotpotqa",
+    )
+
+    assert len(result.trajectory) == 1
+    assert result.trajectory[0]["parse_error_role"] == "evidence_updater"
+    assert result.trajectory[0]["generated_roles"] == ["query_retriever", "evidence_updater"]
+    assert result.trajectory[0]["observation"]["passages"][0]["doc_id"] == "d1"
+    assert len(result.parse_errors) == 1
+
+
 def test_compute_reward_terms_scores_answer_evidence_format_and_cost() -> None:
     trajectory = [
         {

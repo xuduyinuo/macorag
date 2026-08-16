@@ -65,6 +65,13 @@ class RAGLoopExecutor:
                 retrieval_history=[dict(item) for item in state.retrieval_history],
                 retrieval_count=state.retrieval_count,
             )
+            query_retriever: dict[str, Any] = {}
+            retrieval: dict[str, Any] = {}
+            observation = normalize_observation({"query": "", "passages": []})
+            update: dict[str, Any] = {}
+            answer: dict[str, Any] = {}
+            generated_roles: list[str] = []
+            active_role = AgentRole.QUERY_RETRIEVER
             try:
                 # query_retriever 只决定检索 query；真正返回多少段落由检索环境的 top_k 控制。
                 query_text = self.policy.generate(
@@ -72,6 +79,7 @@ class RAGLoopExecutor:
                     question=question,
                     state=state_before,
                 )
+                generated_roles.append(AgentRole.QUERY_RETRIEVER.value)
                 query_action = parse_action_text(query_text, AgentRole.QUERY_RETRIEVER)
                 query_retriever = dict(query_action.query_retriever or {})
                 query = str(query_retriever.get("query") or "")
@@ -90,12 +98,14 @@ class RAGLoopExecutor:
                 )
 
                 # evidence_updater 只把本轮检索结果中有用的 passage 合并进证据池。
+                active_role = AgentRole.EVIDENCE_UPDATER
                 update_text = self.policy.generate(
                     role=AgentRole.EVIDENCE_UPDATER,
                     question=question,
                     state=updater_state,
                     observation=observation,
                 )
+                generated_roles.append(AgentRole.EVIDENCE_UPDATER.value)
                 update_action = parse_action_text(update_text, AgentRole.EVIDENCE_UPDATER)
                 update = dict(update_action.update_evidence or {})
                 update["evidence"] = _selected_evidence(update, observation)
@@ -117,14 +127,29 @@ class RAGLoopExecutor:
                 )
 
                 # answer_generator 可以在任意一轮给出最终答案；can_answer=true 时提前结束。
+                active_role = AgentRole.ANSWER_GENERATOR
                 answer_text = self.policy.generate(
                     role=AgentRole.ANSWER_GENERATOR,
                     question=question,
                     state=answer_state,
                 )
+                generated_roles.append(AgentRole.ANSWER_GENERATOR.value)
                 answer_action = parse_action_text(answer_text, AgentRole.ANSWER_GENERATOR)
             except ValueError as exc:
                 parse_errors.append(str(exc))
+                trajectory.append(
+                    {
+                        "round": round_index,
+                        "state": state_before.to_dict(),
+                        "generated_roles": generated_roles,
+                        "parse_error_role": active_role.value,
+                        "query_retriever": query_retriever,
+                        "retrieval": retrieval,
+                        "observation": observation,
+                        "update_evidence": update,
+                        "answer": answer,
+                    }
+                )
                 break
 
             answer = dict(answer_action.answer or {})
@@ -132,6 +157,7 @@ class RAGLoopExecutor:
                 {
                     "round": round_index,
                     "state": state_before.to_dict(),
+                    "generated_roles": generated_roles,
                     "query_retriever": query_retriever,
                     "retrieval": retrieval,
                     "observation": observation,

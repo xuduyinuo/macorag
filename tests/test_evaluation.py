@@ -408,6 +408,35 @@ def test_cached_retrieval_env_shares_dataset_engine_across_threads(monkeypatch: 
     assert sorted(queried_by_thread) == ["worker-0", "worker-1"]
 
 
+def test_cached_retrieval_env_can_prewarm_dataset_engines(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    created: list[str] = []
+
+    class FakeEngine:
+        def query(self, query: str) -> object:
+            raise AssertionError("prewarm should not query")
+
+    def fake_create_linear_rag_query_engine(**kwargs) -> FakeEngine:
+        created.append(kwargs["dataset"])
+        return FakeEngine()
+
+    monkeypatch.setattr("rl_training.retrieval.create_linear_rag_query_engine", fake_create_linear_rag_query_engine)
+    env = CachedLinearRAGRetrievalEnv(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+    )
+
+    env.prewarm(["hotpotqa", "2wiki", "hotpotqa"])
+
+    assert created == ["hotpotqa", "2wiki"]
+
+
 def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

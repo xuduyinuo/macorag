@@ -1,7 +1,7 @@
 # vLLM 可执行文件和模型路径。
 vllm_bin: "/data/conda/envs/macorag/bin/vllm"
 model_path: "model/Qwen2.5-7B-Instruct"
-adapter_path: "outputs/grpo_qwen2.5-7b/2026-07-04_17-28-19/adapter"
+adapter_path: "outputs/grpo_qwen2.5-7b/2026-07-06_08-57-57/checkpoint-1400"
 vllm_model: "macorag"
 
 # 每个 base_url 的端口会启动一个服务，GPU 按顺序轮询分配。
