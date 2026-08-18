@@ -15,6 +15,7 @@ from rl_training.config import parse_args
 from rl_training.data import load_rl_samples
 from rl_training.policy import HFSharedPolicy
 from rl_training.policy import sequence_logprobs
+import rl_training.policy as policy_module
 import rl_training.rewards as reward_module
 import rl_training.trainer as trainer_module
 from rl_training.rewards import compute_answer_f1, compute_rl_rewards
@@ -429,12 +430,15 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "loss": 0.2,
         "policy_loss": 0.1,
         "kl": 0.01,
+        "time_policy_forward_seconds": 2.0,
+        "time_reference_forward_seconds": 1.5,
         "time_backward_seconds": 4.0,
         "time_optimizer_step_seconds": 0.2,
     }
     rollout_timing = {
         "time_rollout_seconds": 10.0,
         "time_vllm_generate_seconds": 6.0,
+        "time_behavior_rescore_seconds": 0.25,
         "time_reward_seconds": 0.3,
     }
 
@@ -459,7 +463,10 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
     assert payload["timing"] == {
         "rollout_seconds": 10.0,
         "vllm_generate_seconds": 6.0,
+        "behavior_rescore_seconds": 0.25,
         "reward_seconds": 0.3,
+        "policy_forward_seconds": 2.0,
+        "reference_forward_seconds": 1.5,
         "backward_seconds": 4.0,
         "optimizer_step_seconds": 0.2,
         "weight_sync_seconds": 0.4,
@@ -2502,6 +2509,106 @@ def test_sequence_logprobs_keeps_only_completion_logits() -> None:
     assert torch.all(logprobs > -1e-4)
 
 
+def test_batched_sequence_logprobs_matches_scalar_for_variable_lengths() -> None:
+    class DummyOutput:
+        def __init__(self, logits):
+            self.logits = logits
+
+    class DummyModel:
+        def __call__(self, *, input_ids, attention_mask, **kwargs):
+            del attention_mask, kwargs
+            vocab_size = 16
+            logits = torch.full((*input_ids.shape, vocab_size), -20.0)
+            labels = torch.nn.functional.pad(input_ids[:, 1:], (0, 1), value=0)
+            logits.scatter_(2, labels.unsqueeze(-1), 20.0)
+            return DummyOutput(logits)
+
+    model = DummyModel()
+    prompt_batches = [[1, 2], [3, 4, 5]]
+    completion_batches = [[6, 7], [8]]
+    scalar = [
+        sequence_logprobs(
+            model=model,
+            prompt_ids=prompt_ids,
+            completion_ids=completion_ids,
+            device=torch.device("cpu"),
+        )
+        for prompt_ids, completion_ids in zip(prompt_batches, completion_batches)
+    ]
+
+    batched, mask = policy_module.batched_sequence_logprobs(
+        model=model,
+        prompt_id_batches=prompt_batches,
+        completion_id_batches=completion_batches,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+    )
+
+    assert mask.tolist() == [[True, True], [True, False]]
+    assert torch.allclose(batched[0, :2], scalar[0])
+    assert torch.allclose(batched[1, :1], scalar[1])
+    assert batched[1, 1].item() == 0.0
+
+
+def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> None:
+    class DummyAction:
+        prompt_ids = [1, 2]
+        completion_ids = [3]
+        old_logprobs = torch.zeros(1)
+        advantage = 1.0
+
+    class Args:
+        per_device_train_batch_size = 2
+        gradient_accumulation_steps = 1
+        clip_epsilon = 0.2
+        kl_beta = 0.02
+
+    forward_batch_sizes: list[int] = []
+    backward_calls: list[float] = []
+
+    def fake_batched_sequence_logprobs(*, model, completion_id_batches, **kwargs):
+        del kwargs
+        forward_batch_sizes.append(len(completion_id_batches))
+        value = 1.0 if model == "train" else 0.0
+        logprobs = torch.full(
+            (len(completion_id_batches), 1),
+            value,
+            dtype=torch.float32,
+            requires_grad=model == "train",
+        )
+        return logprobs, torch.ones_like(logprobs, dtype=torch.bool)
+
+    original_backward = torch.Tensor.backward
+
+    def counting_backward(self, *args, **kwargs):
+        backward_calls.append(float(self.detach().item()))
+        return original_backward(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        fake_batched_sequence_logprobs,
+        raising=False,
+    )
+    monkeypatch.setattr(torch.Tensor, "backward", counting_backward)
+
+    metrics = _train_on_rollouts(
+        rollouts=[{"actions": [DummyAction() for _ in range(5)]}],
+        train_model="train",
+        raw_policy_model=object(),
+        ref_model="ref",
+        optimizer=object(),
+        args=Args(),
+        torch=torch,
+        device=torch.device("cpu"),
+        should_step=False,
+    )
+
+    assert forward_batch_sizes == [2, 2, 2, 2, 1, 1]
+    assert len(backward_calls) == 3
+    assert "time_policy_forward_seconds" in metrics
+    assert "time_reference_forward_seconds" in metrics
+
+
 def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) -> None:
     class DummyAction:
         def __init__(self, value: float) -> None:
@@ -2529,9 +2636,10 @@ def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) 
 
     backward_calls = []
 
-    def fake_sequence_logprobs(**kwargs):
-        value = float(kwargs["completion_ids"][0])
-        return torch.tensor([value], dtype=torch.float32, requires_grad=True)
+    def fake_batched_sequence_logprobs(**kwargs):
+        batch_size = len(kwargs["completion_id_batches"])
+        values = torch.full((batch_size, 1), 3.0, requires_grad=True)
+        return values, torch.ones_like(values, dtype=torch.bool)
 
     original_backward = torch.Tensor.backward
 
@@ -2539,7 +2647,10 @@ def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) 
         backward_calls.append(float(self.detach().item()))
         return original_backward(self, *args, **kwargs)
 
-    monkeypatch.setattr("rl_training.train_grpo_macorag.sequence_logprobs", fake_sequence_logprobs)
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        fake_batched_sequence_logprobs,
+    )
     monkeypatch.setattr(torch.Tensor, "backward", counting_backward)
 
     metrics = _train_on_rollouts(
@@ -2581,15 +2692,20 @@ def test_train_on_rollouts_uses_each_actions_own_advantage(monkeypatch) -> None:
 
     captured_advantages: list[float] = []
 
-    def fake_sequence_logprobs(**kwargs):
-        return torch.zeros(1, requires_grad=True)
+    def fake_batched_sequence_logprobs(**kwargs):
+        batch_size = len(kwargs["completion_id_batches"])
+        values = torch.zeros((batch_size, 1), requires_grad=True)
+        return values, torch.ones_like(values, dtype=torch.bool)
 
     def fake_grpo_loss(*, current_logprobs, advantages, **kwargs):
         captured_advantages.append(float(advantages.item()))
         loss = current_logprobs.sum() * 0.0
         return loss, {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "clip_fraction": 0.0}
 
-    monkeypatch.setattr("rl_training.train_grpo_macorag.sequence_logprobs", fake_sequence_logprobs)
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        fake_batched_sequence_logprobs,
+    )
     monkeypatch.setattr("rl_training.train_grpo_macorag.compute_grpo_loss", fake_grpo_loss)
 
     _train_on_rollouts(

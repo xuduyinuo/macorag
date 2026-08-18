@@ -16,7 +16,7 @@ from .data import RLSample, load_rl_samples
 from .logging_utils import append_jsonl as _append_jsonl
 from .logging_utils import make_timestamped_run_dir
 from .logging_utils import write_json as _write_json
-from .policy import HFSharedPolicy, VLLMSharedPolicy, sequence_logprobs
+from .policy import HFSharedPolicy, VLLMSharedPolicy, batched_sequence_logprobs
 from .retrieval import CachedLinearRAGRetrievalEnv
 from .rewards import compute_action_rewards, compute_rl_rewards
 from .runtime import extract_vllm_server_model_paths as _extract_vllm_server_model_paths
@@ -342,6 +342,7 @@ def _train_on_rollouts(
     torch: Any,
     device: Any,
     should_step: bool,
+    pad_token_id: int = 0,
 ) -> dict[str, Any]:
     del raw_policy_model
     trainable_actions = [
@@ -356,33 +357,62 @@ def _train_on_rollouts(
             "policy_loss": 0.0,
             "kl": 0.0,
             "did_optimizer_step": False,
+            "time_policy_forward_seconds": 0.0,
+            "time_reference_forward_seconds": 0.0,
             "time_backward_seconds": 0.0,
             "time_optimizer_step_seconds": 0.0,
         }
 
-    loss_scale = len(trainable_actions) * max(1, int(args.gradient_accumulation_steps))
+    total_token_count = sum(len(action.completion_ids) for _, action in trainable_actions)
+    gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
+    microbatch_size = max(1, int(getattr(args, "per_device_train_batch_size", 1)))
     loss_total = 0.0
+    policy_loss_total = 0.0
+    kl_total = 0.0
+    time_policy_forward_seconds = 0.0
+    time_reference_forward_seconds = 0.0
     time_backward_seconds = 0.0
     time_optimizer_step_seconds = 0.0
     did_optimizer_step = False
-    metrics_list: list[dict[str, float]] = []
-    for rollout, action in trainable_actions:
-        advantage = torch.tensor([float(action.advantage)], dtype=torch.float32, device=device)
-        current = sequence_logprobs(
-            model=train_model,
-            prompt_ids=action.prompt_ids,
-            completion_ids=action.completion_ids,
+    for offset in range(0, len(trainable_actions), microbatch_size):
+        microbatch = trainable_actions[offset : offset + microbatch_size]
+        actions = [action for _, action in microbatch]
+        prompt_id_batches = [action.prompt_ids for action in actions]
+        completion_id_batches = [action.completion_ids for action in actions]
+        advantage = torch.tensor(
+            [float(action.advantage) for action in actions],
+            dtype=torch.float32,
             device=device,
-        ).unsqueeze(0)
+        )
+        policy_forward_start = time.perf_counter()
+        current, mask = batched_sequence_logprobs(
+            model=train_model,
+            prompt_id_batches=prompt_id_batches,
+            completion_id_batches=completion_id_batches,
+            device=device,
+            pad_token_id=pad_token_id,
+        )
+        time_policy_forward_seconds += time.perf_counter() - policy_forward_start
+        reference_forward_start = time.perf_counter()
         with torch.no_grad():
-            reference = sequence_logprobs(
+            reference, reference_mask = batched_sequence_logprobs(
                 model=ref_model,
-                prompt_ids=action.prompt_ids,
-                completion_ids=action.completion_ids,
+                prompt_id_batches=prompt_id_batches,
+                completion_id_batches=completion_id_batches,
                 device=device,
-            ).unsqueeze(0)
-        old = action.old_logprobs.to(device=device).unsqueeze(0)
-        mask = torch.ones_like(current)
+                pad_token_id=pad_token_id,
+            )
+        time_reference_forward_seconds += time.perf_counter() - reference_forward_start
+        if not torch.equal(mask, reference_mask):
+            raise RuntimeError("Policy and reference completion masks differ.")
+        old = torch.zeros_like(current)
+        for row, action in enumerate(actions):
+            action_old = action.old_logprobs.to(device=device)
+            if action_old.numel() != len(action.completion_ids):
+                raise ValueError(
+                    "Stored behavior logprobs must align with the action completion tokens."
+                )
+            old[row, : action_old.numel()] = action_old
         loss, metrics = compute_grpo_loss(
             current_logprobs=current,
             old_logprobs=old,
@@ -392,10 +422,13 @@ def _train_on_rollouts(
             clip_epsilon=args.clip_epsilon,
             kl_beta=args.kl_beta,
         )
-        loss_total += float(loss.detach().item())
-        metrics_list.append(metrics)
+        microbatch_token_count = int(mask.sum().item())
+        token_weight = microbatch_token_count / total_token_count
+        loss_total += metrics["loss"] * token_weight
+        policy_loss_total += metrics["policy_loss"] * token_weight
+        kl_total += metrics["kl"] * token_weight
         backward_start = time.perf_counter()
-        (loss / loss_scale).backward()
+        (loss * token_weight / gradient_accumulation_steps).backward()
         time_backward_seconds += time.perf_counter() - backward_start
     if should_step:
         optimizer_start = time.perf_counter()
@@ -404,10 +437,12 @@ def _train_on_rollouts(
         did_optimizer_step = True
         time_optimizer_step_seconds += time.perf_counter() - optimizer_start
     return {
-        "loss": loss_total / len(metrics_list),
-        "policy_loss": sum(item["policy_loss"] for item in metrics_list) / len(metrics_list),
-        "kl": sum(item["kl"] for item in metrics_list) / len(metrics_list),
+        "loss": loss_total,
+        "policy_loss": policy_loss_total,
+        "kl": kl_total,
         "did_optimizer_step": did_optimizer_step,
+        "time_policy_forward_seconds": time_policy_forward_seconds,
+        "time_reference_forward_seconds": time_reference_forward_seconds,
         "time_backward_seconds": time_backward_seconds,
         "time_optimizer_step_seconds": time_optimizer_step_seconds,
     }
@@ -478,7 +513,16 @@ def _build_train_metrics_payload(
         "timing": {
             "rollout_seconds": rollout_timing["time_rollout_seconds"],
             "vllm_generate_seconds": rollout_timing.get("time_vllm_generate_seconds", 0.0),
+            "behavior_rescore_seconds": rollout_timing.get(
+                "time_behavior_rescore_seconds",
+                0.0,
+            ),
             "reward_seconds": rollout_timing["time_reward_seconds"],
+            "policy_forward_seconds": metrics.get("time_policy_forward_seconds", 0.0),
+            "reference_forward_seconds": metrics.get(
+                "time_reference_forward_seconds",
+                0.0,
+            ),
             "backward_seconds": metrics["time_backward_seconds"],
             "optimizer_step_seconds": metrics["time_optimizer_step_seconds"],
             "weight_sync_seconds": time_weight_sync_seconds,
@@ -578,6 +622,7 @@ def main() -> None:
                     torch=torch,
                     device=device,
                     should_step=(global_step + 1) % max(1, int(args.gradient_accumulation_steps)) == 0,
+                    pad_token_id=int(tokenizer.pad_token_id or 0),
                 )
                 time_weight_sync_seconds = 0.0
                 if metrics.get("did_optimizer_step"):

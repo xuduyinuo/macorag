@@ -332,3 +332,96 @@ def sequence_logprobs(
         .squeeze(-1)
     )
     return logprobs[0, -len(completion_ids) :]
+
+
+def batched_sequence_logprobs(
+    *,
+    model: Any,
+    prompt_id_batches: list[list[int]],
+    completion_id_batches: list[list[int]],
+    device: Any,
+    pad_token_id: int,
+) -> tuple[Any, Any]:
+    """Return completion-token logprobs from one padded causal-LM forward."""
+    import torch
+    import torch.nn.functional as functional
+
+    if len(prompt_id_batches) != len(completion_id_batches):
+        raise ValueError(
+            "prompt_id_batches and completion_id_batches must have identical batch sizes."
+        )
+    batch_size = len(prompt_id_batches)
+    if batch_size == 0:
+        empty = torch.empty((0, 0), dtype=torch.float32, device=device)
+        return empty, torch.empty((0, 0), dtype=torch.bool, device=device)
+    if any(
+        completion_ids and not prompt_ids
+        for prompt_ids, completion_ids in zip(prompt_id_batches, completion_id_batches)
+    ):
+        raise ValueError("A non-empty completion requires at least one prompt token.")
+
+    sequence_lengths = [
+        len(prompt_ids) + len(completion_ids)
+        for prompt_ids, completion_ids in zip(prompt_id_batches, completion_id_batches)
+    ]
+    max_sequence_length = max(sequence_lengths, default=0)
+    max_completion_length = max(map(len, completion_id_batches), default=0)
+    if max_completion_length == 0:
+        empty = torch.empty((batch_size, 0), dtype=torch.float32, device=device)
+        return empty, torch.empty((batch_size, 0), dtype=torch.bool, device=device)
+
+    input_ids = torch.full(
+        (batch_size, max_sequence_length),
+        int(pad_token_id),
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.zeros_like(input_ids)
+    completion_mask = torch.zeros(
+        (batch_size, max_completion_length),
+        dtype=torch.bool,
+        device=device,
+    )
+    predictor_positions = torch.zeros(
+        (batch_size, max_completion_length),
+        dtype=torch.long,
+        device=device,
+    )
+    completion_tokens = torch.zeros_like(predictor_positions)
+
+    for batch_index, (prompt_ids, completion_ids) in enumerate(
+        zip(prompt_id_batches, completion_id_batches)
+    ):
+        sequence = prompt_ids + completion_ids
+        left_padding = max_sequence_length - len(sequence)
+        if sequence:
+            input_ids[batch_index, left_padding:] = torch.tensor(
+                sequence,
+                dtype=torch.long,
+                device=device,
+            )
+            attention_mask[batch_index, left_padding:] = 1
+        completion_length = len(completion_ids)
+        if completion_length:
+            completion_mask[batch_index, :completion_length] = True
+            predictor_positions[batch_index, :completion_length] = torch.arange(
+                left_padding + len(prompt_ids) - 1,
+                left_padding + len(prompt_ids) + completion_length - 1,
+                device=device,
+            )
+            completion_tokens[batch_index, :completion_length] = torch.tensor(
+                completion_ids,
+                dtype=torch.long,
+                device=device,
+            )
+
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(
+        predictor_positions
+    )
+    selected_logits = outputs.logits[batch_indices, predictor_positions]
+    logprobs = functional.log_softmax(selected_logits, dim=-1).gather(
+        -1,
+        completion_tokens.unsqueeze(-1),
+    ).squeeze(-1)
+    return logprobs.masked_fill(~completion_mask, 0.0), completion_mask
