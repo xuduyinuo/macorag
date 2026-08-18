@@ -141,13 +141,11 @@ def _activate_policy_adapter(model: Any) -> None:
 
 @contextmanager
 def _reference_adapter_context(reference_model: Any, policy_model: Any):
-    if reference_model is not policy_model:
+    set_adapter = getattr(reference_model, "set_adapter", None)
+    if reference_model is not policy_model or not callable(set_adapter):
         yield reference_model
         return
 
-    set_adapter = getattr(reference_model, "set_adapter", None)
-    if not callable(set_adapter):
-        raise SystemExit("Shared-base GRPO requires PEFT set_adapter() support.")
     was_training = bool(getattr(reference_model, "training", False))
     set_adapter(_REFERENCE_ADAPTER_NAME)
     _set_adapter_trainability(reference_model, _REFERENCE_ADAPTER_NAME, trainable=False)
