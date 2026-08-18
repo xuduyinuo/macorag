@@ -12,7 +12,7 @@ from rag import RAGLoopExecutor
 
 from .config import parse_args
 from .batched_rollout import run_batched_rollouts
-from .data import RLSample, load_rl_samples
+from .data import RLSample, epoch_sample_order, load_rl_samples, select_balanced_samples
 from .logging_utils import append_jsonl as _append_jsonl
 from .logging_utils import make_timestamped_run_dir
 from .logging_utils import write_json as _write_json
@@ -563,6 +563,19 @@ def main() -> None:
         data_files=list(args.rl_data_files or []),
         max_samples=args.max_samples,
     )
+    loaded_sample_count = len(samples)
+    samples = select_balanced_samples(
+        samples,
+        max_total_samples=args.max_total_samples,
+        seed=args.seed,
+    )
+    data_summary["loaded_samples_before_total_limit"] = loaded_sample_count
+    data_summary["loaded_samples"] = len(samples)
+    data_summary["max_total_samples"] = args.max_total_samples
+    data_summary["counts_by_dataset"] = {
+        dataset: sum(sample.dataset == dataset for sample in samples)
+        for dataset in sorted({sample.dataset for sample in samples})
+    }
     if _is_main_process():
         print(f"Loaded {len(samples)} RL samples from {args.rl_data_root}")
         print(f"Counts by dataset: {data_summary['counts_by_dataset']}")
@@ -593,15 +606,17 @@ def main() -> None:
         _write_json(output_dir / "rl_dataset_summary.json", data_summary)
         print(f"Run output directory: {output_dir}")
 
-    rank_samples = _rank_samples(samples)
     total_epochs = max(1, int(math.ceil(args.num_train_epochs)))
     global_step = 0
-    progress_total = len(rank_samples) * total_epochs
+    progress_total = len(_rank_samples(samples)) * total_epochs
     if args.max_steps > 0:
         progress_total = min(progress_total, args.max_steps)
     progress_bar = _make_progress_bar(args, progress_total)
     try:
         for epoch in range(1, total_epochs + 1):
+            rank_samples = _rank_samples(
+                epoch_sample_order(samples, seed=args.seed, epoch=epoch)
+            )
             for sample_index, sample in rank_samples:
                 if args.max_steps > 0 and global_step >= args.max_steps:
                     break

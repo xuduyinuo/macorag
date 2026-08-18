@@ -24,6 +24,7 @@ PATH_DEFAULTS: dict[str, Any] = {
 ROLLOUT_DEFAULTS: dict[str, Any] = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_samples": None,
+    "max_total_samples": None,
     "seed": 42,
     "max_rounds": 3,
     "group_size": 4,
@@ -160,6 +161,11 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     rollout = parser.add_argument_group("rollout 与采样")
     rollout.add_argument("--system-prompt", default=defaults["system_prompt"])
     rollout.add_argument("--max-samples", type=int, default=defaults["max_samples"])
+    rollout.add_argument(
+        "--max-total-samples",
+        type=int,
+        default=defaults["max_total_samples"],
+    )
     rollout.add_argument("--seed", type=int, default=defaults["seed"])
     rollout.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     rollout.add_argument("--group-size", type=int, default=defaults["group_size"])

@@ -13,6 +13,8 @@ from rag import AgentRole, RAGState
 from prompt_config import load_system_prompt
 from rl_training.config import parse_args
 from rl_training.data import load_rl_samples
+from rl_training.data import RLSample
+import rl_training.data as rl_data_module
 from rl_training.policy import HFSharedPolicy
 from rl_training.policy import sequence_logprobs
 import rl_training.policy as policy_module
@@ -38,6 +40,58 @@ def _write_jsonl(path: Path, rows: list[dict]) -> None:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
+def _sample(qid: str, dataset: str) -> RLSample:
+    return RLSample(
+        qid=qid,
+        dataset=dataset,
+        question=f"question {qid}",
+        answer=f"answer {qid}",
+        answer_aliases=[],
+        supporting_facts=[],
+        context_doc_ids=[],
+        metadata={},
+    )
+
+
+def test_select_balanced_samples_limits_total_deterministically() -> None:
+    samples = [
+        _sample(f"{dataset}-{index}", dataset)
+        for dataset in ("2wiki", "hotpotqa", "musique")
+        for index in range(10)
+    ]
+
+    selected = rl_data_module.select_balanced_samples(
+        samples,
+        max_total_samples=20,
+        seed=42,
+    )
+    repeated = rl_data_module.select_balanced_samples(
+        samples,
+        max_total_samples=20,
+        seed=42,
+    )
+
+    counts = {
+        dataset: sum(item.dataset == dataset for item in selected)
+        for dataset in ("2wiki", "hotpotqa", "musique")
+    }
+    assert counts == {"2wiki": 7, "hotpotqa": 7, "musique": 6}
+    assert [item.qid for item in selected] == [item.qid for item in repeated]
+    assert len({item.qid for item in selected}) == 20
+
+
+def test_epoch_sample_order_is_deterministic_and_changes_by_epoch() -> None:
+    samples = [_sample(f"q-{index}", "hotpotqa") for index in range(12)]
+
+    epoch_one = rl_data_module.epoch_sample_order(samples, seed=7, epoch=1)
+    repeated = rl_data_module.epoch_sample_order(samples, seed=7, epoch=1)
+    epoch_two = rl_data_module.epoch_sample_order(samples, seed=7, epoch=2)
+
+    assert [item.qid for item in epoch_one] == [item.qid for item in repeated]
+    assert [item.qid for item in epoch_one] != [item.qid for item in epoch_two]
+    assert {item.qid for item in epoch_one} == {item.qid for item in samples}
+
+
 def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     config = tmp_path / "train_grpo.yml"
     config.write_text(
@@ -49,6 +103,7 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
                 'retrieval_root: "data/trajectory_train_retrieval"',
                 'output_root: "outputs/grpo"',
                 "max_samples: 8",
+                "max_total_samples: 20",
                 "max_rounds: 2",
                 "group_size: 4",
                 "kl_beta: 0.03",
@@ -71,6 +126,7 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.retrieval_root == "data/trajectory_train_retrieval"
     assert args.output_root == "outputs/grpo"
     assert args.max_samples == 3
+    assert args.max_total_samples == 20
     assert args.max_rounds == 2
     assert args.group_size == 4
     assert args.kl_beta == 0.03

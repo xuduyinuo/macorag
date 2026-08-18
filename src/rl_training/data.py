@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,6 +25,47 @@ class RLSample:
             "answer_aliases": self.answer_aliases,
             "supporting_facts": self.supporting_facts,
         }
+
+
+def select_balanced_samples(
+    samples: list[RLSample],
+    *,
+    max_total_samples: int | None,
+    seed: int,
+) -> list[RLSample]:
+    if max_total_samples is not None and max_total_samples < 0:
+        raise ValueError("max_total_samples must be non-negative or None.")
+    buckets: dict[str, list[RLSample]] = defaultdict(list)
+    for sample in samples:
+        buckets[sample.dataset].append(sample)
+    rng = random.Random(seed)
+    for bucket in buckets.values():
+        rng.shuffle(bucket)
+
+    limit = len(samples) if max_total_samples is None else min(max_total_samples, len(samples))
+    selected: list[RLSample] = []
+    dataset_names = sorted(buckets)
+    while len(selected) < limit:
+        added = False
+        for dataset in dataset_names:
+            bucket = buckets[dataset]
+            if bucket and len(selected) < limit:
+                selected.append(bucket.pop())
+                added = True
+        if not added:
+            break
+    return selected
+
+
+def epoch_sample_order(
+    samples: list[RLSample],
+    *,
+    seed: int,
+    epoch: int,
+) -> list[RLSample]:
+    ordered = list(samples)
+    random.Random(seed + epoch).shuffle(ordered)
+    return ordered
 
 
 def _read_jsonl(path: Path) -> Iterable[dict[str, Any]]:
