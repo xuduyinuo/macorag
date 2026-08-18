@@ -235,7 +235,7 @@ def run_batched_rollouts(
             turn["answer"] = answer
             candidate.trajectory.append(turn)
             candidate.state = answer_states[index]
-            if answer.get("can_answer"):
+            if answer["can_answer"] is True:
                 candidate.final_answer = answer.get("answer")
                 candidate.active = False
 

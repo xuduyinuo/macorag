@@ -1587,9 +1587,14 @@ def test_batched_rollout_masks_finished_and_parse_failed_candidates() -> None:
                     )
                 else:
                     can_answer = candidate_id != 1 or role_round == 1
+                    encoded_can_answer = (
+                        f'"{str(can_answer).lower()}"'
+                        if candidate_id == 1
+                        else str(can_answer).lower()
+                    )
                     response = (
                         '<answer>{"can_answer":'
-                        f'{str(can_answer).lower()},"answer":"answer-{candidate_id}"}}</answer>'
+                        f'{encoded_can_answer},"answer":"answer-{candidate_id}"}}</answer>'
                     )
                 trace.actions.append(
                     GeneratedAction(

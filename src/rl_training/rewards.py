@@ -5,6 +5,8 @@ import string
 from collections import Counter
 from typing import Any
 
+from rag.parser import parse_can_answer
+
 
 def _normalize_answer(value: Any) -> str:
     text = str(value or "").lower()
@@ -139,11 +141,10 @@ def _covered_supporting_fact_count(trajectory: list[dict[str, Any]], sample: dic
 
 
 def _truthy(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() == "true"
-    return bool(value)
+    try:
+        return parse_can_answer(value)
+    except ValueError:
+        return False
 
 
 def _query_reward(trajectory: list[dict[str, Any]], sample: dict[str, Any]) -> float:

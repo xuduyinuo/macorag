@@ -61,6 +61,63 @@ def test_parse_answer_generator_action_requires_answer() -> None:
     assert action.update_evidence is None
 
 
+@pytest.mark.parametrize(("raw", "expected"), [("false", False), ("TRUE", True)])
+def test_parse_answer_normalizes_boolean_strings(raw: str, expected: bool) -> None:
+    action = parse_action_text(
+        f'<answer>{{"can_answer":"{raw}","answer":"x","rationale":"r"}}</answer>',
+        AgentRole.ANSWER_GENERATOR,
+    )
+
+    assert action.answer["can_answer"] is expected
+
+
+@pytest.mark.parametrize("raw", ['"yes"', "1", "null", "[]"])
+def test_parse_answer_rejects_invalid_can_answer_types(raw: str) -> None:
+    with pytest.raises(ValueError, match="answer.can_answer"):
+        parse_action_text(
+            f'<answer>{{"can_answer":{raw},"answer":"x"}}</answer>',
+            AgentRole.ANSWER_GENERATOR,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload, field",
+    [
+        ('{"can_answer":true,"answer":123}', "answer.answer"),
+        ('{"can_answer":true,"answer":"x","rationale":123}', "answer.rationale"),
+    ],
+)
+def test_parse_answer_rejects_non_string_text_fields(payload: str, field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        parse_action_text(f"<answer>{payload}</answer>", AgentRole.ANSWER_GENERATOR)
+
+
+@pytest.mark.parametrize("selected_ids", ['["0"]', "[true]", "null", "{}"])
+def test_parse_evidence_rejects_invalid_passage_ids(selected_ids: str) -> None:
+    with pytest.raises(ValueError, match="update_evidence.selected_passage_ids"):
+        parse_action_text(
+            "<update-evidence>"
+            f'{{"selected_passage_ids":{selected_ids}}}'
+            "</update-evidence>",
+            AgentRole.EVIDENCE_UPDATER,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload, field",
+    [
+        ('{"sub_goal":1,"query":"q"}', "query_retriever.sub_goal"),
+        ('{"sub_goal":"s","query":1}', "query_retriever.query"),
+    ],
+)
+def test_parse_query_rejects_non_string_fields(payload: str, field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        parse_action_text(
+            f"<query-retriever>{payload}</query-retriever>",
+            AgentRole.QUERY_RETRIEVER,
+        )
+
+
 def test_parse_action_text_rejects_missing_required_tag() -> None:
     with pytest.raises(ValueError, match="query-retriever"):
         parse_action_text("<retrieval>{\"query\":\"x\"}</retrieval>", AgentRole.QUERY_RETRIEVER)
@@ -163,6 +220,38 @@ def test_rag_executor_reuses_one_policy_for_both_agent_roles() -> None:
     assert result.trajectory[0]["state"]["retrieval_count"] == 0
     assert result.trajectory[0]["update_evidence"]["evidence"][0]["text"].startswith("The Tripper was directed")
     assert result.state.retrieval_count == 1
+
+
+def test_rag_executor_continues_after_string_false_is_canonicalized() -> None:
+    class FakePolicy:
+        answer_round = 0
+
+        def generate(self, *, role, question, state, observation=None):
+            if role == AgentRole.QUERY_RETRIEVER:
+                return '<query-retriever>{"sub_goal":"find","query":"query"}</query-retriever>'
+            if role == AgentRole.EVIDENCE_UPDATER:
+                return '<update-evidence>{"selected_passage_ids":[]}</update-evidence>'
+            self.answer_round += 1
+            can_answer = "false" if self.answer_round == 1 else "true"
+            return (
+                '<answer>{"can_answer":"'
+                + can_answer
+                + '","answer":"done"}</answer>'
+            )
+
+    class FakeRetrievalEnv:
+        def query(self, dataset, query):
+            return {"query": query, "passages": []}
+
+    result = RAGLoopExecutor(
+        policy=FakePolicy(),
+        retrieval_env=FakeRetrievalEnv(),
+        max_rounds=2,
+    ).run(question="question", dataset="hotpotqa")
+
+    assert len(result.trajectory) == 2
+    assert result.trajectory[0]["answer"]["can_answer"] is False
+    assert result.final_answer == "done"
 
 
 def test_rag_executor_records_partial_round_and_parse_error_role() -> None:

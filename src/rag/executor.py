@@ -179,7 +179,7 @@ class RAGLoopExecutor:
                 },
             ]
             state.retrieval_count += 1 if query else 0
-            if answer.get("can_answer"):
+            if answer["can_answer"] is True:
                 final_answer = answer.get("answer")
                 break
 
