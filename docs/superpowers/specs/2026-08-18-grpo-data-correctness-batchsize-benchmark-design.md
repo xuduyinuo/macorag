@@ -96,7 +96,7 @@ The default reference batch size is 4. If it OOMs, the benchmark runner reports 
 
 ### No-Signal Groups
 
-Before any policy/reference forward, the trainer checks whether every trainable action advantage is numerically zero. When `skip_zero_advantage_updates=true`, it skips policy, reference, backward, optimizer, and vLLM post-step synchronization for that sample, records `zero_advantage`, and preserves the global sample-step counter.
+Before any policy/reference forward, the trainer checks whether every trainable action advantage is numerically zero. When `skip_zero_advantage_updates=true` and `gradient_accumulation_steps=1`, it skips policy, reference, backward, optimizer, and vLLM post-step synchronization for that sample, records `zero_advantage`, and preserves the global sample-step counter. With gradient accumulation greater than one, the skip is disabled so a zero-signal sample cannot disrupt flushing gradients accumulated by earlier samples.
 
 The first implementation does not automatically resample low-reward collapsed groups. The new group statistics provide the evidence required to design that behavior without conflating it with batch-size selection.
 
@@ -127,9 +127,9 @@ Choose the largest candidate satisfying all of the following:
 2. Finite loss, KL, rewards, and gradients for all 20 samples.
 3. Exact same selected QID sequence as the other successful candidates.
 4. No increase in parse-error or invalid-action counts attributable to execution differences.
-5. At least a 5% reduction in median non-skipped sample wall time versus the next smaller successful candidate; otherwise prefer the smaller batch to preserve memory headroom.
+5. At least a 5% increase in valid completion tokens per training-side second versus the next smaller successful candidate. Median non-skipped sample wall time is secondary because stochastic rollout lengths can differ across candidates. If token-normalized improvement is below 5%, prefer the smaller batch to preserve memory headroom.
 
-Report mean, median, P90, total wall time, training-side time, rollout time, peak GPU memory, actions/tokens processed, skipped no-signal steps, and output directory for every candidate.
+Report mean, median, P90, total wall time, training-side time, valid completion tokens per training-side second, rollout time, peak GPU memory, actions/tokens processed, skipped no-signal steps, and output directory for every candidate.
 
 ## Testing Strategy
 
