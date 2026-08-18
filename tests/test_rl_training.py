@@ -1754,6 +1754,31 @@ def test_sync_vllm_after_optimizer_step_uses_lora_mode() -> None:
     assert policy.vllm_client.dense_called is False
 
 
+def test_sync_vllm_after_optimizer_step_restores_policy_adapter() -> None:
+    from rl_training.train_grpo_macorag import _sync_vllm_after_optimizer_step
+
+    model = _FakeDualAdapterModel()
+    model.set_adapter("reference")
+
+    class InspectingClient:
+        def sync_lora_parameters(self, synced_model: object) -> float:
+            assert synced_model is model
+            assert model.active_adapter == "default"
+            assert model.policy_parameter.requires_grad is True
+            assert model.reference_parameter.requires_grad is False
+            return 3.0
+
+    policy = Namespace(vllm_client=InspectingClient())
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_sync_after_step=True,
+        vllm_sync_mode="lora",
+        vllm_sync_every_steps=1,
+    )
+
+    assert _sync_vllm_after_optimizer_step(policy, model, args) == 3.0
+
+
 def test_sync_vllm_after_optimizer_step_respects_sync_interval() -> None:
     from rl_training.train_grpo_macorag import _sync_vllm_after_optimizer_step
 
@@ -3171,6 +3196,85 @@ def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> N
     assert len(backward_calls) == 3
     assert "time_policy_forward_seconds" in metrics
     assert "time_reference_forward_seconds" in metrics
+
+
+def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypatch) -> None:
+    class DummyAction:
+        prompt_ids = [1, 2]
+        completion_ids = [3]
+        old_logprobs = torch.zeros(1)
+        advantage = 1.0
+
+    class Args:
+        per_device_train_batch_size = 1
+        reference_per_device_batch_size = 1
+        gradient_accumulation_steps = 1
+        clip_epsilon = 0.2
+        kl_beta = 0.02
+
+    model = _FakeDualAdapterModel()
+    model.train()
+    observations: list[tuple[str, bool, bool, bool]] = []
+
+    def fake_batched_sequence_logprobs(*, model, completion_id_batches, **kwargs):
+        del kwargs
+        observations.append(
+            (
+                model.active_adapter,
+                model.training,
+                model.policy_parameter.requires_grad,
+                model.reference_parameter.requires_grad,
+            )
+        )
+        values = torch.zeros(
+            (len(completion_id_batches), 1),
+            requires_grad=model.active_adapter == "default",
+        )
+        return values, torch.ones_like(values, dtype=torch.bool)
+
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        fake_batched_sequence_logprobs,
+    )
+
+    _train_on_rollouts(
+        rollouts=[{"actions": [DummyAction()]}],
+        train_model=model,
+        raw_policy_model=model,
+        ref_model=model,
+        optimizer=object(),
+        args=Args(),
+        torch=torch,
+        device=torch.device("cpu"),
+        should_step=False,
+    )
+
+    assert observations == [
+        ("reference", False, True, False),
+        ("default", True, True, False),
+    ]
+    assert model.active_adapter == "default"
+    assert model.training is True
+
+
+def test_save_checkpoint_saves_only_policy_adapter(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _save_checkpoint
+
+    calls: list[tuple[Path, dict[str, object]]] = []
+
+    class FakeModel:
+        def save_pretrained(self, path: Path, **kwargs: object) -> None:
+            calls.append((path, kwargs))
+
+    class FakeTokenizer:
+        def save_pretrained(self, path: Path) -> None:
+            assert path == tmp_path / "checkpoint-7"
+
+    _save_checkpoint(FakeModel(), FakeTokenizer(), tmp_path, 7)
+
+    assert calls == [
+        (tmp_path / "checkpoint-7", {"selected_adapters": ["default"]}),
+    ]
 
 
 def test_train_on_rollouts_skips_zero_advantage_without_model_work(monkeypatch) -> None:

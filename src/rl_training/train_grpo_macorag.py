@@ -280,6 +280,8 @@ def _sync_vllm_after_optimizer_step(
     client = getattr(policy, "vllm_client", None)
     if client is None:
         raise SystemExit("vLLM generation is enabled but policy has no vLLM client.")
+    if callable(getattr(raw_policy_model, "set_adapter", None)):
+        _activate_policy_adapter(raw_policy_model)
     sync_mode = getattr(args, "vllm_sync_mode", "dense")
     if sync_mode == "lora":
         return float(client.sync_lora_parameters(raw_policy_model))
@@ -298,6 +300,8 @@ def _sync_vllm_before_first_rollout(
     client = getattr(policy, "vllm_client", None)
     if client is None:
         raise SystemExit("vLLM generation is enabled but policy has no vLLM client.")
+    if callable(getattr(raw_policy_model, "set_adapter", None)):
+        _activate_policy_adapter(raw_policy_model)
     sync_mode = getattr(args, "vllm_sync_mode", "dense")
     if sync_mode == "lora":
         return float(client.sync_lora_parameters(raw_policy_model))
@@ -496,25 +500,26 @@ def _train_on_rollouts(
     reference_forward_batch_count = 0
     reference_by_action: list[Any] = []
     reference_forward_start = time.perf_counter()
-    with torch.no_grad():
-        for offset in range(0, len(trainable_actions), reference_batch_size):
-            reference_actions = [
-                action
-                for _, action in trainable_actions[offset : offset + reference_batch_size]
-            ]
-            reference_batch, reference_mask = batched_sequence_logprobs(
-                model=ref_model,
-                prompt_id_batches=[action.prompt_ids for action in reference_actions],
-                completion_id_batches=[action.completion_ids for action in reference_actions],
-                device=device,
-                pad_token_id=pad_token_id,
-            )
-            reference_forward_batch_count += 1
-            for row, action in enumerate(reference_actions):
-                completion_length = len(action.completion_ids)
-                if not bool(reference_mask[row, :completion_length].all().item()):
-                    raise RuntimeError("Reference completion mask is missing valid tokens.")
-                reference_by_action.append(reference_batch[row, :completion_length].detach())
+    with _reference_adapter_context(ref_model, raw_policy_model) as active_reference_model:
+        with torch.no_grad():
+            for offset in range(0, len(trainable_actions), reference_batch_size):
+                reference_actions = [
+                    action
+                    for _, action in trainable_actions[offset : offset + reference_batch_size]
+                ]
+                reference_batch, reference_mask = batched_sequence_logprobs(
+                    model=active_reference_model,
+                    prompt_id_batches=[action.prompt_ids for action in reference_actions],
+                    completion_id_batches=[action.completion_ids for action in reference_actions],
+                    device=device,
+                    pad_token_id=pad_token_id,
+                )
+                reference_forward_batch_count += 1
+                for row, action in enumerate(reference_actions):
+                    completion_length = len(action.completion_ids)
+                    if not bool(reference_mask[row, :completion_length].all().item()):
+                        raise RuntimeError("Reference completion mask is missing valid tokens.")
+                    reference_by_action.append(reference_batch[row, :completion_length].detach())
     time_reference_forward_seconds += time.perf_counter() - reference_forward_start
 
     policy_forward_batch_count = 0
@@ -598,10 +603,19 @@ def _train_on_rollouts(
     }
 
 
+def _save_policy_adapter(raw_policy_model: Any, output_dir: Path) -> None:
+    if callable(getattr(raw_policy_model, "set_adapter", None)):
+        _activate_policy_adapter(raw_policy_model)
+    raw_policy_model.save_pretrained(
+        output_dir,
+        selected_adapters=[_POLICY_ADAPTER_NAME],
+    )
+
+
 def _save_checkpoint(raw_policy_model: Any, tokenizer: Any, output_dir: Path, step: int) -> None:
     checkpoint_dir = output_dir / f"checkpoint-{step}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    raw_policy_model.save_pretrained(checkpoint_dir)
+    _save_policy_adapter(raw_policy_model, checkpoint_dir)
     tokenizer.save_pretrained(checkpoint_dir)
 
 
@@ -842,6 +856,7 @@ def main() -> None:
     tokenizer, raw_policy_model, ref_model = _load_policy_and_reference(args, deps, device)
     train_model = _wrap_ddp(raw_policy_model, torch)
     raw_policy_model.train()
+    _activate_policy_adapter(raw_policy_model)
     optimizer = torch.optim.AdamW(
         (parameter for parameter in raw_policy_model.parameters() if parameter.requires_grad),
         lr=args.learning_rate,
@@ -964,7 +979,7 @@ def main() -> None:
         _sync_vllm_after_optimizer_step(policy, raw_policy_model, args, completed_step=global_step)
 
     if _is_main_process():
-        raw_policy_model.save_pretrained(output_dir / "adapter")
+        _save_policy_adapter(raw_policy_model, output_dir / "adapter")
         tokenizer.save_pretrained(output_dir / "adapter")
         _write_json(
             output_dir / "train_meta.json",
