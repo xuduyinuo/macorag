@@ -415,11 +415,28 @@ def batched_sequence_logprobs(
                 device=device,
             )
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits_to_keep = max_completion_length + 1
+    try:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            logits_to_keep=logits_to_keep,
+        )
+    except TypeError:
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits_start = max_sequence_length - outputs.logits.shape[1]
+    relative_positions = predictor_positions - logits_start
+    valid_positions = relative_positions[completion_mask]
+    if valid_positions.numel() and (
+        valid_positions.min().item() < 0
+        or valid_positions.max().item() >= outputs.logits.shape[1]
+    ):
+        raise RuntimeError("Model logits do not cover all requested completion tokens.")
+    relative_positions = relative_positions.clamp(min=0, max=outputs.logits.shape[1] - 1)
     batch_indices = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(
-        predictor_positions
+        relative_positions
     )
-    selected_logits = outputs.logits[batch_indices, predictor_positions]
+    selected_logits = outputs.logits[batch_indices, relative_positions]
     logprobs = functional.log_softmax(selected_logits, dim=-1).gather(
         -1,
         completion_tokens.unsqueeze(-1),

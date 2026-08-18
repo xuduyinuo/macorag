@@ -2515,12 +2515,18 @@ def test_batched_sequence_logprobs_matches_scalar_for_variable_lengths() -> None
             self.logits = logits
 
     class DummyModel:
+        def __init__(self) -> None:
+            self.logits_to_keep = None
+
         def __call__(self, *, input_ids, attention_mask, **kwargs):
-            del attention_mask, kwargs
+            del attention_mask
             vocab_size = 16
             logits = torch.full((*input_ids.shape, vocab_size), -20.0)
             labels = torch.nn.functional.pad(input_ids[:, 1:], (0, 1), value=0)
             logits.scatter_(2, labels.unsqueeze(-1), 20.0)
+            self.logits_to_keep = kwargs.get("logits_to_keep")
+            if self.logits_to_keep is not None:
+                logits = logits[:, -self.logits_to_keep :, :]
             return DummyOutput(logits)
 
     model = DummyModel()
@@ -2548,6 +2554,7 @@ def test_batched_sequence_logprobs_matches_scalar_for_variable_lengths() -> None
     assert torch.allclose(batched[0, :2], scalar[0])
     assert torch.allclose(batched[1, :1], scalar[1])
     assert batched[1, 1].item() == 0.0
+    assert model.logits_to_keep == max(map(len, completion_batches)) + 1
 
 
 def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> None:
