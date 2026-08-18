@@ -233,11 +233,8 @@ def test_rag_executor_continues_after_string_false_is_canonicalized() -> None:
                 return '<update-evidence>{"selected_passage_ids":[]}</update-evidence>'
             self.answer_round += 1
             can_answer = "false" if self.answer_round == 1 else "true"
-            return (
-                '<answer>{"can_answer":"'
-                + can_answer
-                + '","answer":"done"}</answer>'
-            )
+            answer = "null" if can_answer == "false" else '"done"'
+            return f'<answer>{{"can_answer":"{can_answer}","answer":{answer}}}</answer>'
 
     class FakeRetrievalEnv:
         def query(self, dataset, query):
@@ -252,6 +249,25 @@ def test_rag_executor_continues_after_string_false_is_canonicalized() -> None:
     assert len(result.trajectory) == 2
     assert result.trajectory[0]["answer"]["can_answer"] is False
     assert result.final_answer == "done"
+
+
+def test_parse_answer_accepts_null_only_when_can_answer_is_false() -> None:
+    action = parse_action_text(
+        '<answer>{"can_answer":false,"answer":null,"rationale":"need more evidence"}</answer>',
+        AgentRole.ANSWER_GENERATOR,
+    )
+
+    assert action.answer == {
+        "can_answer": False,
+        "answer": None,
+        "rationale": "need more evidence",
+    }
+
+    with pytest.raises(ValueError, match="answer.answer"):
+        parse_action_text(
+            '<answer>{"can_answer":true,"answer":null}</answer>',
+            AgentRole.ANSWER_GENERATOR,
+        )
 
 
 def test_rag_executor_records_partial_round_and_parse_error_role() -> None:

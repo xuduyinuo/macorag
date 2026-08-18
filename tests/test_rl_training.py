@@ -1883,9 +1883,14 @@ def test_batched_rollout_masks_finished_and_parse_failed_candidates() -> None:
                         if candidate_id == 1
                         else str(can_answer).lower()
                     )
+                    answer = (
+                        "null"
+                        if candidate_id == 1 and role_round == 0
+                        else f'"answer-{candidate_id}"'
+                    )
                     response = (
                         '<answer>{"can_answer":'
-                        f'{encoded_can_answer},"answer":"answer-{candidate_id}"}}</answer>'
+                        f'{encoded_can_answer},"answer":{answer}}}</answer>'
                     )
                 trace.actions.append(
                     GeneratedAction(

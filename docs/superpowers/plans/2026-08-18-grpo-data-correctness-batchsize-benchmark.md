@@ -38,7 +38,10 @@
 
 - [ ] **Step 1: Write failing parser tests**
 
-Add tests proving `"false"` and `"TRUE"` normalize to booleans, while `"yes"`, `1`, a numeric answer, a non-string rationale, boolean passage IDs, and string passage IDs raise `ValueError` with the relevant field name.
+Add tests proving `"false"` and `"TRUE"` normalize to booleans, `false` accepts the
+SFT-contract `answer: null`, while `"yes"`, `1`, a numeric answer for `true`, a
+non-string rationale, boolean passage IDs, and string passage IDs raise `ValueError`
+with the relevant field name.
 
 ```python
 @pytest.mark.parametrize(("raw", "expected"), [("false", False), ("TRUE", True)])

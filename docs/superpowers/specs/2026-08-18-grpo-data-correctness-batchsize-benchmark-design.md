@@ -38,7 +38,9 @@ Adopt role-specific vLLM JSON-schema decoding and redesign all tagged responses.
 
 - `answer.can_answer` accepts JSON booleans and the case-insensitive strings `"true"` and `"false"`, returning a real Python `bool`.
 - Values such as `"yes"`, `1`, lists, and null are rejected with a role-specific `ValueError`.
-- `answer.answer` and `answer.rationale`, when present, must be strings. `answer.answer` remains required.
+- `answer.answer` remains required. It must be a string when `can_answer=true`; when
+  `can_answer=false`, it may be null to preserve the existing SFT output contract.
+  `answer.rationale`, when present, must be a string.
 - Query `sub_goal` and `query` must be strings; `sub_goal` remains non-empty.
 - `selected_passage_ids` must be a list containing only integer IDs. Booleans are rejected even though `bool` subclasses `int` in Python.
 - Once parsed, executors use `answer["can_answer"] is True`; they never apply generic Python truthiness.

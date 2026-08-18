@@ -99,6 +99,9 @@ def parse_action_text(text: str, role: AgentRole | str) -> ParsedAction:
     if "answer" not in answer:
         raise ValueError("Missing required field: answer.answer")
     answer["can_answer"] = parse_can_answer(answer["can_answer"])
-    _require_string(answer, "answer", field="answer.answer", allow_empty=True)
+    if answer["can_answer"] is True:
+        _require_string(answer, "answer", field="answer.answer", allow_empty=True)
+    elif answer["answer"] is not None and not isinstance(answer["answer"], str):
+        raise ValueError("answer.answer must be null or a string when can_answer is false.")
     _validate_optional_string(answer, "rationale", field="answer.rationale")
     return ParsedAction(role=role, answer=answer)
