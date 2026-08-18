@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import types
+from unittest.mock import ANY
 
 import pytest
 import torch
@@ -236,6 +237,158 @@ def test_rl_runtime_helpers_are_extracted_and_reexported() -> None:
     assert entrypoint._parse_gpu_indices is runtime.parse_gpu_indices
     assert entrypoint._validate_vllm_gpu_placement is runtime.validate_vllm_gpu_placement
     assert entrypoint._validate_local_vllm_server_model is runtime.validate_local_vllm_server_model
+
+
+class _FakeDualAdapterModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.policy_parameter = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=True)
+        self.reference_parameter = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
+        self.active_adapter = "default"
+        self.loaded_adapters: list[tuple[str, bool]] = []
+        self.gradient_checkpointing_calls: list[dict[str, object]] = []
+
+    def named_parameters(self, prefix: str = "", recurse: bool = True):
+        del prefix, recurse
+        yield "base_model.layer.lora_A.default.weight", self.policy_parameter
+        yield "base_model.layer.lora_A.reference.weight", self.reference_parameter
+
+    def parameters(self, recurse: bool = True):
+        del recurse
+        yield self.policy_parameter
+        yield self.reference_parameter
+
+    def load_adapter(self, path: str, *, adapter_name: str, is_trainable: bool) -> None:
+        assert path == "outputs/sft/adapter"
+        self.loaded_adapters.append((adapter_name, is_trainable))
+
+    def set_adapter(self, adapter_name: str) -> None:
+        self.active_adapter = adapter_name
+        if adapter_name == "default":
+            self.policy_parameter.requires_grad_(True)
+        elif adapter_name == "reference":
+            self.reference_parameter.requires_grad_(True)
+
+    def gradient_checkpointing_enable(self, **kwargs: object) -> None:
+        self.gradient_checkpointing_calls.append(kwargs)
+
+
+@pytest.mark.parametrize("gradient_checkpointing", [False, True])
+def test_load_policy_and_reference_uses_one_shared_base_with_dual_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+    gradient_checkpointing: bool,
+) -> None:
+    import rl_training.train_grpo_macorag as train_module
+
+    base_loads: list[str] = []
+    prepare_calls: list[dict[str, object]] = []
+    peft_loads: list[tuple[object, str, str, bool]] = []
+
+    class FakeTokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        @classmethod
+        def from_pretrained(cls, path: str, **kwargs: object):
+            assert path == "outputs/sft/adapter"
+            assert kwargs == {"trust_remote_code": True}
+            return cls()
+
+    class FakeBase:
+        def __init__(self) -> None:
+            self.config = Namespace(use_cache=True)
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path: str, **kwargs: object):
+            assert kwargs == {"fake_model_kwarg": True}
+            base_loads.append(path)
+            return FakeBase()
+
+    shared_model = _FakeDualAdapterModel()
+
+    class FakePeftModel:
+        @staticmethod
+        def from_pretrained(base: object, path: str, *, adapter_name: str, is_trainable: bool):
+            peft_loads.append((base, path, adapter_name, is_trainable))
+            return shared_model
+
+    def fake_prepare(base: object, **kwargs: object) -> object:
+        prepare_calls.append(kwargs)
+        return base
+
+    monkeypatch.setattr(train_module, "_model_kwargs", lambda *args: {"fake_model_kwarg": True})
+    args = Namespace(
+        model_path="model/base",
+        sft_adapter_path="outputs/sft/adapter",
+        load_4bit=True,
+        gradient_checkpointing=gradient_checkpointing,
+    )
+    deps = {
+        "torch": torch,
+        "AutoModelForCausalLM": FakeAutoModel,
+        "AutoTokenizer": FakeTokenizer,
+        "PeftModel": FakePeftModel,
+        "prepare_model_for_kbit_training": fake_prepare,
+    }
+
+    tokenizer, policy_model, reference_model = train_module._load_policy_and_reference(
+        args,
+        deps,
+        torch.device("cpu"),
+    )
+
+    assert tokenizer.pad_token == "<eos>"
+    assert base_loads == ["model/base"]
+    assert peft_loads == [
+        (ANY, "outputs/sft/adapter", "default", True),
+    ]
+    assert shared_model.loaded_adapters == [("reference", False)]
+    assert policy_model is shared_model
+    assert reference_model is shared_model
+    assert shared_model.active_adapter == "default"
+    assert shared_model.policy_parameter.requires_grad is True
+    assert shared_model.reference_parameter.requires_grad is False
+    assert prepare_calls == [
+        {
+            "use_gradient_checkpointing": gradient_checkpointing,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+        }
+    ]
+    assert bool(shared_model.gradient_checkpointing_calls) is gradient_checkpointing
+
+
+def test_reference_adapter_context_restores_policy_mode_and_freezes_reference() -> None:
+    from rl_training.train_grpo_macorag import _reference_adapter_context
+
+    model = _FakeDualAdapterModel()
+    model.train()
+
+    with _reference_adapter_context(model, model) as reference_model:
+        assert reference_model is model
+        assert model.active_adapter == "reference"
+        assert model.training is False
+        assert model.reference_parameter.requires_grad is False
+
+    assert model.active_adapter == "default"
+    assert model.training is True
+    assert model.policy_parameter.requires_grad is True
+    assert model.reference_parameter.requires_grad is False
+
+
+def test_reference_adapter_context_restores_policy_after_exception() -> None:
+    from rl_training.train_grpo_macorag import _reference_adapter_context
+
+    model = _FakeDualAdapterModel()
+    model.train()
+
+    with pytest.raises(RuntimeError, match="reference failed"):
+        with _reference_adapter_context(model, model):
+            raise RuntimeError("reference failed")
+
+    assert model.active_adapter == "default"
+    assert model.training is True
+    assert model.reference_parameter.requires_grad is False
 
 
 def test_rl_logging_helpers_are_extracted_and_reexported() -> None:

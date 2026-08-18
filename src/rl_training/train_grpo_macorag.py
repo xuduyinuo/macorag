@@ -6,6 +6,7 @@ import os
 import random
 import statistics
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,10 @@ from .runtime import validate_local_vllm_server_model as _validate_local_vllm_se
 from .runtime import validate_vllm_gpu_placement as _validate_vllm_gpu_placement
 from .trainer import assign_action_advantages, compute_grpo_loss, normalize_group_advantages
 from .vllm_client import VLLMGenerationClient
+
+
+_POLICY_ADAPTER_NAME = "default"
+_REFERENCE_ADAPTER_NAME = "reference"
 
 
 def _configure_visible_gpus(args: Any) -> None:
@@ -119,6 +124,41 @@ def _device(torch: Any) -> Any:
     return torch.device("cpu")
 
 
+def _set_adapter_trainability(model: Any, adapter_name: str, *, trainable: bool) -> None:
+    marker = f".{adapter_name}."
+    for name, parameter in model.named_parameters():
+        if marker in f".{name}.":
+            parameter.requires_grad_(trainable)
+
+
+def _activate_policy_adapter(model: Any) -> None:
+    set_adapter = getattr(model, "set_adapter", None)
+    if not callable(set_adapter):
+        raise SystemExit("Shared-base GRPO requires PEFT set_adapter() support.")
+    set_adapter(_POLICY_ADAPTER_NAME)
+    _set_adapter_trainability(model, _REFERENCE_ADAPTER_NAME, trainable=False)
+
+
+@contextmanager
+def _reference_adapter_context(reference_model: Any, policy_model: Any):
+    if reference_model is not policy_model:
+        yield reference_model
+        return
+
+    set_adapter = getattr(reference_model, "set_adapter", None)
+    if not callable(set_adapter):
+        raise SystemExit("Shared-base GRPO requires PEFT set_adapter() support.")
+    was_training = bool(getattr(reference_model, "training", False))
+    set_adapter(_REFERENCE_ADAPTER_NAME)
+    _set_adapter_trainability(reference_model, _REFERENCE_ADAPTER_NAME, trainable=False)
+    reference_model.eval()
+    try:
+        yield reference_model
+    finally:
+        _activate_policy_adapter(reference_model)
+        reference_model.train(was_training)
+
+
 def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> tuple[Any, Any, Any]:
     torch = deps["torch"]
     AutoModelForCausalLM = deps["AutoModelForCausalLM"]
@@ -138,24 +178,29 @@ def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> 
     if args.load_4bit:
         base_model = prepare_model_for_kbit_training(
             base_model,
+            use_gradient_checkpointing=args.gradient_checkpointing,
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
-    policy_model = PeftModel.from_pretrained(base_model, args.sft_adapter_path, is_trainable=True)
+    policy_model = PeftModel.from_pretrained(
+        base_model,
+        args.sft_adapter_path,
+        adapter_name=_POLICY_ADAPTER_NAME,
+        is_trainable=True,
+    )
+    load_adapter = getattr(policy_model, "load_adapter", None)
+    if not callable(load_adapter):
+        raise SystemExit("Shared-base GRPO requires PEFT load_adapter() support.")
+    load_adapter(
+        args.sft_adapter_path,
+        adapter_name=_REFERENCE_ADAPTER_NAME,
+        is_trainable=False,
+    )
+    _activate_policy_adapter(policy_model)
     if args.gradient_checkpointing and hasattr(policy_model, "gradient_checkpointing_enable"):
         policy_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-
-    ref_base = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        **_model_kwargs(args, torch, _local_rank()),
-    )
-    ref_model = PeftModel.from_pretrained(ref_base, args.sft_adapter_path, is_trainable=False)
-    ref_model.eval()
-    for parameter in ref_model.parameters():
-        parameter.requires_grad_(False)
     if not args.load_4bit:
         policy_model.to(device)
-        ref_model.to(device)
-    return tokenizer, policy_model, ref_model
+    return tokenizer, policy_model, policy_model
 
 
 def _wrap_ddp(model: Any, torch: Any) -> Any:
