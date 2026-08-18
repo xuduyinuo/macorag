@@ -35,6 +35,7 @@ class LinearRAG:
         self.graph = ig.Graph(directed=False)
         self.graph_loaded = self.load_graph()
         self.ner_mappings_loaded = self.load_ner_mappings()
+        self._retrieval_state_prepared = False
 
     def load_ner_mappings(self) -> bool:
         """Load passage/sentence -> entity mappings from query-time cache."""
@@ -168,7 +169,11 @@ class LinearRAG:
             question_info["pred_answer"] = pred_ans
         return retrieval_results
         
-    def retrieve(self, questions):
+    def _prepare_retrieval_state(self):
+        """Materialize immutable query-time state once for this index."""
+        if getattr(self, "_retrieval_state_prepared", False):
+            return
+
         self.entity_hash_ids = list(self.entity_embedding_store.hash_id_to_text.keys())
         self.entity_embeddings = np.array(self.entity_embedding_store.embeddings)
         self.passage_hash_ids = list(self.passage_embedding_store.hash_id_to_text.keys())
@@ -189,6 +194,7 @@ class LinearRAG:
             ]
         else:
             self.passage_node_indices = []
+        self._graph_ready_for_query = graph_ready
 
         # Precompute sparse matrices for vectorized retrieval if needed
         vectorized_ready = (
@@ -216,11 +222,30 @@ class LinearRAG:
                     "using BFS/dense fallback."
                 )
 
+        self._retrieval_state_prepared = True
+
+    def retrieve(self, questions):
+        self._prepare_retrieval_state()
+        graph_ready = self._graph_ready_for_query
+
+        if not questions:
+            return []
+        question_texts = [question_info["question"] for question_info in questions]
+        question_embeddings = self.config.embedding_model.encode(
+            question_texts,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=self.config.batch_size,
+        )
         retrieval_results = []
         disable_progress = os.environ.get("MACORAG_SILENT_RETRIEVAL") == "1"
-        for question_info in tqdm(questions, desc="Retrieving", disable=disable_progress):
+        for question_info, question_embedding in tqdm(
+            zip(questions, question_embeddings),
+            total=len(questions),
+            desc="Retrieving",
+            disable=disable_progress,
+        ):
             question = question_info["question"]
-            question_embedding = self.config.embedding_model.encode(question,normalize_embeddings=True,show_progress_bar=False,batch_size=self.config.batch_size)
             seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores = self.get_seed_entities(question)
             if len(seed_entities) != 0 and graph_ready:
                 sorted_passage_hash_ids,sorted_passage_scores = self.graph_search_with_seed_entities(question,question_embedding,seed_entity_indices,seed_entities,seed_entity_hash_ids,seed_entity_scores)

@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
 import torch
 
 from rag import AgentRole, RAGState
@@ -243,6 +244,120 @@ def test_linear_rag_query_engine_loads_sentence_transformer_offline(
 
     assert captured["model_name"] == "sentence-transformers/all-mpnet-base-v2"
     assert captured["kwargs"]["local_files_only"] is True
+
+
+def test_linearrag_prepares_query_state_only_once(monkeypatch) -> None:
+    import data_processing.retrieval as retrieval
+
+    _, linear_rag_cls = retrieval._load_linearrag_modules()
+    engine = object.__new__(linear_rag_cls)
+    engine._retrieval_state_prepared = False
+    engine.config = Namespace(use_vectorized_retrieval=True)
+    engine.device = torch.device("cpu")
+    engine.entity_embedding_store = Namespace(hash_id_to_text={"e": "entity"}, embeddings=[[1.0]])
+    engine.passage_embedding_store = Namespace(hash_id_to_text={"p": "passage"}, embeddings=[[2.0]])
+    engine.sentence_embedding_store = Namespace(hash_id_to_text={"s": "sentence"}, embeddings=[[3.0]])
+    engine.graph_loaded = False
+    engine.ner_mappings_loaded = True
+    engine.entity_hash_id_to_sentence_hash_ids = {"e": {"s"}}
+    engine.sentence_hash_id_to_entity_hash_ids = {"s": {"e"}}
+    monkeypatch.setattr(engine, "_ensure_graph_ready_for_query", lambda: False)
+    sparse_calls: list[str] = []
+
+    def prepare_sparse() -> None:
+        sparse_calls.append("prepared")
+        fake_sparse = Namespace(shape=(1, 1), _nnz=lambda: 1)
+        engine.entity_to_sentence_sparse = fake_sparse
+        engine.sentence_to_entity_sparse = fake_sparse
+
+    monkeypatch.setattr(engine, "_precompute_sparse_matrices", prepare_sparse)
+
+    engine._prepare_retrieval_state()
+    first_entity_embeddings = engine.entity_embeddings
+    engine._prepare_retrieval_state()
+
+    assert sparse_calls == ["prepared"]
+    assert engine._retrieval_state_prepared is True
+    assert engine.entity_embeddings is first_entity_embeddings
+    assert engine.passage_node_indices == []
+
+
+def test_linearrag_encodes_query_batch_in_one_model_call(monkeypatch) -> None:
+    import numpy as np
+    import data_processing.retrieval as retrieval
+
+    _, linear_rag_cls = retrieval._load_linearrag_modules()
+    engine = object.__new__(linear_rag_cls)
+    engine._retrieval_state_prepared = True
+    engine._graph_ready_for_query = False
+    engine.passage_embedding_store = Namespace(texts=["passage"])
+
+    class FakeEmbeddingModel:
+        def __init__(self) -> None:
+            self.calls: list[object] = []
+
+        def encode(self, value, **kwargs):
+            self.calls.append(value)
+            return np.asarray([[1.0], [2.0]], dtype=np.float32)
+
+    embedding_model = FakeEmbeddingModel()
+    engine.config = Namespace(
+        embedding_model=embedding_model,
+        batch_size=8,
+        retrieval_top_k=1,
+    )
+    monkeypatch.setattr(engine, "get_seed_entities", lambda question: ([], [], [], []))
+    monkeypatch.setattr(
+        engine,
+        "dense_passage_retrieval",
+        lambda embedding: ([0], [float(np.asarray(embedding).reshape(-1)[0])]),
+    )
+
+    rows = engine.retrieve([{"question": "q1"}, {"question": "q2"}])
+
+    assert embedding_model.calls == [["q1", "q2"]]
+    assert [row["question"] for row in rows] == ["q1", "q2"]
+    assert [row["sorted_passage_scores"] for row in rows] == [[1.0], [2.0]]
+
+
+def test_linear_rag_query_engine_batches_queries_in_order() -> None:
+    import data_processing.retrieval as retrieval
+
+    calls: list[list[dict[str, str]]] = []
+
+    class FakeEngine:
+        def retrieve(self, questions: list[dict[str, str]]) -> list[dict[str, object]]:
+            calls.append(questions)
+            return [
+                {
+                    "sorted_passage": [f"passage:{item['question']}"],
+                    "sorted_passage_scores": [float(index)],
+                }
+                for index, item in enumerate(questions)
+            ]
+
+    query_engine = object.__new__(retrieval.LinearRAGQueryEngine)
+    query_engine.dataset = "hotpotqa"
+    query_engine.engine = FakeEngine()
+
+    results = query_engine.query_batch(["q1", "q2"])
+
+    assert calls == [[{"question": "q1"}, {"question": "q2"}]]
+    assert [item.query for item in results] == ["q1", "q2"]
+    assert [item.passages for item in results] == [["passage:q1"], ["passage:q2"]]
+    assert [item.scores for item in results] == [[0.0], [1.0]]
+    assert query_engine.query_batch([]) == []
+
+
+def test_linear_rag_query_engine_rejects_mismatched_batch_size() -> None:
+    import data_processing.retrieval as retrieval
+
+    query_engine = object.__new__(retrieval.LinearRAGQueryEngine)
+    query_engine.dataset = "hotpotqa"
+    query_engine.engine = Namespace(retrieve=lambda questions: [])
+
+    with pytest.raises(RuntimeError, match="batch size"):
+        query_engine.query_batch(["q1"])
 
 
 def test_train_grpo_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:

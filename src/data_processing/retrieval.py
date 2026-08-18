@@ -127,14 +127,32 @@ class LinearRAGQueryEngine:
         self.dataset = dataset
         self.engine = LinearRAG(config)
 
+    def prepare(self) -> None:
+        prepare = getattr(self.engine, "_prepare_retrieval_state", None)
+        if callable(prepare):
+            prepare()
+
     def query(self, query: str) -> RetrievalResult:
-        results = self.engine.retrieve([{"question": query}])[0]
-        return RetrievalResult(
-            dataset=self.dataset,
-            query=query,
-            passages=list(results["sorted_passage"]),
-            scores=[float(score) for score in results["sorted_passage_scores"]],
-        )
+        return self.query_batch([query])[0]
+
+    def query_batch(self, queries: list[str]) -> list[RetrievalResult]:
+        if not queries:
+            return []
+        rows = self.engine.retrieve([{"question": query} for query in queries])
+        if len(rows) != len(queries):
+            raise RuntimeError(
+                "LinearRAG returned a mismatched batch size: "
+                f"expected {len(queries)}, got {len(rows)}."
+            )
+        return [
+            RetrievalResult(
+                dataset=self.dataset,
+                query=query,
+                passages=list(row["sorted_passage"]),
+                scores=[float(score) for score in row["sorted_passage_scores"]],
+            )
+            for query, row in zip(queries, rows)
+        ]
 
 
 def _dataset_dir(processed_root: Union[str, Path], dataset: str) -> Path:

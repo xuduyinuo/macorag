@@ -61,13 +61,20 @@ class CachedLinearRAGRetrievalEnv:
         for dataset in datasets:
             if dataset in seen:
                 continue
-            self._engine(dataset)
+            engine = self._engine(dataset)
+            prepare = getattr(engine, "prepare", None)
+            if callable(prepare):
+                prepare()
             seen.add(dataset)
 
     def query(self, dataset: str, query: str) -> dict[str, Any]:
         lock = self._dataset_lock(dataset)
         with lock:
             result = self._engine(dataset).query(query)
+        return self._observation(result, query=query)
+
+    @staticmethod
+    def _observation(result: Any, *, query: str | None = None) -> dict[str, Any]:
         passages = []
         for passage_id, text in enumerate(result.passages):
             passages.append(
@@ -78,4 +85,17 @@ class CachedLinearRAGRetrievalEnv:
                     "score": result.scores[passage_id] if passage_id < len(result.scores) else None,
                 }
             )
-        return {"query": query, "passages": passages}
+        return {"query": query if query is not None else result.query, "passages": passages}
+
+    def query_batch(self, dataset: str, queries: list[str]) -> list[dict[str, Any]]:
+        if not queries:
+            return []
+        lock = self._dataset_lock(dataset)
+        with lock:
+            results = self._engine(dataset).query_batch(queries)
+        if len(results) != len(queries):
+            raise RuntimeError(
+                "LinearRAG query environment returned a mismatched batch size: "
+                f"expected {len(queries)}, got {len(results)}."
+            )
+        return [self._observation(result) for result in results]

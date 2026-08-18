@@ -437,6 +437,85 @@ def test_cached_retrieval_env_can_prewarm_dataset_engines(monkeypatch: pytest.Mo
     assert created == ["hotpotqa", "2wiki"]
 
 
+def test_cached_retrieval_env_prewarm_prepares_each_engine_once(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    prepared: list[str] = []
+
+    class FakeEngine:
+        def __init__(self, dataset: str) -> None:
+            self.dataset = dataset
+
+        def prepare(self) -> None:
+            prepared.append(self.dataset)
+
+    monkeypatch.setattr(
+        "rl_training.retrieval.create_linear_rag_query_engine",
+        lambda **kwargs: FakeEngine(kwargs["dataset"]),
+    )
+    env = CachedLinearRAGRetrievalEnv(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+    )
+
+    env.prewarm(["hotpotqa", "hotpotqa", "2wiki"])
+
+    assert prepared == ["hotpotqa", "2wiki"]
+
+
+def test_cached_retrieval_env_batches_queries_with_one_engine_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from data_processing.retrieval import RetrievalResult
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    batches: list[list[str]] = []
+
+    class FakeEngine:
+        def query_batch(self, queries: list[str]) -> list[RetrievalResult]:
+            batches.append(queries)
+            return [
+                RetrievalResult(
+                    dataset="hotpotqa",
+                    query=query,
+                    passages=[f"passage:{query}"],
+                    scores=[float(index)],
+                )
+                for index, query in enumerate(queries)
+            ]
+
+    monkeypatch.setattr(
+        "rl_training.retrieval.create_linear_rag_query_engine",
+        lambda **kwargs: FakeEngine(),
+    )
+    env = CachedLinearRAGRetrievalEnv(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+    )
+
+    observations = env.query_batch("hotpotqa", ["q1", "q2"])
+
+    assert batches == [["q1", "q2"]]
+    assert [item["query"] for item in observations] == ["q1", "q2"]
+    assert [item["passages"][0]["passage_id"] for item in observations] == [0, 0]
+    assert [item["passages"][0]["score"] for item in observations] == [0.0, 1.0]
+    assert env.query_batch("hotpotqa", []) == []
+
+
 def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
