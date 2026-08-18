@@ -100,7 +100,19 @@ class _FakeLLM:
                 "lora_request": lora_request,
             }
         )
-        return [SimpleNamespace(outputs=[SimpleNamespace(token_ids=(11, 12, 13))])]
+        results = []
+        for prompt_index, _ in enumerate(prompts):
+            token_ids = tuple(11 + (prompt_index * 10) + offset for offset in range(3))
+            logprobs = [
+                {token_id: SimpleNamespace(logprob=-0.1 * (offset + 1))}
+                for offset, token_id in enumerate(token_ids)
+            ]
+            results.append(
+                SimpleNamespace(
+                    outputs=[SimpleNamespace(token_ids=token_ids, logprobs=logprobs)]
+                )
+            )
+        return results
 
     def collective_rpc(self, *, method, args=(), kwargs=None):
         self.collective_rpc_calls.append({"method": method, "args": args, "kwargs": kwargs or {}})
@@ -410,12 +422,45 @@ def test_generate_endpoint_passes_fixed_lora_request() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {"completion_ids": [[11, 12, 13]]}
+    assert response.json() == {
+        "completion_ids": [[11, 12, 13]],
+        "logprobs": [[-0.1, -0.2, pytest.approx(-0.3)]],
+    }
     assert llm.generate_calls[0]["prompts"] == ["hello"]
     assert llm.generate_calls[0]["sampling_params"].kwargs["temperature"] == 0.7
+    assert llm.generate_calls[0]["sampling_params"].kwargs["logprobs"] == 1
     assert llm.generate_calls[0]["lora_request"].lora_name == "macorag_train"
     assert llm.generate_calls[0]["lora_request"].lora_int_id == 1
     assert llm.generate_calls[0]["lora_request"].lora_path == "outputs/adapter"
+
+
+def test_generate_endpoint_returns_batched_completion_logprobs_in_prompt_order() -> None:
+    from fastapi.testclient import TestClient
+
+    from rl_training.vllm_lora_server import create_app, parse_server_args
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+    llm = _FakeLLM()
+    client = TestClient(create_app(args, llm=llm, sampling_params_cls=_FakeSamplingParams))
+
+    response = client.post("/generate/", json={"prompts": ["first", "second"], "max_tokens": 3})
+
+    assert response.status_code == 200
+    assert response.json()["completion_ids"] == [[11, 12, 13], [21, 22, 23]]
+    assert response.json()["logprobs"][0] == pytest.approx([-0.1, -0.2, -0.3])
+    assert response.json()["logprobs"][1] == pytest.approx([-0.1, -0.2, -0.3])
+    assert llm.generate_calls[0]["prompts"] == ["first", "second"]
 
 
 def test_health_endpoint_exposes_lora_identity_and_capability_status() -> None:

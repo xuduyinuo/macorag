@@ -11,6 +11,8 @@ from rag import (
     build_query_retriever_prompt,
 )
 
+from .vllm_client import VLLMGenerationOutput
+
 
 @dataclass
 class GeneratedAction:
@@ -29,6 +31,14 @@ class GeneratedAction:
 @dataclass
 class RolloutTrace:
     actions: list[GeneratedAction] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class PolicyGenerationRequest:
+    role: AgentRole
+    question: str
+    state: RAGState
+    observation: dict[str, Any] | None = None
 
 
 class HFSharedPolicy:
@@ -147,11 +157,17 @@ class VLLMSharedPolicy(HFSharedPolicy):
     def __init__(self, *, vllm_client: Any, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.vllm_client = vllm_client
-        self.timing: dict[str, float] = {"time_vllm_generate_seconds": 0.0}
+        self.timing: dict[str, float] = {
+            "time_vllm_generate_seconds": 0.0,
+            "time_behavior_rescore_seconds": 0.0,
+        }
 
     def reset_trace(self) -> None:
         super().reset_trace()
-        self.timing = {"time_vllm_generate_seconds": 0.0}
+        self.timing = {
+            "time_vllm_generate_seconds": 0.0,
+            "time_behavior_rescore_seconds": 0.0,
+        }
 
     def generate(
         self,
@@ -161,44 +177,120 @@ class VLLMSharedPolicy(HFSharedPolicy):
         state: RAGState,
         observation: dict[str, Any] | None = None,
     ) -> str:
+        return self.generate_batch(
+            [
+                PolicyGenerationRequest(
+                    role=role,
+                    question=question,
+                    state=state,
+                    observation=observation,
+                )
+            ],
+            traces=[self.trace],
+        )[0]
+
+    def generate_batch(
+        self,
+        requests: list[PolicyGenerationRequest],
+        *,
+        traces: list[RolloutTrace] | None = None,
+    ) -> list[str]:
         import time
         import torch
 
-        prompt = self._prompt_for(role=role, question=question, state=state, observation=observation)
-        prompt_ids = self._encode_prompt(prompt)
-        generate_start = time.perf_counter()
-        completion, response = self.vllm_client.generate(
-            self.tokenizer.decode(prompt_ids, skip_special_tokens=False),
-            max_tokens=self.max_completion_length,
-            temperature=self.temperature,
-            top_p=self.top_p,
-            top_k=self.top_k,
-        )
-        self.timing["time_vllm_generate_seconds"] += time.perf_counter() - generate_start
-        if self.tokenizer.eos_token_id in completion:
-            completion = completion[: completion.index(self.tokenizer.eos_token_id) + 1]
-        if not response:
-            response = self.tokenizer.decode(completion, skip_special_tokens=True)
-        device = next(self.model.parameters()).device
-        with torch.no_grad():
-            old_logprobs = sequence_logprobs(
-                model=self.model,
-                prompt_ids=prompt_ids,
-                completion_ids=completion,
-                device=device,
-            ).detach().cpu()
-        self.trace.actions.append(
-            GeneratedAction(
-                role=role,
-                prompt=prompt,
-                response=response,
-                prompt_ids=prompt_ids,
-                completion_ids=completion,
-                old_logprobs=old_logprobs,
-                round_index=self._next_round_index(role),
+        if not requests:
+            return []
+        if traces is None:
+            traces = [self.trace for _ in requests]
+        if len(traces) != len(requests):
+            raise ValueError(
+                f"Expected one rollout trace per generation request, got {len(traces)} for {len(requests)}."
             )
-        )
-        return response
+
+        prompts = [
+            self._prompt_for(
+                role=request.role,
+                question=request.question,
+                state=request.state,
+                observation=request.observation,
+            )
+            for request in requests
+        ]
+        prompt_id_batches = [self._encode_prompt(prompt) for prompt in prompts]
+        decoded_prompts = [
+            self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
+            for prompt_ids in prompt_id_batches
+        ]
+        generate_start = time.perf_counter()
+        batch_generator = getattr(self.vllm_client, "generate_batch", None)
+        if callable(batch_generator):
+            outputs = batch_generator(
+                decoded_prompts,
+                max_tokens=self.max_completion_length,
+                temperature=self.temperature,
+                top_p=self.top_p,
+                top_k=self.top_k,
+            )
+        else:
+            outputs = []
+            for decoded_prompt in decoded_prompts:
+                completion_ids, text = self.vllm_client.generate(
+                    decoded_prompt,
+                    max_tokens=self.max_completion_length,
+                    temperature=self.temperature,
+                    top_p=self.top_p,
+                    top_k=self.top_k,
+                )
+                outputs.append(VLLMGenerationOutput(completion_ids=completion_ids, text=text))
+        self.timing["time_vllm_generate_seconds"] += time.perf_counter() - generate_start
+        if len(outputs) != len(requests):
+            raise RuntimeError(
+                f"vLLM returned {len(outputs)} outputs for {len(requests)} policy requests."
+            )
+
+        device = next(self.model.parameters()).device
+        responses: list[str] = []
+        for request, trace, prompt, prompt_ids, output in zip(
+            requests,
+            traces,
+            prompts,
+            prompt_id_batches,
+            outputs,
+        ):
+            completion_ids = list(output.completion_ids)
+            output_logprobs = list(output.logprobs) if output.logprobs is not None else None
+            if self.tokenizer.eos_token_id in completion_ids:
+                end = completion_ids.index(self.tokenizer.eos_token_id) + 1
+                completion_ids = completion_ids[:end]
+                if output_logprobs is not None:
+                    output_logprobs = output_logprobs[:end]
+            response = output.text or self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+            if output_logprobs is None:
+                rescore_start = time.perf_counter()
+                with torch.no_grad():
+                    old_logprobs = sequence_logprobs(
+                        model=self.model,
+                        prompt_ids=prompt_ids,
+                        completion_ids=completion_ids,
+                        device=device,
+                    ).detach().cpu()
+                self.timing["time_behavior_rescore_seconds"] += time.perf_counter() - rescore_start
+            else:
+                old_logprobs = torch.tensor(output_logprobs, dtype=torch.float32)
+            round_index = sum(1 for action in trace.actions if action.role == request.role)
+            trace.actions.append(
+                GeneratedAction(
+                    role=request.role,
+                    prompt=prompt,
+                    response=response,
+                    prompt_ids=prompt_ids,
+                    completion_ids=completion_ids,
+                    old_logprobs=old_logprobs,
+                    round_index=round_index,
+                )
+            )
+            responses.append(response)
+        return responses
 
 
 def sequence_logprobs(

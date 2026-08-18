@@ -1,9 +1,17 @@
 from __future__ import annotations
 
 import time
+from dataclasses import dataclass
 from typing import Any
 
 from .vllm_lora_mapping import collect_lora_named_tensors
+
+
+@dataclass(frozen=True)
+class VLLMGenerationOutput:
+    completion_ids: list[int]
+    logprobs: list[float] | None = None
+    text: str = ""
 
 
 def collect_trainable_named_parameters(model: Any, *, device: Any | None = None) -> dict[str, Any]:
@@ -157,22 +165,93 @@ class VLLMGenerationClient:
         top_p: float,
         top_k: int,
     ) -> tuple[list[int], str]:
+        outputs = self.generate_batch(
+            [prompt],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+        )
+        return outputs[0].completion_ids, outputs[0].text
+
+    def generate_batch(
+        self,
+        prompts: list[str],
+        *,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        top_k: int,
+    ) -> list[VLLMGenerationOutput]:
+        if not prompts:
+            return []
+        request_payload = {
+            "prompts": prompts,
+            "n": 1,
+            "repetition_penalty": 1.0,
+            "temperature": temperature,
+            "top_p": top_p,
+            "top_k": top_k,
+            "max_tokens": max_tokens,
+        }
+        session = getattr(self.backend, "session", None)
+        base_url = getattr(self.backend, "base_url", None)
+        if session is not None and base_url is not None:
+            response = session.post(f"{base_url}/generate/", json=request_payload)
+            if response.status_code != 200:
+                raise RuntimeError(f"vLLM generation failed: HTTP {response.status_code}, {response.text}")
+            try:
+                payload = response.json()
+            except Exception as exc:
+                raise RuntimeError(f"Invalid /generate/ response: {exc}") from exc
+            return self._outputs_from_payload(prompts, payload)
+
         generator = getattr(self.backend, "generate", None)
         if generator is None:
             raise SystemExit("TRL VLLMClient is missing generate(); installed TRL is incompatible.")
         outputs = generator(
-            prompts=[prompt],
-            n=1,
-            repetition_penalty=1.0,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
+            **request_payload,
         )
-        first = outputs[0]
-        if first and isinstance(first[0], list):
-            first = first[0]
-        return list(first), ""
+        completion_ids = []
+        for output in outputs:
+            if output and isinstance(output[0], list):
+                if len(output) != 1:
+                    raise RuntimeError("vLLM returned multiple completions when n=1.")
+                output = output[0]
+            completion_ids.append(list(output))
+        return self._outputs_from_payload(prompts, {"completion_ids": completion_ids})
+
+    @staticmethod
+    def _outputs_from_payload(
+        prompts: list[str],
+        payload: dict[str, Any],
+    ) -> list[VLLMGenerationOutput]:
+        completion_ids = payload.get("completion_ids")
+        if not isinstance(completion_ids, list) or len(completion_ids) != len(prompts):
+            actual = len(completion_ids) if isinstance(completion_ids, list) else "invalid"
+            raise RuntimeError(
+                "vLLM returned a mismatched generation batch size: "
+                f"expected {len(prompts)}, got {actual}."
+            )
+        payload_logprobs = payload.get("logprobs")
+        if payload_logprobs is not None and (
+            not isinstance(payload_logprobs, list) or len(payload_logprobs) != len(prompts)
+        ):
+            raise RuntimeError("vLLM returned a mismatched logprob batch size.")
+
+        results: list[VLLMGenerationOutput] = []
+        for index, token_ids in enumerate(completion_ids):
+            tokens = [int(item) for item in token_ids]
+            logprobs = None
+            if payload_logprobs is not None:
+                logprobs = [float(item) for item in payload_logprobs[index]]
+                if len(logprobs) != len(tokens):
+                    raise RuntimeError(
+                        "vLLM completion/logprob length mismatch: "
+                        f"completion {index} has {len(tokens)} tokens and {len(logprobs)} logprobs."
+                    )
+            results.append(VLLMGenerationOutput(completion_ids=tokens, logprobs=logprobs))
+        return results
 
     def sync_trainable_parameters(self, model: Any) -> float:
         updater = getattr(self.backend, "update_named_param", None)

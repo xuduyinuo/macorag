@@ -788,6 +788,74 @@ class _FakeSession:
         )
 
 
+def test_vllm_generation_client_batches_prompts_with_aligned_logprobs() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        update_payload={
+            "completion_ids": [[10, 11], [20]],
+            "logprobs": [[-0.1, -0.2], [-0.3]],
+        }
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+
+    outputs = client.generate_batch(
+        ["first", "second"],
+        max_tokens=8,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    assert [item.completion_ids for item in outputs] == [[10, 11], [20]]
+    assert [item.logprobs for item in outputs] == [[-0.1, -0.2], [-0.3]]
+    assert backend.session.posts == [
+        (
+            "http://127.0.0.1:8000/generate/",
+            {
+                "prompts": ["first", "second"],
+                "n": 1,
+                "repetition_penalty": 1.0,
+                "temperature": 0.7,
+                "top_p": 0.9,
+                "top_k": 5,
+                "max_tokens": 8,
+            },
+        )
+    ]
+
+
+def test_vllm_generation_client_rejects_misaligned_logprobs() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        update_payload={"completion_ids": [[10, 11]], "logprobs": [[-0.1]]}
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+
+    with pytest.raises(RuntimeError, match="logprob length"):
+        client.generate_batch(
+            ["prompt"],
+            max_tokens=8,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=5,
+        )
+
+
+def test_vllm_generation_client_empty_batch_avoids_backend_call() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+
+    assert client.generate_batch([], max_tokens=8, temperature=0.7, top_p=0.9, top_k=5) == []
+
+
 def test_vllm_generation_client_syncs_trainable_parameters() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
@@ -1296,6 +1364,106 @@ def test_vllm_shared_policy_generates_and_records_trace() -> None:
     assert action.response == "decoded response"
     assert action.old_logprobs.shape == (2,)
     assert policy.timing["time_vllm_generate_seconds"] >= 0.0
+
+
+def test_vllm_shared_policy_batches_requests_and_uses_server_logprobs(monkeypatch) -> None:
+    from rl_training.policy import PolicyGenerationRequest, RolloutTrace, VLLMSharedPolicy
+    from rl_training.vllm_client import VLLMGenerationOutput
+
+    class FakeBatchClient:
+        def __init__(self) -> None:
+            self.prompt_batches: list[list[str]] = []
+
+        def generate_batch(self, prompts, **kwargs):
+            self.prompt_batches.append(prompts)
+            return [
+                VLLMGenerationOutput(completion_ids=[10, 11], logprobs=[-0.1, -0.2]),
+                VLLMGenerationOutput(completion_ids=[20], logprobs=[-0.3]),
+            ]
+
+    monkeypatch.setattr(
+        "rl_training.policy.sequence_logprobs",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("HF rescoring should not run")),
+    )
+    client = FakeBatchClient()
+    policy = VLLMSharedPolicy(
+        model=_LogprobModel(),
+        tokenizer=_FakeTokenizer(),
+        vllm_client=client,
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+    traces = [RolloutTrace(), RolloutTrace()]
+    requests = [
+        PolicyGenerationRequest(
+            role=AgentRole.QUERY_RETRIEVER,
+            question="first",
+            state=RAGState(question="first"),
+        ),
+        PolicyGenerationRequest(
+            role=AgentRole.QUERY_RETRIEVER,
+            question="second",
+            state=RAGState(question="second"),
+        ),
+    ]
+
+    responses = policy.generate_batch(requests, traces=traces)
+
+    assert responses == ["decoded response", "decoded response"]
+    assert len(client.prompt_batches) == 1
+    assert [trace.actions[0].completion_ids for trace in traces] == [[10, 11], [20]]
+    assert torch.equal(traces[0].actions[0].old_logprobs, torch.tensor([-0.1, -0.2]))
+    assert torch.equal(traces[1].actions[0].old_logprobs, torch.tensor([-0.3]))
+    assert [trace.actions[0].round_index for trace in traces] == [0, 0]
+    assert policy.timing["time_behavior_rescore_seconds"] == 0.0
+
+
+def test_vllm_shared_policy_falls_back_to_hf_rescore_without_server_logprobs(monkeypatch) -> None:
+    from rl_training.policy import PolicyGenerationRequest, RolloutTrace, VLLMSharedPolicy
+    from rl_training.vllm_client import VLLMGenerationOutput
+
+    class FakeBatchClient:
+        def generate_batch(self, prompts, **kwargs):
+            return [VLLMGenerationOutput(completion_ids=[10, 11], logprobs=None)]
+
+    rescored: list[list[int]] = []
+
+    def fake_sequence_logprobs(**kwargs):
+        rescored.append(kwargs["completion_ids"])
+        return torch.tensor([-1.0, -2.0])
+
+    monkeypatch.setattr("rl_training.policy.sequence_logprobs", fake_sequence_logprobs)
+    policy = VLLMSharedPolicy(
+        model=_LogprobModel(),
+        tokenizer=_FakeTokenizer(),
+        vllm_client=FakeBatchClient(),
+        system_prompt="system",
+        max_prompt_length=32,
+        max_completion_length=2,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+    trace = RolloutTrace()
+
+    policy.generate_batch(
+        [
+            PolicyGenerationRequest(
+                role=AgentRole.QUERY_RETRIEVER,
+                question="question",
+                state=RAGState(question="question"),
+            )
+        ],
+        traces=[trace],
+    )
+
+    assert rescored == [[10, 11]]
+    assert torch.equal(trace.actions[0].old_logprobs, torch.tensor([-1.0, -2.0]))
+    assert policy.timing["time_behavior_rescore_seconds"] >= 0.0
 
 
 def test_build_policy_uses_hf_policy_when_vllm_disabled() -> None:

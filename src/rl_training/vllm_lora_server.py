@@ -289,6 +289,26 @@ def refresh_active_lora(adapter_manager: Any, lora_int_id: int) -> bool:
     return True
 
 
+def _chosen_token_logprobs(output: Any) -> list[float]:
+    token_ids = list(output.token_ids)
+    token_logprobs = getattr(output, "logprobs", None)
+    if token_logprobs is None or len(token_logprobs) != len(token_ids):
+        raise RuntimeError(
+            "vLLM completion/logprob length mismatch: "
+            f"{len(token_ids)} tokens versus {0 if token_logprobs is None else len(token_logprobs)} logprobs."
+        )
+    chosen: list[float] = []
+    for token_id, candidates in zip(token_ids, token_logprobs):
+        entry = candidates.get(token_id) if isinstance(candidates, dict) else None
+        if entry is None and isinstance(candidates, dict):
+            entry = candidates.get(str(token_id))
+        if entry is None:
+            raise RuntimeError(f"vLLM logprobs missing chosen token {token_id}.")
+        value = getattr(entry, "logprob", entry)
+        chosen.append(float(value))
+    return chosen
+
+
 def create_app(
     args: argparse.Namespace,
     *,
@@ -356,6 +376,7 @@ def create_app(
             "top_k": request.top_k,
             "min_p": request.min_p,
             "max_tokens": request.max_tokens,
+            "logprobs": 1,
         }
         if request.guided_decoding_regex is not None:
             try:
@@ -368,8 +389,10 @@ def create_app(
             )
         sampling_params = sampling_params_cls(**sampling_kwargs)
         outputs = llm.generate(request.prompts, sampling_params=sampling_params, lora_request=lora_request)
-        completion_ids = [list(output.token_ids) for outputs_item in outputs for output in outputs_item.outputs]
-        return {"completion_ids": completion_ids}
+        flattened_outputs = [output for outputs_item in outputs for output in outputs_item.outputs]
+        completion_ids = [list(output.token_ids) for output in flattened_outputs]
+        logprobs = [_chosen_token_logprobs(output) for output in flattened_outputs]
+        return {"completion_ids": completion_ids, "logprobs": logprobs}
 
     @app.post("/init_communicator/")
     async def init_communicator(request: InitCommunicatorRequest = Body(...)):
