@@ -516,6 +516,99 @@ def test_cached_retrieval_env_batches_queries_with_one_engine_call(
     assert env.query_batch("hotpotqa", []) == []
 
 
+def test_cached_retrieval_env_deduplicates_batch_misses_and_isolates_copies(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from data_processing.retrieval import RetrievalResult
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    batches: list[list[str]] = []
+
+    class FakeEngine:
+        def query_batch(self, queries):
+            batches.append(list(queries))
+            return [
+                RetrievalResult(
+                    dataset="hotpotqa",
+                    query=query,
+                    passages=[f"passage:{query}"],
+                    scores=[1.0],
+                )
+                for query in queries
+            ]
+
+    monkeypatch.setattr(
+        "rl_training.retrieval.create_linear_rag_query_engine",
+        lambda **kwargs: FakeEngine(),
+    )
+    env = CachedLinearRAGRetrievalEnv(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+        query_cache_size=8,
+    )
+
+    first = env.query_batch("hotpotqa", [" Q1 ", "q1", "q2"])
+    first[0]["passages"][0]["text"] = "mutated"
+    second = env.query_batch("hotpotqa", ["q1", "q2"])
+
+    assert batches == [[" Q1 ", "q2"]]
+    assert [item["query"] for item in first] == [" Q1 ", "q1", "q2"]
+    assert second[0]["passages"][0]["text"] == "passage: Q1 "
+    assert env.stats()["cache_hits"] == 3
+    assert env.stats()["cache_misses"] == 2
+    assert env.stats()["time_retrieval_seconds"] >= 0.0
+
+
+def test_cached_retrieval_env_evicts_lru_and_zero_disables_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from data_processing.retrieval import RetrievalResult
+    from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+
+    batches: list[list[str]] = []
+
+    class FakeEngine:
+        def query_batch(self, queries):
+            batches.append(list(queries))
+            return [RetrievalResult("hotpotqa", query, [query], [1.0]) for query in queries]
+
+    monkeypatch.setattr(
+        "rl_training.retrieval.create_linear_rag_query_engine",
+        lambda **kwargs: FakeEngine(),
+    )
+    common = dict(
+        retrieval_root=tmp_path,
+        embedding_model="embedding",
+        spacy_model=None,
+        top_k=5,
+        max_workers=2,
+        batch_size=4,
+        use_vectorized_retrieval=True,
+    )
+    cached = CachedLinearRAGRetrievalEnv(**common, query_cache_size=1)
+    cached.query_batch("hotpotqa", ["q1"])
+    cached.query_batch("hotpotqa", ["q2"])
+    cached.query_batch("hotpotqa", ["q1"])
+
+    uncached = CachedLinearRAGRetrievalEnv(**common, query_cache_size=0)
+    uncached.query_batch("hotpotqa", ["q"])
+    uncached.query_batch("hotpotqa", ["q"])
+
+    assert batches[:3] == [["q1"], ["q2"], ["q1"]]
+    assert batches[3:] == [["q"], ["q"]]
+    assert cached.stats()["cache_hits"] == 0
+    assert cached.stats()["cache_misses"] == 3
+    assert uncached.stats()["cache_hits"] == 0
+    assert uncached.stats()["cache_misses"] == 2
+
+
 def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

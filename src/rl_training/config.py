@@ -78,6 +78,7 @@ RETRIEVAL_DEFAULTS: dict[str, Any] = {
     "retrieval_max_workers": 8,
     "retrieval_batch_size": 128,
     "use_vectorized_retrieval": False,
+    "retrieval_query_cache_size": 4096,
 }
 
 # vLLM 生成与权重同步：当前支持 dense 与 LoRA 两种同步路径。
@@ -234,6 +235,11 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     retrieval.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
     retrieval.add_argument("--retrieval-max-workers", type=int, default=defaults["retrieval_max_workers"])
     retrieval.add_argument("--retrieval-batch-size", type=int, default=defaults["retrieval_batch_size"])
+    retrieval.add_argument(
+        "--retrieval-query-cache-size",
+        type=int,
+        default=defaults["retrieval_query_cache_size"],
+    )
     retrieval.add_argument(
         "--use-vectorized-retrieval",
         action=BooleanOptionalAction,

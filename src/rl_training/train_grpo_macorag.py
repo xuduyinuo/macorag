@@ -185,6 +185,7 @@ def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
         max_workers=args.retrieval_max_workers,
         batch_size=args.retrieval_batch_size,
         use_vectorized_retrieval=args.use_vectorized_retrieval,
+        query_cache_size=getattr(args, "retrieval_query_cache_size", 0),
     )
 
 
@@ -271,6 +272,8 @@ def _rollout_group(
     time_vllm_generate_seconds = 0.0
     time_behavior_rescore_seconds = 0.0
     time_reward_seconds = 0.0
+    retrieval_stats = getattr(retrieval_env, "stats", None)
+    retrieval_before = retrieval_stats() if callable(retrieval_stats) else {}
 
     supports_batch = callable(getattr(policy, "generate_batch", None))
     if supports_batch:
@@ -341,11 +344,22 @@ def _rollout_group(
         },
     )
     time_reward_seconds += time.perf_counter() - reward_start
+    retrieval_after = retrieval_stats() if callable(retrieval_stats) else {}
     return rollouts, {
         "time_rollout_seconds": time_rollout_seconds,
         "time_vllm_generate_seconds": time_vllm_generate_seconds,
         "time_behavior_rescore_seconds": time_behavior_rescore_seconds,
         "time_reward_seconds": time_reward_seconds,
+        "time_retrieval_seconds": float(
+            retrieval_after.get("time_retrieval_seconds", 0.0)
+            - retrieval_before.get("time_retrieval_seconds", 0.0)
+        ),
+        "retrieval_cache_hits": int(
+            retrieval_after.get("cache_hits", 0) - retrieval_before.get("cache_hits", 0)
+        ),
+        "retrieval_cache_misses": int(
+            retrieval_after.get("cache_misses", 0) - retrieval_before.get("cache_misses", 0)
+        ),
     }
 
 
