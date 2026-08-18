@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from argparse import Namespace
 from pathlib import Path
+import subprocess
 import sys
 import types
 
@@ -617,6 +619,86 @@ def test_resolved_args_payload_makes_runtime_values_json_serializable(tmp_path: 
         "nested": {"devices": ["0", "1"]},
         "output_path": str(tmp_path / "output"),
     }
+
+
+def test_batch_benchmark_dry_run_prints_isolated_candidates(tmp_path: Path) -> None:
+    result = subprocess.run(
+        ["bash", "scripts/benchmark_grpo_batch_sizes.sh"],
+        cwd=Path.cwd(),
+        env={
+            **dict(os.environ),
+            "DRY_RUN": "1",
+            "SAMPLE_COUNT": "20",
+            "BATCH_SIZES": "1 2 4",
+            "BENCHMARK_ROOT": str(tmp_path / "benchmark"),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.count("rl_training.train_grpo_macorag") == 3
+    assert result.stdout.count("--max-total-samples 20") == 3
+    for batch_size in (1, 2, 4):
+        assert f"--per-device-train-batch-size {batch_size}" in result.stdout
+        assert str(tmp_path / "benchmark" / f"bs{batch_size}" / "runs") in result.stdout
+
+
+def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: Path) -> None:
+    root = tmp_path / "benchmark"
+    qids = [f"q{index}" for index in range(20)]
+    throughputs = {1: 100.0, 2: 107.0, 4: 110.0}
+    for batch_size, throughput in throughputs.items():
+        candidate = root / f"bs{batch_size}"
+        run_dir = candidate / "runs" / "2026-08-18_00-00-00"
+        run_dir.mkdir(parents=True)
+        (candidate / "status.json").write_text(
+            json.dumps({"status": "success", "exit_code": 0}), encoding="utf-8"
+        )
+        (candidate / "gpu_memory_mib.txt").write_text("1000\n1200\n", encoding="utf-8")
+        (run_dir / "train_meta.json").write_text(
+            json.dumps({"selected_qids": qids}), encoding="utf-8"
+        )
+        with (run_dir / "train_metrics.jsonl").open("w", encoding="utf-8") as handle:
+            for index, qid in enumerate(qids):
+                training_seconds = 100.0 / throughput
+                handle.write(
+                    json.dumps(
+                        {
+                            "qid": qid,
+                            "loss": 0.1,
+                            "kl": 0.01,
+                            "reward_total": 0.5,
+                            "valid_completion_token_count": 100,
+                            "trainable_action_count": 4,
+                            "skipped_update_reason": None,
+                            "timing": {
+                                "policy_forward_seconds": training_seconds / 3,
+                                "reference_forward_seconds": training_seconds / 3,
+                                "backward_seconds": training_seconds / 3,
+                                "rollout_seconds": 2.0,
+                                "total_seconds": 3.0 + index / 100,
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+
+    result = subprocess.run(
+        [sys.executable, "scripts/summarize_grpo_batch_benchmark.py", str(root)],
+        cwd=Path.cwd(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["same_selected_qids"] is True
+    assert summary["selected_batch_size"] == 2
+    assert summary["candidates"]["2"]["valid_tokens_per_training_second"] == pytest.approx(107.0)
+    assert summary["candidates"]["4"]["peak_gpu_memory_mib"] == 1200
 
 
 def test_parse_args_supports_disabling_rl_progress_bar(tmp_path: Path) -> None:
