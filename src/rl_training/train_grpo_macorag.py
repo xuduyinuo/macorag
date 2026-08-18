@@ -383,29 +383,76 @@ def _train_on_rollouts(
         for action in rollout["actions"]
         if action.completion_ids
     ]
-    if not trainable_actions:
-        return {
-            "loss": 0.0,
-            "policy_loss": 0.0,
-            "kl": 0.0,
-            "did_optimizer_step": False,
-            "time_policy_forward_seconds": 0.0,
-            "time_reference_forward_seconds": 0.0,
-            "time_backward_seconds": 0.0,
-            "time_optimizer_step_seconds": 0.0,
-        }
-
+    action_count = len(trainable_actions)
     total_token_count = sum(len(action.completion_ids) for _, action in trainable_actions)
+    base_metrics = {
+        "loss": 0.0,
+        "policy_loss": 0.0,
+        "kl": 0.0,
+        "clip_fraction": 0.0,
+        "trainable_action_count": action_count,
+        "valid_completion_token_count": total_token_count,
+        "policy_forward_batch_count": 0,
+        "reference_forward_batch_count": 0,
+        "did_optimizer_step": False,
+        "skipped_update_reason": None,
+        "time_policy_forward_seconds": 0.0,
+        "time_reference_forward_seconds": 0.0,
+        "time_backward_seconds": 0.0,
+        "time_optimizer_step_seconds": 0.0,
+    }
+    if not trainable_actions:
+        base_metrics["skipped_update_reason"] = "no_trainable_actions"
+        return base_metrics
+
     gradient_accumulation_steps = max(1, int(args.gradient_accumulation_steps))
+    if (
+        bool(getattr(args, "skip_zero_advantage_updates", False))
+        and gradient_accumulation_steps == 1
+        and all(abs(float(action.advantage)) <= 1e-12 for _, action in trainable_actions)
+    ):
+        base_metrics["skipped_update_reason"] = "zero_advantage"
+        return base_metrics
+
     microbatch_size = max(1, int(getattr(args, "per_device_train_batch_size", 1)))
+    reference_batch_size = max(
+        1,
+        int(getattr(args, "reference_per_device_batch_size", microbatch_size)),
+    )
     loss_total = 0.0
     policy_loss_total = 0.0
     kl_total = 0.0
+    clip_fraction_total = 0.0
     time_policy_forward_seconds = 0.0
     time_reference_forward_seconds = 0.0
     time_backward_seconds = 0.0
     time_optimizer_step_seconds = 0.0
     did_optimizer_step = False
+    reference_forward_batch_count = 0
+    reference_by_action: list[Any] = []
+    reference_forward_start = time.perf_counter()
+    with torch.no_grad():
+        for offset in range(0, len(trainable_actions), reference_batch_size):
+            reference_actions = [
+                action
+                for _, action in trainable_actions[offset : offset + reference_batch_size]
+            ]
+            reference_batch, reference_mask = batched_sequence_logprobs(
+                model=ref_model,
+                prompt_id_batches=[action.prompt_ids for action in reference_actions],
+                completion_id_batches=[action.completion_ids for action in reference_actions],
+                device=device,
+                pad_token_id=pad_token_id,
+            )
+            reference_forward_batch_count += 1
+            for row, action in enumerate(reference_actions):
+                completion_length = len(action.completion_ids)
+                if not bool(reference_mask[row, :completion_length].all().item()):
+                    raise RuntimeError("Reference completion mask is missing valid tokens.")
+                reference_by_action.append(reference_batch[row, :completion_length].detach())
+    time_reference_forward_seconds += time.perf_counter() - reference_forward_start
+
+    policy_forward_batch_count = 0
     for offset in range(0, len(trainable_actions), microbatch_size):
         microbatch = trainable_actions[offset : offset + microbatch_size]
         actions = [action for _, action in microbatch]
@@ -424,21 +471,13 @@ def _train_on_rollouts(
             device=device,
             pad_token_id=pad_token_id,
         )
+        policy_forward_batch_count += 1
         time_policy_forward_seconds += time.perf_counter() - policy_forward_start
-        reference_forward_start = time.perf_counter()
-        with torch.no_grad():
-            reference, reference_mask = batched_sequence_logprobs(
-                model=ref_model,
-                prompt_id_batches=prompt_id_batches,
-                completion_id_batches=completion_id_batches,
-                device=device,
-                pad_token_id=pad_token_id,
-            )
-        time_reference_forward_seconds += time.perf_counter() - reference_forward_start
-        if not torch.equal(mask, reference_mask):
-            raise RuntimeError("Policy and reference completion masks differ.")
+        reference = torch.zeros_like(current)
         old = torch.zeros_like(current)
         for row, action in enumerate(actions):
+            reference_row = reference_by_action[offset + row]
+            reference[row, : reference_row.numel()] = reference_row
             action_old = action.old_logprobs.to(device=device)
             if action_old.numel() != len(action.completion_ids):
                 raise ValueError(
@@ -459,6 +498,7 @@ def _train_on_rollouts(
         loss_total += metrics["loss"] * token_weight
         policy_loss_total += metrics["policy_loss"] * token_weight
         kl_total += metrics["kl"] * token_weight
+        clip_fraction_total += metrics["clip_fraction"] * token_weight
         backward_start = time.perf_counter()
         (loss * token_weight / gradient_accumulation_steps).backward()
         time_backward_seconds += time.perf_counter() - backward_start
@@ -472,7 +512,13 @@ def _train_on_rollouts(
         "loss": loss_total,
         "policy_loss": policy_loss_total,
         "kl": kl_total,
+        "clip_fraction": clip_fraction_total,
+        "trainable_action_count": action_count,
+        "valid_completion_token_count": total_token_count,
+        "policy_forward_batch_count": policy_forward_batch_count,
+        "reference_forward_batch_count": reference_forward_batch_count,
         "did_optimizer_step": did_optimizer_step,
+        "skipped_update_reason": None,
         "time_policy_forward_seconds": time_policy_forward_seconds,
         "time_reference_forward_seconds": time_reference_forward_seconds,
         "time_backward_seconds": time_backward_seconds,

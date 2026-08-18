@@ -110,7 +110,9 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
                 "clip_epsilon: 0.15",
                 "learning_rate: 0.00001",
                 "per_device_train_batch_size: 1",
+                "reference_per_device_batch_size: 4",
                 "gradient_accumulation_steps: 2",
+                "skip_zero_advantage_updates: true",
                 "gpu_indices: \"0,1\"",
                 "disable_tqdm: false",
             ]
@@ -132,6 +134,8 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.kl_beta == 0.03
     assert args.clip_epsilon == 0.15
     assert args.gradient_accumulation_steps == 2
+    assert args.reference_per_device_batch_size == 4
+    assert args.skip_zero_advantage_updates is True
     assert args.gpu_indices == "0,1"
     assert args.disable_tqdm is False
 
@@ -2658,16 +2662,17 @@ def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> N
 
     class Args:
         per_device_train_batch_size = 2
+        reference_per_device_batch_size = 4
         gradient_accumulation_steps = 1
         clip_epsilon = 0.2
         kl_beta = 0.02
 
-    forward_batch_sizes: list[int] = []
+    forward_batch_sizes: list[tuple[str, int]] = []
     backward_calls: list[float] = []
 
     def fake_batched_sequence_logprobs(*, model, completion_id_batches, **kwargs):
         del kwargs
-        forward_batch_sizes.append(len(completion_id_batches))
+        forward_batch_sizes.append((model, len(completion_id_batches)))
         value = 1.0 if model == "train" else 0.0
         logprobs = torch.full(
             (len(completion_id_batches), 1),
@@ -2702,10 +2707,64 @@ def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> N
         should_step=False,
     )
 
-    assert forward_batch_sizes == [2, 2, 2, 2, 1, 1]
+    assert forward_batch_sizes == [
+        ("ref", 4),
+        ("ref", 1),
+        ("train", 2),
+        ("train", 2),
+        ("train", 1),
+    ]
     assert len(backward_calls) == 3
     assert "time_policy_forward_seconds" in metrics
     assert "time_reference_forward_seconds" in metrics
+
+
+def test_train_on_rollouts_skips_zero_advantage_without_model_work(monkeypatch) -> None:
+    class DummyAction:
+        prompt_ids = [1, 2]
+        completion_ids = [3]
+        old_logprobs = torch.zeros(1)
+        advantage = 0.0
+
+    class Args:
+        per_device_train_batch_size = 1
+        reference_per_device_batch_size = 4
+        gradient_accumulation_steps = 1
+        skip_zero_advantage_updates = True
+        clip_epsilon = 0.2
+        kl_beta = 0.02
+
+    def unexpected_forward(**kwargs):
+        raise AssertionError("zero-advantage samples must not run model forwards")
+
+    class UnexpectedOptimizer:
+        def step(self):
+            raise AssertionError("zero-advantage samples must not step the optimizer")
+
+        def zero_grad(self, **kwargs):
+            raise AssertionError("zero-advantage samples must not clear gradients")
+
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        unexpected_forward,
+    )
+
+    metrics = _train_on_rollouts(
+        rollouts=[{"actions": [DummyAction()]}],
+        train_model=object(),
+        raw_policy_model=object(),
+        ref_model=object(),
+        optimizer=UnexpectedOptimizer(),
+        args=Args(),
+        torch=torch,
+        device=torch.device("cpu"),
+        should_step=True,
+    )
+
+    assert metrics["skipped_update_reason"] == "zero_advantage"
+    assert metrics["did_optimizer_step"] is False
+    assert metrics["time_policy_forward_seconds"] == 0.0
+    assert metrics["time_reference_forward_seconds"] == 0.0
 
 
 def test_train_on_rollouts_backprops_each_action_to_release_graphs(monkeypatch) -> None:

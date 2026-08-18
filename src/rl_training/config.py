@@ -43,7 +43,9 @@ OPTIMIZATION_DEFAULTS: dict[str, Any] = {
     "weight_decay": 0.0,
     "warmup_ratio": 0.0,
     "per_device_train_batch_size": 1,
+    "reference_per_device_batch_size": 4,
     "gradient_accumulation_steps": 1,
+    "skip_zero_advantage_updates": True,
     "kl_beta": 0.02,
     "clip_epsilon": 0.2,
     "bf16": False,
@@ -183,7 +185,17 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     optimization.add_argument("--weight-decay", type=float, default=defaults["weight_decay"])
     optimization.add_argument("--warmup-ratio", type=float, default=defaults["warmup_ratio"])
     optimization.add_argument("--per-device-train-batch-size", type=int, default=defaults["per_device_train_batch_size"])
+    optimization.add_argument(
+        "--reference-per-device-batch-size",
+        type=int,
+        default=defaults["reference_per_device_batch_size"],
+    )
     optimization.add_argument("--gradient-accumulation-steps", type=int, default=defaults["gradient_accumulation_steps"])
+    optimization.add_argument(
+        "--skip-zero-advantage-updates",
+        action=BooleanOptionalAction,
+        default=defaults["skip_zero_advantage_updates"],
+    )
     optimization.add_argument("--kl-beta", type=float, default=defaults["kl_beta"])
     optimization.add_argument("--clip-epsilon", type=float, default=defaults["clip_epsilon"])
     optimization.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
