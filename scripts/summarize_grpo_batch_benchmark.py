@@ -44,7 +44,26 @@ def _finite_training_metrics(records: list[dict[str, Any]]) -> bool:
             value = record.get(key)
             if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
                 return False
+        if record.get("skipped_update_reason") is None:
+            if record.get("gradients_finite") is not True:
+                return False
+            gradient_norm = record.get("gradient_norm")
+            if not isinstance(gradient_norm, (int, float)) or not math.isfinite(
+                float(gradient_norm)
+            ):
+                return False
     return True
+
+
+def _parse_error_diagnostics(run_dir: Path) -> tuple[int, int]:
+    rollout_count = 0
+    parse_error_count = 0
+    for path in sorted((run_dir / "rollout_samples").glob("*.jsonl")):
+        for item in _read_jsonl(path):
+            for rollout in item.get("group_rollouts") or []:
+                rollout_count += 1
+                parse_error_count += len(rollout.get("parse_errors") or [])
+    return rollout_count, parse_error_count
 
 
 def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
@@ -56,6 +75,7 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
         "exit_code": status.get("exit_code"),
         "output_dir": str(run_dir) if run_dir else None,
         "reference_batch_size": status.get("reference_batch_size"),
+        "reference_batch_fallback": bool(status.get("reference_batch_fallback", False)),
     }
     if run_dir is None:
         result["valid"] = False
@@ -91,6 +111,7 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
         if line.strip().isdigit()
     ] if memory_path.is_file() else []
     finite = _finite_training_metrics(metrics)
+    group_rollout_count, parse_error_count = _parse_error_diagnostics(run_dir)
     successful = status.get("status") == "success" and status.get("exit_code") == 0
     complete = len(metrics) == expected_records
 
@@ -115,6 +136,11 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
             ),
             "skipped_zero_advantage_steps": sum(
                 record.get("skipped_update_reason") == "zero_advantage" for record in metrics
+            ),
+            "group_rollout_count": group_rollout_count,
+            "parse_error_count": parse_error_count,
+            "parse_error_rate": (
+                parse_error_count / group_rollout_count if group_rollout_count else 0.0
             ),
             "peak_gpu_memory_mib": max(memory_samples) if memory_samples else None,
         }
@@ -153,7 +179,10 @@ def summarize(root: Path) -> dict[str, Any]:
                 selected = batch_size
                 continue
             previous = successful[index - 1][1]
-            if candidate["valid_tokens_per_training_second"] >= (
+            parse_errors_not_increased = (
+                candidate["parse_error_rate"] <= previous["parse_error_rate"]
+            )
+            if parse_errors_not_increased and candidate["valid_tokens_per_training_second"] >= (
                 previous["valid_tokens_per_training_second"] * 1.05
             ):
                 selected = batch_size

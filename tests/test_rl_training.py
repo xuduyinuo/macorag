@@ -31,6 +31,7 @@ from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _build_train_metrics_payload
 from rl_training.train_grpo_macorag import _dataset_rollout_path
+from rl_training.train_grpo_macorag import _gradient_health
 from rl_training.train_grpo_macorag import _resolved_args_payload
 from rl_training.trainer import compute_grpo_loss
 from rl_training.vllm_client import collect_trainable_named_parameters
@@ -499,6 +500,8 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "policy_forward_batch_count": 1,
         "reference_forward_batch_count": 1,
         "skipped_update_reason": None,
+        "gradient_norm": 2.5,
+        "gradients_finite": True,
         "time_policy_forward_seconds": 2.0,
         "time_reference_forward_seconds": 1.5,
         "time_backward_seconds": 4.0,
@@ -542,6 +545,8 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
     assert payload["rollout_advantage_std"] == 1.0
     assert payload["action_advantage_std"] == 0.75
     assert payload["clip_fraction"] == 0.125
+    assert payload["gradient_norm"] == 2.5
+    assert payload["gradients_finite"] is True
     assert payload["trainable_action_count"] == 2
     assert payload["valid_completion_token_count"] == 7
     assert payload["timing"] == {
@@ -645,6 +650,53 @@ def test_batch_benchmark_dry_run_prints_isolated_candidates(tmp_path: Path) -> N
         assert str(tmp_path / "benchmark" / f"bs{batch_size}" / "runs") in result.stdout
 
 
+def test_batch_benchmark_retries_reference_oom_with_action_batch(tmp_path: Path) -> None:
+    fake_python = tmp_path / "fake-python"
+    fake_python.write_text(
+        """#!/usr/bin/env bash
+if [[ "$1" == "-m" ]]; then
+  action=""; reference=""
+  while [[ $# -gt 0 ]]; do
+    [[ "$1" == "--per-device-train-batch-size" ]] && action="$2"
+    [[ "$1" == "--reference-per-device-batch-size" ]] && reference="$2"
+    shift
+  done
+  if [[ "$action" != "$reference" ]]; then
+    echo 'torch.OutOfMemoryError: CUDA out of memory' >&2
+    exit 1
+  fi
+  exit 0
+fi
+exec /data/conda/envs/macorag/bin/python "$@"
+""",
+        encoding="utf-8",
+    )
+    fake_python.chmod(0o755)
+    root = tmp_path / "benchmark"
+
+    result = subprocess.run(
+        ["bash", "scripts/benchmark_grpo_batch_sizes.sh"],
+        cwd=Path.cwd(),
+        env={
+            **dict(os.environ),
+            "BATCH_SIZES": "1",
+            "BENCHMARK_ROOT": str(root),
+            "PYTHON_BIN": str(fake_python),
+            "REFERENCE_BATCH_SIZE": "4",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    status = json.loads((root / "bs1" / "status.json").read_text(encoding="utf-8"))
+    assert status["status"] == "success"
+    assert status["reference_batch_size"] == 1
+    assert status["reference_batch_fallback"] is True
+    assert (root / "bs1" / "train_ref4_oom.log").is_file()
+
+
 def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: Path) -> None:
     root = tmp_path / "benchmark"
     qids = [f"q{index}" for index in range(20)]
@@ -673,6 +725,8 @@ def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: 
                             "valid_completion_token_count": 100,
                             "trainable_action_count": 4,
                             "skipped_update_reason": None,
+                            "gradients_finite": True,
+                            "gradient_norm": 1.0,
                             "timing": {
                                 "policy_forward_seconds": training_seconds / 3,
                                 "reference_forward_seconds": training_seconds / 3,
@@ -699,6 +753,32 @@ def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: 
     assert summary["selected_batch_size"] == 2
     assert summary["candidates"]["2"]["valid_tokens_per_training_second"] == pytest.approx(107.0)
     assert summary["candidates"]["4"]["peak_gpu_memory_mib"] == 1200
+
+    rollout_dir = root / "bs2" / "runs" / "2026-08-18_00-00-00" / "rollout_samples"
+    rollout_dir.mkdir()
+    (rollout_dir / "hotpotqa.jsonl").write_text(
+        json.dumps(
+            {
+                "group_rollouts": [
+                    {"parse_errors": ["invalid action"]},
+                    {"parse_errors": []},
+                ]
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [sys.executable, "scripts/summarize_grpo_batch_benchmark.py", str(root)],
+        cwd=Path.cwd(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["candidates"]["2"]["parse_error_count"] == 1
+    assert summary["selected_batch_size"] == 1
+    (rollout_dir / "hotpotqa.jsonl").unlink()
 
     batch_two_metrics = root / "bs2" / "runs" / "2026-08-18_00-00-00" / "train_metrics.jsonl"
     rows = [json.loads(line) for line in batch_two_metrics.read_text(encoding="utf-8").splitlines()]
@@ -733,6 +813,22 @@ def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: 
     summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
     assert summary["candidates"]["2"]["valid"] is False
     assert summary["candidates"]["2"]["failure_reason"] == "incomplete metric records: 19/20"
+
+
+def test_gradient_health_detects_nonfinite_trainable_gradients() -> None:
+    model = torch.nn.Linear(2, 1, bias=False)
+    model.weight.grad = torch.tensor([[3.0, 4.0]])
+
+    norm, finite = _gradient_health(model, torch=torch)
+
+    assert norm == pytest.approx(5.0)
+    assert finite is True
+
+    model.weight.grad[0, 0] = torch.nan
+    norm, finite = _gradient_health(model, torch=torch)
+
+    assert norm != norm
+    assert finite is False
 
 
 def test_parse_args_supports_disabling_rl_progress_bar(tmp_path: Path) -> None:

@@ -261,6 +261,24 @@ def _sync_vllm_before_first_rollout(
     raise SystemExit(f"Unsupported vLLM sync mode: {sync_mode}")
 
 
+def _gradient_health(model: Any, *, torch: Any) -> tuple[float | None, bool | None]:
+    parameters = getattr(model, "parameters", None)
+    if not callable(parameters):
+        return None, None
+    gradients = [
+        parameter.grad.detach()
+        for parameter in parameters()
+        if getattr(parameter, "grad", None) is not None
+    ]
+    if not gradients:
+        return None, None
+    per_gradient_norms = torch.stack(
+        [torch.linalg.vector_norm(gradient.float()) for gradient in gradients]
+    )
+    total_norm = torch.linalg.vector_norm(per_gradient_norms)
+    return float(total_norm.item()), bool(torch.isfinite(total_norm).item())
+
+
 def _rollout_group(
     *,
     args: Any,
@@ -377,7 +395,6 @@ def _train_on_rollouts(
     should_step: bool,
     pad_token_id: int = 0,
 ) -> dict[str, Any]:
-    del raw_policy_model
     trainable_actions = [
         (rollout, action)
         for rollout in rollouts
@@ -397,6 +414,8 @@ def _train_on_rollouts(
         "reference_forward_batch_count": 0,
         "did_optimizer_step": False,
         "skipped_update_reason": None,
+        "gradient_norm": None,
+        "gradients_finite": None,
         "time_policy_forward_seconds": 0.0,
         "time_reference_forward_seconds": 0.0,
         "time_backward_seconds": 0.0,
@@ -503,7 +522,10 @@ def _train_on_rollouts(
         backward_start = time.perf_counter()
         (loss * token_weight / gradient_accumulation_steps).backward()
         time_backward_seconds += time.perf_counter() - backward_start
-    if should_step:
+    gradient_norm, gradients_finite = _gradient_health(raw_policy_model, torch=torch)
+    if should_step and gradients_finite is False:
+        optimizer.zero_grad(set_to_none=True)
+    elif should_step:
         optimizer_start = time.perf_counter()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -519,7 +541,11 @@ def _train_on_rollouts(
         "policy_forward_batch_count": policy_forward_batch_count,
         "reference_forward_batch_count": reference_forward_batch_count,
         "did_optimizer_step": did_optimizer_step,
-        "skipped_update_reason": None,
+        "skipped_update_reason": (
+            "nonfinite_gradients" if gradients_finite is False else None
+        ),
+        "gradient_norm": gradient_norm,
+        "gradients_finite": gradients_finite,
         "time_policy_forward_seconds": time_policy_forward_seconds,
         "time_reference_forward_seconds": time_reference_forward_seconds,
         "time_backward_seconds": time_backward_seconds,
@@ -608,6 +634,8 @@ def _build_train_metrics_payload(
         "policy_forward_batch_count": metrics.get("policy_forward_batch_count", 0),
         "reference_forward_batch_count": metrics.get("reference_forward_batch_count", 0),
         "skipped_update_reason": metrics.get("skipped_update_reason"),
+        "gradient_norm": metrics.get("gradient_norm"),
+        "gradients_finite": metrics.get("gradients_finite"),
         "reward_total": reward_mean,
         "reward_group": {
             "min": min(reward_totals),
