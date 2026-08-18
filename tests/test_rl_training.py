@@ -1314,6 +1314,37 @@ def test_sync_vllm_after_optimizer_step_respects_sync_interval() -> None:
     assert policy.vllm_client.lora_called is False
 
 
+def test_sync_vllm_before_first_rollout_ignores_post_step_cadence() -> None:
+    import rl_training.train_grpo_macorag as train_module
+
+    policy = _FakePolicyWithLoraClient()
+    args = Namespace(
+        use_vllm_generation=True,
+        vllm_sync_after_step=False,
+        vllm_sync_mode="lora",
+        vllm_sync_every_steps=100,
+    )
+
+    elapsed = train_module._sync_vllm_before_first_rollout(policy, object(), args)
+
+    assert elapsed == 2.0
+    assert policy.vllm_client.lora_called is True
+    assert policy.vllm_client.dense_called is False
+
+
+def test_sync_vllm_before_first_rollout_skips_disabled_or_non_main(monkeypatch) -> None:
+    import rl_training.train_grpo_macorag as train_module
+
+    policy = _FakePolicyWithLoraClient()
+    args = Namespace(use_vllm_generation=False, vllm_sync_mode="lora")
+    assert train_module._sync_vllm_before_first_rollout(policy, object(), args) == 0.0
+
+    args.use_vllm_generation = True
+    monkeypatch.setattr(train_module, "_is_main_process", lambda: False)
+    assert train_module._sync_vllm_before_first_rollout(policy, object(), args) == 0.0
+    assert policy.vllm_client.lora_called is False
+
+
 def test_vllm_generation_client_dequantizes_4bit_weights_before_sync(monkeypatch) -> None:
     import rl_training.vllm_client as vllm_client
     from rl_training.vllm_client import _move_tensor_for_sync

@@ -241,6 +241,24 @@ def _sync_vllm_after_optimizer_step(
     raise SystemExit(f"Unsupported vLLM sync mode: {sync_mode}")
 
 
+def _sync_vllm_before_first_rollout(
+    policy: Any,
+    raw_policy_model: Any,
+    args: Any,
+) -> float:
+    if not getattr(args, "use_vllm_generation", False) or not _is_main_process():
+        return 0.0
+    client = getattr(policy, "vllm_client", None)
+    if client is None:
+        raise SystemExit("vLLM generation is enabled but policy has no vLLM client.")
+    sync_mode = getattr(args, "vllm_sync_mode", "dense")
+    if sync_mode == "lora":
+        return float(client.sync_lora_parameters(raw_policy_model))
+    if sync_mode == "dense":
+        return float(client.sync_trainable_parameters(raw_policy_model))
+    raise SystemExit(f"Unsupported vLLM sync mode: {sync_mode}")
+
+
 def _rollout_group(
     *,
     args: Any,
@@ -596,6 +614,13 @@ def main() -> None:
     retrieval_env = _build_retrieval_env(args)
     retrieval_env.prewarm(sorted({sample.dataset for sample in samples}))
     policy = _build_policy(args, raw_policy_model, tokenizer)
+    time_initial_weight_sync_seconds = _sync_vllm_before_first_rollout(
+        policy,
+        raw_policy_model,
+        args,
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
 
     base_output_dir = Path(args.output_root)
     output_dir = make_timestamped_run_dir(base_output_dir)
@@ -746,6 +771,7 @@ def main() -> None:
                 "vllm_max_model_len": args.vllm_max_model_len,
                 "vllm_sync_mode": args.vllm_sync_mode,
                 "vllm_sync_every_steps": args.vllm_sync_every_steps,
+                "time_initial_weight_sync_seconds": time_initial_weight_sync_seconds,
             },
         )
         print(f"GRPO training complete. Adapter saved to {output_dir / 'adapter'}.")
