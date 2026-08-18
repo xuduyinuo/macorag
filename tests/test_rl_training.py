@@ -1466,6 +1466,265 @@ def test_vllm_shared_policy_falls_back_to_hf_rescore_without_server_logprobs(mon
     assert policy.timing["time_behavior_rescore_seconds"] >= 0.0
 
 
+def test_batched_rollout_one_round_batches_each_role_and_retrieval() -> None:
+    from rl_training.batched_rollout import run_batched_rollouts
+    from rl_training.policy import GeneratedAction
+
+    class FakeBatchPolicy:
+        def __init__(self) -> None:
+            self.role_batches: list[list[AgentRole]] = []
+
+        def generate_batch(self, requests, *, traces):
+            self.role_batches.append([request.role for request in requests])
+            responses = []
+            for request, trace in zip(requests, traces):
+                if request.role == AgentRole.QUERY_RETRIEVER:
+                    response = (
+                        '<query-retriever>{"sub_goal":"find director",'
+                        '"query":"The Tripper director"}</query-retriever>'
+                    )
+                elif request.role == AgentRole.EVIDENCE_UPDATER:
+                    response = (
+                        '<update-evidence>{"selected_passage_ids":[0],'
+                        '"rationale":"supports"}</update-evidence>'
+                    )
+                else:
+                    response = '<answer>{"can_answer":true,"answer":"David Arquette"}</answer>'
+                trace.actions.append(
+                    GeneratedAction(
+                        role=request.role,
+                        prompt="prompt",
+                        response=response,
+                        prompt_ids=[1],
+                        completion_ids=[2],
+                        old_logprobs=torch.zeros(1),
+                        round_index=sum(1 for item in trace.actions if item.role == request.role),
+                    )
+                )
+                responses.append(response)
+            return responses
+
+    class FakeRetrievalEnv:
+        def __init__(self) -> None:
+            self.query_batches: list[list[str]] = []
+
+        def query_batch(self, dataset: str, queries: list[str]):
+            assert dataset == "hotpotqa"
+            self.query_batches.append(queries)
+            return [
+                {
+                    "query": query,
+                    "passages": [
+                        {
+                            "passage_id": 0,
+                            "text": "The Tripper was directed by David Arquette.",
+                            "score": 1.0,
+                        }
+                    ],
+                }
+                for query in queries
+            ]
+
+    policy = FakeBatchPolicy()
+    retrieval_env = FakeRetrievalEnv()
+
+    rollouts = run_batched_rollouts(
+        question="Who directed The Tripper?",
+        dataset="hotpotqa",
+        group_size=4,
+        max_rounds=2,
+        policy=policy,
+        retrieval_env=retrieval_env,
+    )
+
+    assert policy.role_batches == [
+        [AgentRole.QUERY_RETRIEVER] * 4,
+        [AgentRole.EVIDENCE_UPDATER] * 4,
+        [AgentRole.ANSWER_GENERATOR] * 4,
+    ]
+    assert retrieval_env.query_batches == [["The Tripper director"] * 4]
+    assert [item.result.final_answer for item in rollouts] == ["David Arquette"] * 4
+    assert [len(item.trace.actions) for item in rollouts] == [3, 3, 3, 3]
+    assert [item.result.trajectory[0]["generated_roles"] for item in rollouts] == [
+        ["query_retriever", "evidence_updater", "answer_generator"]
+    ] * 4
+
+
+def test_batched_rollout_masks_finished_and_parse_failed_candidates() -> None:
+    from rl_training.batched_rollout import run_batched_rollouts
+    from rl_training.policy import GeneratedAction
+
+    class DivergentPolicy:
+        def __init__(self) -> None:
+            self.trace_ids: dict[int, int] = {}
+            self.batch_sizes: list[tuple[AgentRole, int]] = []
+
+        def generate_batch(self, requests, *, traces):
+            self.batch_sizes.append((requests[0].role, len(requests)))
+            responses = []
+            for trace_index, (request, trace) in enumerate(zip(requests, traces)):
+                candidate_id = self.trace_ids.setdefault(id(trace), len(self.trace_ids))
+                role_round = sum(1 for item in trace.actions if item.role == request.role)
+                if request.role == AgentRole.QUERY_RETRIEVER:
+                    response = (
+                        "invalid query"
+                        if candidate_id == 2 and role_round == 0
+                        else '<query-retriever>{"sub_goal":"find",'
+                        f'"query":"query-{candidate_id}-{role_round}"}}</query-retriever>'
+                    )
+                elif request.role == AgentRole.EVIDENCE_UPDATER:
+                    response = (
+                        "invalid evidence"
+                        if candidate_id == 3 and role_round == 0
+                        else '<update-evidence>{"selected_passage_ids":[0]}</update-evidence>'
+                    )
+                else:
+                    can_answer = candidate_id != 1 or role_round == 1
+                    response = (
+                        '<answer>{"can_answer":'
+                        f'{str(can_answer).lower()},"answer":"answer-{candidate_id}"}}</answer>'
+                    )
+                trace.actions.append(
+                    GeneratedAction(
+                        role=request.role,
+                        prompt="prompt",
+                        response=response,
+                        prompt_ids=[1],
+                        completion_ids=[2],
+                        old_logprobs=torch.zeros(1),
+                        round_index=role_round,
+                    )
+                )
+                responses.append(response)
+            return responses
+
+    class BatchRetrieval:
+        def __init__(self) -> None:
+            self.batches: list[list[str]] = []
+
+        def query_batch(self, dataset, queries):
+            self.batches.append(queries)
+            return [
+                {"query": query, "passages": [{"passage_id": 0, "text": query, "score": 1.0}]}
+                for query in queries
+            ]
+
+    policy = DivergentPolicy()
+    retrieval = BatchRetrieval()
+
+    rollouts = run_batched_rollouts(
+        question="question",
+        dataset="hotpotqa",
+        group_size=4,
+        max_rounds=2,
+        policy=policy,
+        retrieval_env=retrieval,
+    )
+
+    assert policy.batch_sizes == [
+        (AgentRole.QUERY_RETRIEVER, 4),
+        (AgentRole.EVIDENCE_UPDATER, 3),
+        (AgentRole.ANSWER_GENERATOR, 2),
+        (AgentRole.QUERY_RETRIEVER, 1),
+        (AgentRole.EVIDENCE_UPDATER, 1),
+        (AgentRole.ANSWER_GENERATOR, 1),
+    ]
+    assert retrieval.batches == [
+        ["query-0-0", "query-1-0", "query-3-0"],
+        ["query-1-1"],
+    ]
+    assert [item.result.final_answer for item in rollouts] == [
+        "answer-0",
+        "answer-1",
+        None,
+        None,
+    ]
+    assert rollouts[2].result.trajectory[0]["parse_error_role"] == "query_retriever"
+    assert rollouts[2].result.trajectory[0]["generated_roles"] == ["query_retriever"]
+    assert rollouts[3].result.trajectory[0]["parse_error_role"] == "evidence_updater"
+    assert rollouts[3].result.trajectory[0]["generated_roles"] == [
+        "query_retriever",
+        "evidence_updater",
+    ]
+    assert len(rollouts[1].result.trajectory) == 2
+
+
+def test_rollout_group_uses_one_batched_executor_call(monkeypatch) -> None:
+    from rag import RAGLoopResult
+    from rl_training.batched_rollout import BatchedRolloutResult
+    from rl_training.data import RLSample
+    from rl_training.policy import RolloutTrace
+    from rl_training.train_grpo_macorag import _rollout_group
+
+    calls: list[dict[str, object]] = []
+
+    def fake_run_batched_rollouts(**kwargs):
+        calls.append(kwargs)
+        return [
+            BatchedRolloutResult(
+                result=RAGLoopResult(
+                    question=kwargs["question"],
+                    dataset=kwargs["dataset"],
+                    trajectory=[],
+                    state=RAGState(question=kwargs["question"]),
+                    final_answer="gold",
+                    parse_errors=[],
+                ),
+                trace=RolloutTrace(),
+            )
+            for _ in range(kwargs["group_size"])
+        ]
+
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.run_batched_rollouts",
+        fake_run_batched_rollouts,
+    )
+
+    class FakePolicy:
+        def __init__(self) -> None:
+            self.timing = {}
+
+        def reset_trace(self) -> None:
+            self.timing = {
+                "time_vllm_generate_seconds": 1.5,
+                "time_behavior_rescore_seconds": 0.0,
+            }
+
+        def generate_batch(self, requests, *, traces):
+            raise AssertionError("fake batched executor owns generation")
+
+    sample = RLSample(
+        qid="q1",
+        dataset="hotpotqa",
+        question="question",
+        answer="gold",
+        answer_aliases=[],
+        supporting_facts=[],
+        context_doc_ids=[],
+        metadata={},
+    )
+    args = Namespace(
+        group_size=4,
+        max_rounds=2,
+        query_local_credit_weight=0.75,
+        evidence_local_credit_weight=0.70,
+        answer_local_credit_weight=0.30,
+    )
+
+    rollouts, timing = _rollout_group(
+        args=args,
+        sample=sample,
+        policy=FakePolicy(),
+        retrieval_env=object(),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["group_size"] == 4
+    assert [item["group_index"] for item in rollouts] == [0, 1, 2, 3]
+    assert timing["time_vllm_generate_seconds"] == 1.5
+    assert timing["time_behavior_rescore_seconds"] == 0.0
+
+
 def test_build_policy_uses_hf_policy_when_vllm_disabled() -> None:
     args = Namespace(
         use_vllm_generation=False,

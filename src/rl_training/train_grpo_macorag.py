@@ -11,6 +11,7 @@ from typing import Any
 from rag import RAGLoopExecutor
 
 from .config import parse_args
+from .batched_rollout import run_batched_rollouts
 from .data import RLSample, load_rl_samples
 from .logging_utils import append_jsonl as _append_jsonl
 from .logging_utils import make_timestamped_run_dir
@@ -250,23 +251,56 @@ def _rollout_group(
     rollouts: list[dict[str, Any]] = []
     time_rollout_seconds = 0.0
     time_vllm_generate_seconds = 0.0
+    time_behavior_rescore_seconds = 0.0
     time_reward_seconds = 0.0
-    for group_index in range(args.group_size):
+
+    supports_batch = callable(getattr(policy, "generate_batch", None))
+    if supports_batch:
         policy.reset_trace()
-        executor = RAGLoopExecutor(policy=policy, retrieval_env=retrieval_env, max_rounds=args.max_rounds)
         rollout_start = time.perf_counter()
-        result = executor.run(question=sample.question, dataset=sample.dataset)
-        time_rollout_seconds += time.perf_counter() - rollout_start
+        batch_results = run_batched_rollouts(
+            question=sample.question,
+            dataset=sample.dataset,
+            group_size=args.group_size,
+            max_rounds=args.max_rounds,
+            policy=policy,
+            retrieval_env=retrieval_env,
+        )
+        time_rollout_seconds = time.perf_counter() - rollout_start
         time_vllm_generate_seconds += float(
             getattr(policy, "timing", {}).get("time_vllm_generate_seconds", 0.0)
         )
+        time_behavior_rescore_seconds += float(
+            getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
+        )
+        group_results = [
+            (group_index, item.result, item.trace)
+            for group_index, item in enumerate(batch_results)
+        ]
+    else:
+        group_results = []
+        for group_index in range(args.group_size):
+            policy.reset_trace()
+            executor = RAGLoopExecutor(policy=policy, retrieval_env=retrieval_env, max_rounds=args.max_rounds)
+            rollout_start = time.perf_counter()
+            result = executor.run(question=sample.question, dataset=sample.dataset)
+            time_rollout_seconds += time.perf_counter() - rollout_start
+            time_vllm_generate_seconds += float(
+                getattr(policy, "timing", {}).get("time_vllm_generate_seconds", 0.0)
+            )
+            time_behavior_rescore_seconds += float(
+                getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
+            )
+            group_results.append((group_index, result, policy.trace))
+
+    for group_index, result, trace in group_results:
         rollout = {
             "group_index": group_index,
             "result": result,
             "trajectory": result.trajectory,
             "parse_errors": result.parse_errors,
             "final_answer": result.final_answer,
-            "actions": list(policy.trace.actions),
+            "actions": list(trace.actions),
         }
         reward_start = time.perf_counter()
         rewards = compute_rl_rewards(rollout=rollout, sample=sample.to_reward_sample())
@@ -292,6 +326,7 @@ def _rollout_group(
     return rollouts, {
         "time_rollout_seconds": time_rollout_seconds,
         "time_vllm_generate_seconds": time_vllm_generate_seconds,
+        "time_behavior_rescore_seconds": time_behavior_rescore_seconds,
         "time_reward_seconds": time_reward_seconds,
     }
 
