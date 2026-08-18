@@ -65,7 +65,9 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
     metrics = _read_jsonl(run_dir / "train_metrics.jsonl")
     meta_path = run_dir / "train_meta.json"
     meta = _read_json(meta_path) if meta_path.is_file() else {}
-    qids = list(meta.get("selected_qids") or [record.get("qid") for record in metrics])
+    configured_qids = list(meta.get("selected_qids") or [])
+    qids = [record.get("qid") for record in metrics]
+    expected_records = int(status.get("sample_count") or len(configured_qids) or len(metrics))
     training_times = [
         sum(
             float(record.get("timing", {}).get(key, 0.0))
@@ -90,13 +92,16 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
     ] if memory_path.is_file() else []
     finite = _finite_training_metrics(metrics)
     successful = status.get("status") == "success" and status.get("exit_code") == 0
+    complete = len(metrics) == expected_records
 
     result.update(
         {
-            "valid": bool(successful and finite and metrics),
+            "valid": bool(successful and finite and complete and metrics),
             "finite_metrics": finite,
             "metric_records": len(metrics),
+            "expected_metric_records": expected_records,
             "selected_qids": qids,
+            "configured_selected_qids": configured_qids,
             "total_wall_seconds": sum(total_times),
             "mean_sample_seconds": statistics.fmean(total_times) if total_times else 0.0,
             "median_sample_seconds": statistics.median(total_times) if total_times else 0.0,
@@ -115,9 +120,14 @@ def _candidate_summary(candidate_dir: Path) -> dict[str, Any]:
         }
     )
     if not result["valid"]:
-        result["failure_reason"] = status.get("failure_reason") or (
-            "non-finite metrics" if not finite else "incomplete candidate"
-        )
+        if successful and not complete:
+            result["failure_reason"] = (
+                f"incomplete metric records: {len(metrics)}/{expected_records}"
+            )
+        else:
+            result["failure_reason"] = status.get("failure_reason") or (
+                "non-finite metrics" if not finite else "incomplete candidate"
+            )
     return result
 
 

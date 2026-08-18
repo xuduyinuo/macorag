@@ -66,8 +66,9 @@ for batch_size in ${BATCH_SIZES}; do
 
     STATUS="${status}" EXIT_CODE="${exit_code}" FAILURE_REASON="${failure_reason}" \
         REFERENCE_BATCH_SIZE_VALUE="${REFERENCE_BATCH_SIZE}" CANDIDATE_DIR="${candidate_dir}" \
+        SAMPLE_COUNT_VALUE="${SAMPLE_COUNT}" \
         "${PYTHON_BIN}" -c \
-        'import json, os, pathlib; p=pathlib.Path(os.environ["CANDIDATE_DIR"])/"status.json"; p.write_text(json.dumps({"status": os.environ["STATUS"], "exit_code": int(os.environ["EXIT_CODE"]), "failure_reason": os.environ["FAILURE_REASON"], "reference_batch_size": int(os.environ["REFERENCE_BATCH_SIZE_VALUE"])}, indent=2)+"\n", encoding="utf-8")'
+        'import json, os, pathlib; p=pathlib.Path(os.environ["CANDIDATE_DIR"])/"status.json"; p.write_text(json.dumps({"status": os.environ["STATUS"], "exit_code": int(os.environ["EXIT_CODE"]), "failure_reason": os.environ["FAILURE_REASON"], "reference_batch_size": int(os.environ["REFERENCE_BATCH_SIZE_VALUE"]), "sample_count": int(os.environ["SAMPLE_COUNT_VALUE"])}, indent=2)+"\n", encoding="utf-8")'
 
     printf 'Batch size %s finished with status=%s exit_code=%s\n' "${batch_size}" "${status}" "${exit_code}"
     if [[ "${status}" == "oom" ]]; then

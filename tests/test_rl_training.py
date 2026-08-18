@@ -700,6 +700,40 @@ def test_batch_benchmark_summary_applies_five_percent_throughput_rule(tmp_path: 
     assert summary["candidates"]["2"]["valid_tokens_per_training_second"] == pytest.approx(107.0)
     assert summary["candidates"]["4"]["peak_gpu_memory_mib"] == 1200
 
+    batch_two_metrics = root / "bs2" / "runs" / "2026-08-18_00-00-00" / "train_metrics.jsonl"
+    rows = [json.loads(line) for line in batch_two_metrics.read_text(encoding="utf-8").splitlines()]
+    rows[0]["qid"] = "different-runtime-order"
+    batch_two_metrics.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [sys.executable, "scripts/summarize_grpo_batch_benchmark.py", str(root)],
+        cwd=Path.cwd(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["same_selected_qids"] is False
+    assert summary["selected_batch_size"] is None
+
+    rows.pop()
+    batch_two_metrics.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    subprocess.run(
+        [sys.executable, "scripts/summarize_grpo_batch_benchmark.py", str(root)],
+        cwd=Path.cwd(),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    summary = json.loads((root / "benchmark_summary.json").read_text(encoding="utf-8"))
+    assert summary["candidates"]["2"]["valid"] is False
+    assert summary["candidates"]["2"]["failure_reason"] == "incomplete metric records: 19/20"
+
 
 def test_parse_args_supports_disabling_rl_progress_bar(tmp_path: Path) -> None:
     config = tmp_path / "train_grpo.yml"
