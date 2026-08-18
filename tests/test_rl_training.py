@@ -266,7 +266,9 @@ class _FakeDualAdapterModel(torch.nn.Module):
         self.active_adapter = adapter_name
         if adapter_name == "default":
             self.policy_parameter.requires_grad_(True)
+            self.reference_parameter.requires_grad_(False)
         elif adapter_name == "reference":
+            self.policy_parameter.requires_grad_(False)
             self.reference_parameter.requires_grad_(True)
 
     def gradient_checkpointing_enable(self, **kwargs: object) -> None:
@@ -368,6 +370,7 @@ def test_reference_adapter_context_restores_policy_mode_and_freezes_reference() 
         assert reference_model is model
         assert model.active_adapter == "reference"
         assert model.training is False
+        assert model.policy_parameter.requires_grad is False
         assert model.reference_parameter.requires_grad is False
 
     assert model.active_adapter == "default"
@@ -389,6 +392,89 @@ def test_reference_adapter_context_restores_policy_after_exception() -> None:
     assert model.active_adapter == "default"
     assert model.training is True
     assert model.reference_parameter.requires_grad is False
+
+
+def test_activate_policy_adapter_rejects_non_policy_trainable_parameters() -> None:
+    from rl_training.train_grpo_macorag import _activate_policy_adapter
+
+    class ModelWithUnexpectedTrainable(_FakeDualAdapterModel):
+        def __init__(self) -> None:
+            super().__init__()
+            self.base_parameter = torch.nn.Parameter(torch.tensor([3.0]), requires_grad=True)
+
+        def named_parameters(self, prefix: str = "", recurse: bool = True):
+            yield from super().named_parameters(prefix=prefix, recurse=recurse)
+            yield "base_model.layer.base_layer.bias", self.base_parameter
+
+    with pytest.raises(SystemExit, match="non-policy trainable parameters"):
+        _activate_policy_adapter(ModelWithUnexpectedTrainable())
+
+
+def test_real_peft_dual_adapter_lifecycle_and_policy_only_save(tmp_path: Path) -> None:
+    peft = pytest.importorskip("peft")
+    transformers = pytest.importorskip("transformers")
+    from rl_training.train_grpo_macorag import (
+        _activate_policy_adapter,
+        _reference_adapter_context,
+        _save_policy_adapter,
+    )
+
+    config = transformers.Qwen2Config(
+        vocab_size=64,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+    )
+    lora_config = peft.LoraConfig(
+        r=2,
+        lora_alpha=4,
+        target_modules=["q_proj", "v_proj"],
+        task_type="CAUSAL_LM",
+    )
+    seed_adapter = tmp_path / "seed"
+    peft.get_peft_model(
+        transformers.Qwen2ForCausalLM(config),
+        lora_config,
+    ).save_pretrained(seed_adapter)
+    shared_model = peft.PeftModel.from_pretrained(
+        transformers.Qwen2ForCausalLM(config),
+        seed_adapter,
+        adapter_name="default",
+        is_trainable=True,
+    )
+    shared_model.load_adapter(
+        seed_adapter,
+        adapter_name="reference",
+        is_trainable=False,
+    )
+
+    _activate_policy_adapter(shared_model)
+    shared_model.train()
+    with _reference_adapter_context(shared_model, shared_model):
+        assert shared_model.active_adapter == "reference"
+        assert shared_model.training is False
+        assert all(not parameter.requires_grad for parameter in shared_model.parameters())
+
+    trainable_names = [
+        name
+        for name, parameter in shared_model.named_parameters()
+        if parameter.requires_grad
+    ]
+    assert trainable_names
+    assert all(".default." in name for name in trainable_names)
+    output_dir = tmp_path / "policy"
+    _save_policy_adapter(shared_model, output_dir)
+    assert (output_dir / "adapter_config.json").is_file()
+    assert (output_dir / "adapter_model.safetensors").is_file()
+    assert not (output_dir / "reference").exists()
+    reloaded = peft.PeftModel.from_pretrained(
+        transformers.Qwen2ForCausalLM(config),
+        output_dir,
+        is_trainable=False,
+    )
+    assert set(reloaded.peft_config) == {"default"}
 
 
 def test_rl_logging_helpers_are_extracted_and_reexported() -> None:
@@ -3250,7 +3336,7 @@ def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypat
     )
 
     assert observations == [
-        ("reference", False, True, False),
+        ("reference", False, False, False),
         ("default", True, True, False),
     ]
     assert model.active_adapter == "default"

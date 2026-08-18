@@ -137,6 +137,18 @@ def _activate_policy_adapter(model: Any) -> None:
         raise SystemExit("Shared-base GRPO requires PEFT set_adapter() support.")
     set_adapter(_POLICY_ADAPTER_NAME)
     _set_adapter_trainability(model, _REFERENCE_ADAPTER_NAME, trainable=False)
+    trainable_names = [
+        name
+        for name, parameter in model.named_parameters()
+        if getattr(parameter, "requires_grad", False)
+    ]
+    policy_marker = f".{_POLICY_ADAPTER_NAME}."
+    unexpected = [name for name in trainable_names if policy_marker not in f".{name}."]
+    if unexpected:
+        preview = ", ".join(unexpected[:5])
+        raise SystemExit(f"Shared-base GRPO found non-policy trainable parameters: {preview}")
+    if not trainable_names:
+        raise SystemExit("Shared-base GRPO policy adapter has no trainable parameters.")
 
 
 @contextmanager
