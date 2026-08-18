@@ -70,6 +70,7 @@ LOGGING_DEFAULTS: dict[str, Any] = {
     "save_steps": 100,
     "save_total_limit": 3,
     "logging_steps": 1,
+    "log_all_group_rollouts": True,
 }
 
 # 检索环境：这些参数必须与预构建 LinearRAG 索引保持一致。
@@ -262,6 +263,11 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     logging.add_argument("--save-steps", type=int, default=defaults["save_steps"])
     logging.add_argument("--save-total-limit", type=int, default=defaults["save_total_limit"])
     logging.add_argument("--logging-steps", type=int, default=defaults["logging_steps"])
+    logging.add_argument(
+        "--log-all-group-rollouts",
+        action=BooleanOptionalAction,
+        default=defaults["log_all_group_rollouts"],
+    )
 
     runtime = parser.add_argument_group("运行环境")
     runtime.add_argument("--gpu-index", type=int, default=defaults["gpu_index"])

@@ -4,6 +4,7 @@ from __future__ import annotations
 import math
 import os
 import random
+import statistics
 import time
 from pathlib import Path
 from typing import Any
@@ -542,6 +543,31 @@ def _dataset_rollout_path(output_dir: Path, dataset: str) -> Path:
     return output_dir / "rollout_samples" / f"{_safe_dataset_name(dataset)}.jsonl"
 
 
+def _json_serializable_value(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, dict):
+        return {
+            str(key): _json_serializable_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_json_serializable_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return [_json_serializable_value(item) for item in sorted(value, key=str)]
+    return str(value)
+
+
+def _resolved_args_payload(args: Any) -> dict[str, Any]:
+    """Return the effective CLI/config values in a stable JSON representation."""
+    return {
+        key: _json_serializable_value(value)
+        for key, value in sorted(vars(args).items())
+    }
+
+
 def _build_train_metrics_payload(
     *,
     epoch: int,
@@ -554,6 +580,7 @@ def _build_train_metrics_payload(
     best_rollout: dict[str, Any],
     learning_rate: float,
     rollout_timing: dict[str, Any],
+    time_initial_weight_sync_seconds: float,
     time_weight_sync_seconds: float,
     time_total_seconds: float,
 ) -> dict[str, Any]:
@@ -563,6 +590,8 @@ def _build_train_metrics_payload(
         for rollout in rollouts
         for action in rollout.get("actions", [])
     ]
+    rollout_advantages = [float(item["advantage"]) for item in rollouts]
+    reward_mean = sum(reward_totals) / len(reward_totals)
     return {
         "epoch": epoch,
         "sample": sample_index + 1,
@@ -573,7 +602,19 @@ def _build_train_metrics_payload(
         "loss": metrics["loss"],
         "policy_loss": metrics["policy_loss"],
         "kl": metrics["kl"],
-        "reward_total": sum(reward_totals) / len(reward_totals),
+        "clip_fraction": metrics.get("clip_fraction", 0.0),
+        "trainable_action_count": metrics.get("trainable_action_count", 0),
+        "valid_completion_token_count": metrics.get("valid_completion_token_count", 0),
+        "policy_forward_batch_count": metrics.get("policy_forward_batch_count", 0),
+        "reference_forward_batch_count": metrics.get("reference_forward_batch_count", 0),
+        "skipped_update_reason": metrics.get("skipped_update_reason"),
+        "reward_total": reward_mean,
+        "reward_group": {
+            "min": min(reward_totals),
+            "max": max(reward_totals),
+            "mean": reward_mean,
+            "std": statistics.pstdev(reward_totals) if len(reward_totals) > 1 else 0.0,
+        },
         "reward_query": best_rollout["rewards"]["query_reward"],
         "reward_evidence": best_rollout["rewards"]["evidence_reward"],
         "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
@@ -582,6 +623,12 @@ def _build_train_metrics_payload(
             sum(action_advantages) / len(action_advantages)
             if action_advantages
             else 0.0
+        ),
+        "rollout_advantage_std": (
+            statistics.pstdev(rollout_advantages) if len(rollout_advantages) > 1 else 0.0
+        ),
+        "action_advantage_std": (
+            statistics.pstdev(action_advantages) if len(action_advantages) > 1 else 0.0
         ),
         "gold_answer": sample.answer,
         "generated_answer": best_rollout["final_answer"],
@@ -595,6 +642,9 @@ def _build_train_metrics_payload(
                 "time_behavior_rescore_seconds",
                 0.0,
             ),
+            "retrieval_seconds": rollout_timing.get("time_retrieval_seconds", 0.0),
+            "retrieval_cache_hits": rollout_timing.get("retrieval_cache_hits", 0),
+            "retrieval_cache_misses": rollout_timing.get("retrieval_cache_misses", 0),
             "reward_seconds": rollout_timing["time_reward_seconds"],
             "policy_forward_seconds": metrics.get("time_policy_forward_seconds", 0.0),
             "reference_forward_seconds": metrics.get(
@@ -603,10 +653,63 @@ def _build_train_metrics_payload(
             ),
             "backward_seconds": metrics["time_backward_seconds"],
             "optimizer_step_seconds": metrics["time_optimizer_step_seconds"],
+            "initial_weight_sync_seconds": time_initial_weight_sync_seconds,
             "weight_sync_seconds": time_weight_sync_seconds,
             "total_seconds": time_total_seconds,
         },
     }
+
+
+def _action_credit_payload(action: Any) -> dict[str, Any]:
+    return {
+        "role": getattr(action.role, "value", str(action.role)),
+        "round_index": action.round_index,
+        "local_reward": action.local_reward,
+        "terminal_reward": action.terminal_reward,
+        "advantage": action.advantage,
+    }
+
+
+def _rollout_log_payload(
+    *,
+    epoch: int,
+    sample_index: int,
+    sample: Any,
+    rollouts: list[dict[str, Any]],
+    best_rollout: dict[str, Any],
+    log_all_group_rollouts: bool,
+) -> dict[str, Any]:
+    payload = {
+        "epoch": epoch,
+        "sample": sample_index + 1,
+        "qid": sample.qid,
+        "dataset": sample.dataset,
+        "question": sample.question,
+        "gold_answer": sample.answer,
+        "best_reward": best_rollout["rewards"],
+        "terminal_reward": best_rollout["terminal_reward"],
+        "action_credit": [
+            _action_credit_payload(action) for action in best_rollout["actions"]
+        ],
+        "trajectory": best_rollout["trajectory"],
+    }
+    if log_all_group_rollouts:
+        payload["group_rollouts"] = [
+            {
+                "group_index": rollout["group_index"],
+                "rewards": rollout["rewards"],
+                "terminal_reward": rollout["terminal_reward"],
+                "parse_errors": rollout["parse_errors"],
+                "final_answer": rollout["final_answer"],
+                "generated_action_count": len(rollout["actions"]),
+                "action_credit": [
+                    _action_credit_payload(action) for action in rollout["actions"]
+                ],
+                "trajectory": rollout["trajectory"],
+            }
+            for rollout in rollouts
+        ]
+    return payload
 
 
 def _make_progress_bar(args: Any, total: int) -> Any:
@@ -758,33 +861,21 @@ def main() -> None:
                         best_rollout=best_rollout,
                         learning_rate=args.learning_rate,
                         rollout_timing=rollout_timing,
+                        time_initial_weight_sync_seconds=time_initial_weight_sync_seconds,
                         time_weight_sync_seconds=time_weight_sync_seconds,
                         time_total_seconds=time_total_seconds,
                     )
                     _append_jsonl(log_path, payload)
                     _append_jsonl(
                         _dataset_rollout_path(output_dir, sample.dataset),
-                        {
-                            "epoch": epoch,
-                            "sample": sample_index + 1,
-                            "qid": sample.qid,
-                            "dataset": sample.dataset,
-                            "question": sample.question,
-                            "gold_answer": sample.answer,
-                            "best_reward": best_rollout["rewards"],
-                            "terminal_reward": best_rollout["terminal_reward"],
-                            "action_credit": [
-                                {
-                                    "role": getattr(action.role, "value", str(action.role)),
-                                    "round_index": action.round_index,
-                                    "local_reward": action.local_reward,
-                                    "terminal_reward": action.terminal_reward,
-                                    "advantage": action.advantage,
-                                }
-                                for action in best_rollout["actions"]
-                            ],
-                            "trajectory": best_rollout["trajectory"],
-                        },
+                        _rollout_log_payload(
+                            epoch=epoch,
+                            sample_index=sample_index,
+                            sample=sample,
+                            rollouts=rollouts,
+                            best_rollout=best_rollout,
+                            log_all_group_rollouts=bool(args.log_all_group_rollouts),
+                        ),
                     )
                 if _is_main_process() and args.save_steps > 0 and global_step % args.save_steps == 0:
                     _save_checkpoint(raw_policy_model, tokenizer, output_dir, global_step)
@@ -832,6 +923,12 @@ def main() -> None:
                 "vllm_sync_mode": args.vllm_sync_mode,
                 "vllm_sync_every_steps": args.vllm_sync_every_steps,
                 "time_initial_weight_sync_seconds": time_initial_weight_sync_seconds,
+                "resolved_args": _resolved_args_payload(args),
+                "selected_qids": [sample.qid for sample in samples],
+                "selected_counts_by_dataset": {
+                    dataset: sum(sample.dataset == dataset for sample in samples)
+                    for dataset in sorted({sample.dataset for sample in samples})
+                },
             },
         )
         print(f"GRPO training complete. Adapter saved to {output_dir / 'adapter'}.")

@@ -29,6 +29,7 @@ from rl_training.train_grpo_macorag import _train_on_rollouts
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _build_train_metrics_payload
 from rl_training.train_grpo_macorag import _dataset_rollout_path
+from rl_training.train_grpo_macorag import _resolved_args_payload
 from rl_training.trainer import compute_grpo_loss
 from rl_training.vllm_client import collect_trainable_named_parameters
 
@@ -490,6 +491,12 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "loss": 0.2,
         "policy_loss": 0.1,
         "kl": 0.01,
+        "clip_fraction": 0.125,
+        "trainable_action_count": 2,
+        "valid_completion_token_count": 7,
+        "policy_forward_batch_count": 1,
+        "reference_forward_batch_count": 1,
+        "skipped_update_reason": None,
         "time_policy_forward_seconds": 2.0,
         "time_reference_forward_seconds": 1.5,
         "time_backward_seconds": 4.0,
@@ -499,6 +506,9 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "time_rollout_seconds": 10.0,
         "time_vllm_generate_seconds": 6.0,
         "time_behavior_rescore_seconds": 0.25,
+        "time_retrieval_seconds": 1.25,
+        "retrieval_cache_hits": 3,
+        "retrieval_cache_misses": 2,
         "time_reward_seconds": 0.3,
     }
 
@@ -513,6 +523,7 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         best_rollout=best_rollout,
         learning_rate=0.00001,
         rollout_timing=rollout_timing,
+        time_initial_weight_sync_seconds=0.6,
         time_weight_sync_seconds=0.4,
         time_total_seconds=15.0,
     )
@@ -520,19 +531,92 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
     assert payload["gold_answer"] == "Gold answer"
     assert payload["generated_answer"] == "Predicted answer"
     assert payload["action_advantage_mean"] == 0.25
+    assert payload["reward_group"] == {
+        "min": 1.0,
+        "max": 3.0,
+        "mean": 2.0,
+        "std": 1.0,
+    }
+    assert payload["rollout_advantage_std"] == 1.0
+    assert payload["action_advantage_std"] == 0.75
+    assert payload["clip_fraction"] == 0.125
+    assert payload["trainable_action_count"] == 2
+    assert payload["valid_completion_token_count"] == 7
     assert payload["timing"] == {
         "rollout_seconds": 10.0,
         "vllm_generate_seconds": 6.0,
         "behavior_rescore_seconds": 0.25,
+        "retrieval_seconds": 1.25,
+        "retrieval_cache_hits": 3,
+        "retrieval_cache_misses": 2,
         "reward_seconds": 0.3,
         "policy_forward_seconds": 2.0,
         "reference_forward_seconds": 1.5,
         "backward_seconds": 4.0,
         "optimizer_step_seconds": 0.2,
+        "initial_weight_sync_seconds": 0.6,
         "weight_sync_seconds": 0.4,
         "total_seconds": 15.0,
     }
     assert all(not key.startswith("time_") for key in payload)
+
+
+def test_rollout_log_payload_keeps_best_and_optionally_logs_group() -> None:
+    import rl_training.train_grpo_macorag as train_module
+
+    sample = Namespace(qid="q1", dataset="hotpotqa", question="question", answer="gold")
+    actions = [
+        Namespace(
+            role=AgentRole.QUERY_RETRIEVER,
+            round_index=0,
+            local_reward=0.5,
+            terminal_reward=1.0,
+            advantage=0.25,
+        )
+    ]
+    rollouts = [
+        {
+            "group_index": index,
+            "rewards": {"total": float(index)},
+            "terminal_reward": float(index),
+            "parse_errors": [],
+            "final_answer": f"answer-{index}",
+            "actions": actions,
+            "trajectory": [{"round": 0, "answer": {"can_answer": True}}],
+        }
+        for index in range(4)
+    ]
+
+    payload = train_module._rollout_log_payload(
+        epoch=1,
+        sample_index=0,
+        sample=sample,
+        rollouts=rollouts,
+        best_rollout=rollouts[-1],
+        log_all_group_rollouts=True,
+    )
+
+    assert payload["best_reward"] == {"total": 3.0}
+    assert payload["trajectory"] == rollouts[-1]["trajectory"]
+    assert len(payload["group_rollouts"]) == 4
+    assert payload["group_rollouts"][0]["group_index"] == 0
+    assert payload["group_rollouts"][0]["final_answer"] == "answer-0"
+
+
+def test_resolved_args_payload_makes_runtime_values_json_serializable(tmp_path: Path) -> None:
+    args = Namespace(
+        flag=True,
+        output_path=tmp_path / "output",
+        batch_sizes=(1, 2, 4),
+        nested={"devices": {"0", "1"}},
+    )
+
+    assert _resolved_args_payload(args) == {
+        "batch_sizes": [1, 2, 4],
+        "flag": True,
+        "nested": {"devices": ["0", "1"]},
+        "output_path": str(tmp_path / "output"),
+    }
 
 
 def test_parse_args_supports_disabling_rl_progress_bar(tmp_path: Path) -> None:
