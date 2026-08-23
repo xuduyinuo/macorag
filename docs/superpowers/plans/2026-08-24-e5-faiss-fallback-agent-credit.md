@@ -151,6 +151,17 @@ Implement `create_retrieval_env()` with keyword-only parameters `backend`, `retr
 
 The E5 environment exposes `query`, `query_batch`, `prewarm`, and `stats` and uses existing deep-copy LRU semantics.
 
+- [ ] **Step 4a: Normalize E5 agent-facing passages to local IDs and four fields**
+
+Add a regression test whose fake E5 result contains a global `passage_id` plus `chunk_id`, `doc_id`, `dataset`, and `sentences`. Assert that the runtime observation renumbers results by rank and exposes exactly `passage_id`, `title`, `text`, and `score`. Then update `CachedE5FaissRetrievalEnv._observation()` to construct that projection without changing the underlying E5 index/query result.
+
+```python
+assert observation["passages"] == [
+    {"passage_id": 0, "title": "A", "text": "alpha", "score": 0.9},
+    {"passage_id": 1, "title": "B", "text": "beta", "score": 0.8},
+]
+```
+
 - [ ] **Step 5: Wire evaluation and GRPO arguments**
 
 Add defaults/CLI fields `retrieval_backend=e5_faiss`, `retrieval_embedding_model=intfloat/e5-base-v2`, `retrieval_device=cpu`, and `retrieval_max_length=512`. Update both `_build_retrieval_env()` functions to call the factory. Persist backend/model/device/max length/root/top-k in run metadata. Preserve existing resume/retry edits in overlapping files.

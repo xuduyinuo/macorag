@@ -51,7 +51,9 @@ The encoder uses the E5 tokenizer and encoder directly:
 4. L2-normalize every embedding.
 5. Convert embeddings to contiguous `float32` arrays.
 
-The query engine loads one encoder and lazily loads one FAISS index/corpus pair per dataset. It supports both `query()` and `query_batch()`. Batch rollout retrieval must encode all cache misses together and perform one FAISS batch search. Returned passages retain stable `passage_id`, title, text, metadata, and similarity score.
+The query engine loads one encoder and lazily loads one FAISS index/corpus pair per dataset. It supports both `query()` and `query_batch()`. Batch rollout retrieval must encode all cache misses together and perform one FAISS batch search.
+
+The query engine may retain the complete corpus row and global FAISS ID internally, but the runtime observation exposed to agents contains exactly `passage_id`, `title`, `text`, and `score`. `passage_id` is the zero-based rank within the current retrieval result (`0..top_k-1`), not the global corpus ID. Every retrieval starts numbering from zero. When the Evidence Agent selects a local ID, the executor immediately copies the corresponding title, text, and score into accumulated evidence, so later retrievals cannot reinterpret an earlier local ID. Corpus metadata such as `chunk_id`, `doc_id`, `dataset`, and the text-duplicating `sentences` field must not enter the agent prompt.
 
 The existing LRU query cache and retrieval timing counters remain available at the backend-neutral environment boundary.
 
