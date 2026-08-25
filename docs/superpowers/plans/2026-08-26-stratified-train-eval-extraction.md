@@ -445,7 +445,7 @@ Expected: focused tests pass; current default configs remain untouched.
 - [ ] **Step 1: Preview production quotas**
 
 ```bash
-python -m data_processing.extract_stratified_datasets \
+PYTHONPATH=src python -m data_processing.extract_stratified_datasets \
   --train-config config/extract_stratified_train_v2.yml \
   --eval-config config/extract_stratified_eval_v2.yml \
   --dry-run
@@ -465,7 +465,7 @@ Expected: exit 0. If either exists, stop and inspect it; do not delete it.
 - [ ] **Step 3: Run paired extraction**
 
 ```bash
-python -m data_processing.extract_stratified_datasets \
+PYTHONPATH=src python -m data_processing.extract_stratified_datasets \
   --train-config config/extract_stratified_train_v2.yml \
   --eval-config config/extract_stratified_eval_v2.yml
 ```
@@ -475,7 +475,7 @@ Expected: both roots publish only after all six dataset audits pass.
 - [ ] **Step 4: Independently audit published artifacts**
 
 ```bash
-python -m data_processing.extract_stratified_datasets \
+PYTHONPATH=src python -m data_processing.extract_stratified_datasets \
   --train-config config/extract_stratified_train_v2.yml \
   --eval-config config/extract_stratified_eval_v2.yml \
   --audit-existing
@@ -543,8 +543,8 @@ pre-existing unrelated changes remain; generated data is not committed.
 - [ ] **Step 5: Hand off matching E5 builds without launching them**
 
 ```bash
-python -m data_processing.retrieval_cli --config config/build_retrieval_train_stratified_v2_e5.yml
-python -m data_processing.retrieval_cli --config config/build_retrieval_eval_stratified_v2_e5.yml
+PYTHONPATH=src python -m data_processing.retrieval_cli --config config/build_retrieval_train_stratified_v2_e5.yml
+PYTHONPATH=src python -m data_processing.retrieval_cli --config config/build_retrieval_eval_stratified_v2_e5.yml
 ```
 
 Do not use the new runtime configs or claim indexes exist until these commands
