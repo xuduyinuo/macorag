@@ -526,3 +526,63 @@ def test_cli_audits_existing_pair(tmp_path: Path, capsys) -> None:
     assert payload["train_total"] == 3
     assert payload["evaluation_total"] == 3
     assert payload["overlap_audit"] == {"qid_count": 0, "normalized_question_count": 0}
+
+
+def test_production_configs_match_approved_contract() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    train = load_extraction_config(
+        repo_root / "config" / "extract_stratified_train_v2.yml", repo_root=repo_root
+    )
+    evaluation = load_extraction_config(
+        repo_root / "config" / "extract_stratified_eval_v2.yml", repo_root=repo_root
+    )
+
+    assert train["seed"] == evaluation["seed"] == 20260826
+    assert (train["split"], evaluation["split"]) == ("train", "dev")
+    assert (train["expected_total"], evaluation["expected_total"]) == (2000, 1000)
+    assert train["datasets"]["2wiki"]["quotas"] == {
+        "compositional": 831,
+        "comparison": 486,
+        "bridge_comparison": 440,
+        "inference": 243,
+    }
+    assert evaluation["datasets"]["hotpotqa"]["quotas"] == {
+        "hard/bridge": 798,
+        "hard/comparison": 202,
+    }
+    assert evaluation["datasets"]["musique"]["quotas"] == {
+        "2hop": 518,
+        "3hop1": 235,
+        "3hop2": 79,
+        "4hop1": 102,
+        "4hop2": 27,
+        "4hop3": 39,
+    }
+
+
+def test_opt_in_downstream_configs_use_only_v2_roots() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+
+    train_retrieval = yaml.safe_load(
+        (repo_root / "config" / "build_retrieval_train_stratified_v2_e5.yml").read_text()
+    )
+    eval_retrieval = yaml.safe_load(
+        (repo_root / "config" / "build_retrieval_eval_stratified_v2_e5.yml").read_text()
+    )
+    train_runtime = yaml.safe_load(
+        (repo_root / "config" / "train_grpo_stratified_v2.yml").read_text()
+    )
+    eval_runtime = yaml.safe_load(
+        (repo_root / "config" / "eval_macorag_stratified_v2.yml").read_text()
+    )
+
+    assert train_retrieval["data_root"] == "data/rl_train_2000_stratified_v2"
+    assert train_retrieval["retrieval_root"] == "data/rl_train_2000_stratified_v2_e5_faiss"
+    assert eval_retrieval["data_root"] == "data/eval_1000_stratified_v2"
+    assert eval_retrieval["retrieval_root"] == "data/eval_1000_stratified_v2_e5_faiss"
+    assert train_runtime["rl_data_root"] == "data/rl_train_2000_stratified_v2"
+    assert train_runtime["retrieval_root"] == "data/rl_train_2000_stratified_v2_e5_faiss"
+    assert train_runtime["max_samples"] == 2000
+    assert eval_runtime["data_root"] == "data/eval_1000_stratified_v2"
+    assert eval_runtime["retrieval_root"] == "data/eval_1000_stratified_v2_e5_faiss"
+    assert eval_runtime["max_samples"] is None

@@ -1,0 +1,25 @@
+schema_version: 1
+source_root: "data/processed"
+output_root: "data/rl_train_2000_stratified_v2"
+split: "train"
+seed: 20260826
+expected_total: 2000
+datasets:
+  2wiki:
+    quotas:
+      compositional: 831
+      comparison: 486
+      bridge_comparison: 440
+      inference: 243
+  hotpotqa:
+    quotas:
+      hard/bridge: 1596
+      hard/comparison: 404
+  musique:
+    quotas:
+      2hop: 1036
+      3hop1: 470
+      3hop2: 159
+      4hop1: 203
+      4hop2: 53
+      4hop3: 79
