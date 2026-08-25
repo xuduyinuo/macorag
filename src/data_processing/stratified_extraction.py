@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import random
 import re
+import shutil
+import sys
+import tempfile
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -296,3 +299,207 @@ def validate_dataset_output(
         if summary.get(key) != value:
             raise ValueError(f"summary {key} mismatch for {dataset}/{split}")
     return audit
+
+
+def _config_path(config: dict[str, Any], key: str) -> Path:
+    return Path(config[key])
+
+
+def _source_examples_path(config: dict[str, Any], dataset: str) -> Path:
+    split = str(config["split"])
+    return _config_path(config, "source_root") / dataset / f"{dataset}_{split}.jsonl"
+
+
+def _selection_map(config: dict[str, Any]) -> dict[str, SelectionResult]:
+    selected: dict[str, SelectionResult] = {}
+    for dataset, dataset_config in config["datasets"].items():
+        selected[dataset] = select_rows(
+            source_path=_source_examples_path(config, dataset),
+            dataset=dataset,
+            split=str(config["split"]),
+            quotas=dict(dataset_config["quotas"]),
+            seed=int(config["seed"]),
+        )
+    return selected
+
+
+def _overlap_audit(
+    train_rows: dict[str, list[dict[str, Any]]],
+    evaluation_rows: dict[str, list[dict[str, Any]]],
+) -> dict[str, int]:
+    train_qids = {
+        (dataset, str(row.get("qid") or ""))
+        for dataset, rows in train_rows.items()
+        for row in rows
+    }
+    evaluation_qids = {
+        (dataset, str(row.get("qid") or ""))
+        for dataset, rows in evaluation_rows.items()
+        for row in rows
+    }
+    train_questions = {
+        (dataset, normalize_question(str(row.get("question") or "")))
+        for dataset, rows in train_rows.items()
+        for row in rows
+    }
+    evaluation_questions = {
+        (dataset, normalize_question(str(row.get("question") or "")))
+        for dataset, rows in evaluation_rows.items()
+        for row in rows
+    }
+    return {
+        "qid_count": len(train_qids & evaluation_qids),
+        "normalized_question_count": len(train_questions & evaluation_questions),
+    }
+
+
+def _staging_root(target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    stale = sorted(target.parent.glob(f".{target.name}.staging-*"))
+    for path in stale:
+        print(f"stale staging directory ignored: {path}", file=sys.stderr)
+    return Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+
+
+def _write_split_root(
+    *,
+    staging_root: Path,
+    config: dict[str, Any],
+    selections: dict[str, SelectionResult],
+    overlap_audit: dict[str, int],
+) -> dict[str, Any]:
+    summaries: dict[str, Any] = {}
+    for dataset, selection in selections.items():
+        dataset_config = config["datasets"][dataset]
+        summaries[dataset] = write_dataset_output(
+            output_root=staging_root,
+            repo_root=_config_path(config, "repo_root"),
+            dataset=dataset,
+            split=str(config["split"]),
+            selection=selection,
+            source_examples=_source_examples_path(config, dataset),
+            source_corpus=_config_path(config, "source_root") / dataset / "corpus.jsonl",
+            quotas=dict(dataset_config["quotas"]),
+            seed=int(config["seed"]),
+        )
+        validate_dataset_output(
+            staging_root / dataset,
+            dataset=dataset,
+            split=str(config["split"]),
+            quotas=dict(dataset_config["quotas"]),
+        )
+    manifest = {
+        "schema_version": 1,
+        "split": str(config["split"]),
+        "seed": int(config["seed"]),
+        "source_root": _repo_relative(
+            _config_path(config, "source_root"), _config_path(config, "repo_root")
+        ),
+        "output_root": _config_path(config, "output_root").relative_to(
+            _config_path(config, "repo_root")
+        ).as_posix(),
+        "example_count": sum(summary["example_count"] for summary in summaries.values()),
+        "overlap_audit": dict(overlap_audit),
+        "datasets": summaries,
+    }
+    write_json(staging_root / "extraction_manifest.json", manifest)
+    return manifest
+
+
+def extract_pair(
+    train_config: dict[str, Any], evaluation_config: dict[str, Any]
+) -> dict[str, Any]:
+    train_target = _config_path(train_config, "output_root")
+    evaluation_target = _config_path(evaluation_config, "output_root")
+    for target in (train_target, evaluation_target):
+        if target.exists():
+            raise FileExistsError(f"target already exists: {target}")
+
+    train_selections = _selection_map(train_config)
+    evaluation_selections = _selection_map(evaluation_config)
+    overlap = _overlap_audit(
+        {dataset: result.rows for dataset, result in train_selections.items()},
+        {dataset: result.rows for dataset, result in evaluation_selections.items()},
+    )
+    if overlap["qid_count"]:
+        raise ValueError(f"qid overlap between train and evaluation: {overlap['qid_count']}")
+    if overlap["normalized_question_count"]:
+        raise ValueError(
+            "normalized-question overlap between train and evaluation: "
+            f"{overlap['normalized_question_count']}"
+        )
+
+    train_staging: Path | None = None
+    evaluation_staging: Path | None = None
+    try:
+        train_staging = _staging_root(train_target)
+        evaluation_staging = _staging_root(evaluation_target)
+        train_manifest = _write_split_root(
+            staging_root=train_staging,
+            config=train_config,
+            selections=train_selections,
+            overlap_audit=overlap,
+        )
+        evaluation_manifest = _write_split_root(
+            staging_root=evaluation_staging,
+            config=evaluation_config,
+            selections=evaluation_selections,
+            overlap_audit=overlap,
+        )
+        train_staging.replace(train_target)
+        train_staging = None
+        evaluation_staging.replace(evaluation_target)
+        evaluation_staging = None
+    finally:
+        for staging in (train_staging, evaluation_staging):
+            if staging is not None and staging.exists():
+                shutil.rmtree(staging)
+
+    return {
+        "overlap_audit": overlap,
+        "train": train_manifest,
+        "evaluation": evaluation_manifest,
+    }
+
+
+def audit_existing_pair(
+    train_config: dict[str, Any], evaluation_config: dict[str, Any]
+) -> dict[str, Any]:
+    split_audits: dict[str, dict[str, Any]] = {}
+    rows_by_label: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for label, config in (("train", train_config), ("evaluation", evaluation_config)):
+        output_root = _config_path(config, "output_root")
+        if not output_root.is_dir():
+            raise FileNotFoundError(f"published output root not found: {output_root}")
+        dataset_audits: dict[str, Any] = {}
+        dataset_rows: dict[str, list[dict[str, Any]]] = {}
+        for dataset, dataset_config in config["datasets"].items():
+            dataset_audits[dataset] = validate_dataset_output(
+                output_root / dataset,
+                dataset=dataset,
+                split=str(config["split"]),
+                quotas=dict(dataset_config["quotas"]),
+            )
+            examples_path = output_root / dataset / f"{dataset}_{config['split']}.jsonl"
+            dataset_rows[dataset] = list(read_jsonl(examples_path))
+            summary = read_json(output_root / dataset / "extract_summary.json")
+            source_examples = _config_path(config, "repo_root") / summary["source_examples"]
+            source_corpus = _config_path(config, "repo_root") / summary["source_corpus"]
+            if sha256_file(source_examples) != summary["source_sha256"]["examples"]:
+                raise ValueError(f"source example SHA256 mismatch for {dataset}/{config['split']}")
+            if sha256_file(source_corpus) != summary["source_sha256"]["corpus"]:
+                raise ValueError(f"source corpus SHA256 mismatch for {dataset}/{config['split']}")
+        split_audits[label] = dataset_audits
+        rows_by_label[label] = dataset_rows
+    overlap = _overlap_audit(rows_by_label["train"], rows_by_label["evaluation"])
+    if any(overlap.values()):
+        raise ValueError(f"published train/evaluation overlap: {overlap}")
+    return {
+        "train_total": sum(item["example_count"] for item in split_audits["train"].values()),
+        "evaluation_total": sum(
+            item["example_count"] for item in split_audits["evaluation"].values()
+        ),
+        "overlap_audit": overlap,
+        "train": split_audits["train"],
+        "evaluation": split_audits["evaluation"],
+    }

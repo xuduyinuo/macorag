@@ -4,12 +4,15 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
+from data_processing.extract_stratified_datasets import load_extraction_config, main
 from data_processing.io_utils import write_jsonl
 from data_processing.stratified_extraction import (
     SelectionResult,
     derive_seed,
     eligibility_error,
+    extract_pair,
     normalize_question,
     required_doc_ids,
     scope_corpus,
@@ -325,3 +328,201 @@ def test_validator_detects_tampered_output(tmp_path: Path) -> None:
             split="train",
             quotas={"inference": 2},
         )
+
+
+def _dataset_stratum(dataset: str) -> tuple[str | None, str | None, str]:
+    if dataset == "2wiki":
+        return "inference", None, "inference"
+    if dataset == "hotpotqa":
+        return "bridge", "hard", "hard/bridge"
+    return None, None, "2hop"
+
+
+def _write_pair_sources(repo_root: Path, *, overlap_question: bool = False) -> None:
+    source_root = repo_root / "data" / "processed"
+    for dataset in ("2wiki", "hotpotqa", "musique"):
+        stratum, level, _ = _dataset_stratum(dataset)
+        corpus_rows = []
+        for split in ("train", "dev"):
+            qid = f"{dataset}-{split}"
+            if dataset == "musique":
+                qid = f"2hop__{split}_1"
+            question = f"{dataset} {split} question?"
+            if overlap_question and dataset == "2wiki":
+                question = "Same normalized question?" if split == "train" else "same normalized question!"
+            row = make_row(dataset, split, qid, stratum, level=level, question=question)
+            path = source_root / dataset / f"{dataset}_{split}.jsonl"
+            write_jsonl(path, [row])
+            corpus_rows.extend(make_doc(doc_id) for doc_id in required_doc_ids([row]))
+        unique_docs = {row["doc_id"]: row for row in corpus_rows}
+        write_jsonl(source_root / dataset / "corpus.jsonl", unique_docs.values())
+
+
+def _pair_configs(tmp_path: Path, *, overlap_question: bool = False) -> tuple[dict, dict]:
+    repo_root = tmp_path / "repo"
+    _write_pair_sources(repo_root, overlap_question=overlap_question)
+    datasets = {
+        dataset: {"quotas": {_dataset_stratum(dataset)[2]: 1}}
+        for dataset in ("2wiki", "hotpotqa", "musique")
+    }
+    common = {
+        "schema_version": 1,
+        "repo_root": repo_root,
+        "source_root": repo_root / "data" / "processed",
+        "seed": 20260826,
+        "expected_total": 1,
+        "datasets": datasets,
+    }
+    train = {**common, "split": "train", "output_root": repo_root / "data" / "train_out"}
+    evaluation = {**common, "split": "dev", "output_root": repo_root / "data" / "eval_out"}
+    return train, evaluation
+
+
+def test_extract_pair_publishes_both_after_zero_overlap_audit(tmp_path: Path) -> None:
+    train, evaluation = _pair_configs(tmp_path)
+
+    manifest = extract_pair(train, evaluation)
+
+    assert manifest["overlap_audit"] == {"qid_count": 0, "normalized_question_count": 0}
+    assert train["output_root"].is_dir()
+    assert evaluation["output_root"].is_dir()
+    assert not list((tmp_path / "repo" / "data").glob("*.staging-*"))
+    assert (train["output_root"] / "extraction_manifest.json").is_file()
+    assert (evaluation["output_root"] / "extraction_manifest.json").is_file()
+
+
+def test_extract_pair_refuses_existing_target(tmp_path: Path) -> None:
+    train, evaluation = _pair_configs(tmp_path)
+    train["output_root"].mkdir(parents=True)
+
+    with pytest.raises(FileExistsError, match="target already exists"):
+        extract_pair(train, evaluation)
+
+
+def test_extract_pair_never_publishes_overlapping_questions(tmp_path: Path) -> None:
+    train, evaluation = _pair_configs(tmp_path, overlap_question=True)
+
+    with pytest.raises(ValueError, match="normalized-question overlap"):
+        extract_pair(train, evaluation)
+
+    assert not train["output_root"].exists()
+    assert not evaluation["output_root"].exists()
+
+
+def test_extract_pair_removes_staging_after_handled_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train, evaluation = _pair_configs(tmp_path)
+
+    def fail_validation(*args, **kwargs):
+        raise ValueError("forced validation failure")
+
+    monkeypatch.setattr(
+        "data_processing.stratified_extraction.validate_dataset_output", fail_validation
+    )
+    with pytest.raises(ValueError, match="forced validation failure"):
+        extract_pair(train, evaluation)
+
+    assert not list((tmp_path / "repo" / "data").glob("*.staging-*"))
+    assert not train["output_root"].exists()
+    assert not evaluation["output_root"].exists()
+
+
+def _write_config(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(payload, handle, sort_keys=False)
+
+
+def _write_pair_config_files(tmp_path: Path) -> tuple[Path, Path, Path]:
+    repo_root = tmp_path / "repo"
+    _write_pair_sources(repo_root)
+    datasets = {
+        dataset: {"quotas": {_dataset_stratum(dataset)[2]: 1}}
+        for dataset in ("2wiki", "hotpotqa", "musique")
+    }
+    config_dir = repo_root / "config"
+    train_path = config_dir / "train.yml"
+    eval_path = config_dir / "eval.yml"
+    _write_config(
+        train_path,
+        {
+            "schema_version": 1,
+            "source_root": "data/processed",
+            "output_root": "data/train_out",
+            "split": "train",
+            "seed": 20260826,
+            "expected_total": 1,
+            "datasets": datasets,
+        },
+    )
+    _write_config(
+        eval_path,
+        {
+            "schema_version": 1,
+            "source_root": "data/processed",
+            "output_root": "data/eval_out",
+            "split": "dev",
+            "seed": 20260826,
+            "expected_total": 1,
+            "datasets": datasets,
+        },
+    )
+    return repo_root, train_path, eval_path
+
+
+def test_config_rejects_wrong_quota_total(tmp_path: Path) -> None:
+    repo_root, train_path, _ = _write_pair_config_files(tmp_path)
+    payload = yaml.safe_load(train_path.read_text(encoding="utf-8"))
+    payload["expected_total"] = 2
+    _write_config(train_path, payload)
+
+    with pytest.raises(ValueError, match="quota total 1 != expected_total 2"):
+        load_extraction_config(train_path, repo_root=repo_root)
+
+
+def test_cli_dry_run_prints_contract_without_writing(tmp_path: Path, capsys) -> None:
+    repo_root, train_path, eval_path = _write_pair_config_files(tmp_path)
+
+    rc = main(
+        [
+            "--train-config",
+            str(train_path),
+            "--eval-config",
+            str(eval_path),
+            "--repo-root",
+            str(repo_root),
+            "--dry-run",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["train"]["total_quota"] == 3
+    assert payload["evaluation"]["total_quota"] == 3
+    assert not (repo_root / "data" / "train_out").exists()
+
+
+def test_cli_audits_existing_pair(tmp_path: Path, capsys) -> None:
+    repo_root, train_path, eval_path = _write_pair_config_files(tmp_path)
+    train = load_extraction_config(train_path, repo_root=repo_root)
+    evaluation = load_extraction_config(eval_path, repo_root=repo_root)
+    extract_pair(train, evaluation)
+
+    rc = main(
+        [
+            "--train-config",
+            str(train_path),
+            "--eval-config",
+            str(eval_path),
+            "--repo-root",
+            str(repo_root),
+            "--audit-existing",
+        ]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["train_total"] == 3
+    assert payload["evaluation_total"] == 3
+    assert payload["overlap_audit"] == {"qid_count": 0, "normalized_question_count": 0}
