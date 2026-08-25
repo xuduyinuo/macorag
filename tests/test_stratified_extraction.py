@@ -7,11 +7,17 @@ import pytest
 
 from data_processing.io_utils import write_jsonl
 from data_processing.stratified_extraction import (
+    SelectionResult,
     derive_seed,
     eligibility_error,
     normalize_question,
+    required_doc_ids,
+    scope_corpus,
     select_rows,
+    sha256_file,
     stratum_key,
+    validate_dataset_output,
+    write_dataset_output,
 )
 
 
@@ -183,3 +189,139 @@ def test_select_rows_rejects_underfilled_stratum(tmp_path: Path) -> None:
 
 def test_test_fixture_rows_are_json_serializable() -> None:
     json.dumps(make_row("2wiki", "train", "q", "comparison"))
+
+
+def make_doc(doc_id: str) -> dict:
+    return {
+        "doc_id": doc_id,
+        "dataset": doc_id.split(":", 1)[0],
+        "title": f"Title {doc_id}",
+        "text": f"Text for {doc_id}",
+        "sentences": [f"Text for {doc_id}"],
+        "metadata": {},
+    }
+
+
+def test_required_doc_ids_unions_context_and_support() -> None:
+    row = make_row("2wiki", "train", "q", "inference")
+    row["context_doc_ids"] = ["d1", "d2", "d1"]
+    row["supporting_facts"] = [
+        {"doc_id": "d3", "text": "gold"},
+        {"doc_id": "", "text": "ignored"},
+    ]
+    assert required_doc_ids([row]) == {"d1", "d2", "d3"}
+
+
+def test_scope_corpus_is_exact_and_preserves_source_order(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    write_jsonl(corpus, [make_doc("d2"), make_doc("unused"), make_doc("d1")])
+
+    scoped = scope_corpus(corpus, {"d1", "d2"})
+
+    assert [row["doc_id"] for row in scoped] == ["d2", "d1"]
+
+
+def test_scope_corpus_rejects_missing_required_doc(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    write_jsonl(corpus, [make_doc("d1")])
+
+    with pytest.raises(ValueError, match="missing required corpus docs: missing"):
+        scope_corpus(corpus, {"d1", "missing"})
+
+
+def test_scope_corpus_rejects_duplicate_required_doc(tmp_path: Path) -> None:
+    corpus = tmp_path / "corpus.jsonl"
+    write_jsonl(corpus, [make_doc("d1"), make_doc("d1")])
+
+    with pytest.raises(ValueError, match="duplicate corpus doc_id: d1"):
+        scope_corpus(corpus, {"d1"})
+
+
+def test_sha256_file_streams_stable_digest(tmp_path: Path) -> None:
+    path = tmp_path / "payload.bin"
+    path.write_bytes(b"macorag\n")
+    assert sha256_file(path) == "f0b320aa25a7cb197a7f0b4f53f5f68d2f3368ffb01051a9347b2828c1cb5038"
+
+
+def _selected_output_fixture(tmp_path: Path) -> tuple[SelectionResult, Path, Path]:
+    rows = [
+        make_row("2wiki", "train", "i1", "inference"),
+        make_row("2wiki", "train", "i2", "inference"),
+    ]
+    examples = tmp_path / "repo" / "data" / "processed" / "2wiki" / "2wiki_train.jsonl"
+    corpus = examples.parent / "corpus.jsonl"
+    write_jsonl(examples, rows)
+    doc_ids = sorted(required_doc_ids(rows))
+    write_jsonl(corpus, [make_doc(doc_id) for doc_id in doc_ids] + [make_doc("2wiki:unused")])
+    selection = SelectionResult(
+        rows=rows,
+        source_indices=[4, 9],
+        qids=["i1", "i2"],
+        quota_actual={"inference": 2},
+        eligible_count=8,
+        excluded_by_reason={"quality_flags": 1},
+    )
+    return selection, examples, corpus
+
+
+def test_write_and_validate_dataset_output_records_contract(tmp_path: Path) -> None:
+    selection, examples, corpus = _selected_output_fixture(tmp_path)
+    output_root = tmp_path / "repo" / "data" / "out"
+
+    summary = write_dataset_output(
+        output_root=output_root,
+        repo_root=tmp_path / "repo",
+        dataset="2wiki",
+        split="train",
+        selection=selection,
+        source_examples=examples,
+        source_corpus=corpus,
+        quotas={"inference": 2},
+        seed=20260826,
+    )
+
+    assert summary["output_examples"] == "2wiki/2wiki_train.jsonl"
+    assert summary["output_corpus"] == "2wiki/corpus.jsonl"
+    assert summary["source_examples"] == "data/processed/2wiki/2wiki_train.jsonl"
+    assert summary["actual_quota"] == {"inference": 2}
+    assert summary["required_corpus_count"] == 4
+    assert len(summary["output_sha256"]["examples"]) == 64
+
+    audit = validate_dataset_output(
+        output_root / "2wiki",
+        dataset="2wiki",
+        split="train",
+        quotas={"inference": 2},
+    )
+    assert audit["example_count"] == 2
+    assert audit["unique_qid_count"] == 2
+    assert audit["unique_question_count"] == 2
+    assert audit["required_corpus_count"] == audit["corpus_count"] == 4
+    assert audit["actual_quota"] == {"inference": 2}
+
+
+def test_validator_detects_tampered_output(tmp_path: Path) -> None:
+    selection, examples, corpus = _selected_output_fixture(tmp_path)
+    output_root = tmp_path / "repo" / "data" / "out"
+    write_dataset_output(
+        output_root=output_root,
+        repo_root=tmp_path / "repo",
+        dataset="2wiki",
+        split="train",
+        selection=selection,
+        source_examples=examples,
+        source_corpus=corpus,
+        quotas={"inference": 2},
+        seed=20260826,
+    )
+    with (output_root / "2wiki" / "2wiki_train.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(selection.rows[0]))
+        handle.write("\n")
+
+    with pytest.raises(ValueError, match="example SHA256 mismatch"):
+        validate_dataset_output(
+            output_root / "2wiki",
+            dataset="2wiki",
+            split="train",
+            quotas={"inference": 2},
+        )
