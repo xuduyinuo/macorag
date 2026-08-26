@@ -25,6 +25,8 @@ ROLLOUT_DEFAULTS: dict[str, Any] = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_samples": None,
     "max_total_samples": None,
+    "data_sampling_strategy": "head",
+    "data_sampling_seed": 20260826,
     "seed": 42,
     "max_rounds": 3,
     "group_size": 4,
@@ -169,6 +171,16 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         "--max-total-samples",
         type=int,
         default=defaults["max_total_samples"],
+    )
+    rollout.add_argument(
+        "--data-sampling-strategy",
+        choices=("head", "proportional_stratified"),
+        default=defaults["data_sampling_strategy"],
+    )
+    rollout.add_argument(
+        "--data-sampling-seed",
+        type=int,
+        default=defaults["data_sampling_seed"],
     )
     rollout.add_argument("--seed", type=int, default=defaults["seed"])
     rollout.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])

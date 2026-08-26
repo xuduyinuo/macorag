@@ -840,6 +840,8 @@ def main() -> None:
         data_root=args.rl_data_root,
         data_files=list(args.rl_data_files or []),
         max_samples=args.max_samples,
+        data_sampling_strategy=args.data_sampling_strategy,
+        data_sampling_seed=args.data_sampling_seed,
     )
     loaded_sample_count = len(samples)
     samples = select_balanced_samples(

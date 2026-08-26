@@ -8,6 +8,8 @@ prompt_config_path: "config/prompts.yml"
 require_sft_prompt_contract: true
 
 max_samples: 2000
+data_sampling_strategy: "proportional_stratified"
+data_sampling_seed: 20260826
 max_rounds: 4
 group_size: 4
 num_train_epochs: 1.0

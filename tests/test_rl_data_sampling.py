@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from rl_training.config import parse_args
 from rl_training.data import RLSample, load_rl_samples, select_proportional_prefix
 
 
@@ -319,3 +320,46 @@ def test_loader_rejects_unknown_strategy_and_non_integer_seed(tmp_path: Path) ->
             data_sampling_strategy="proportional_stratified",
             data_sampling_seed="20260826",  # type: ignore[arg-type]
         )
+
+
+def test_parse_args_loads_and_overrides_data_sampling_options(
+    tmp_path: Path,
+) -> None:
+    config = tmp_path / "train.yml"
+    config.write_text(
+        "data_sampling_strategy: head\ndata_sampling_seed: 7\n",
+        encoding="utf-8",
+    )
+
+    from_yaml = parse_args(["--config", str(config)])
+    overridden = parse_args(
+        [
+            "--config",
+            str(config),
+            "--data-sampling-strategy",
+            "proportional_stratified",
+            "--data-sampling-seed",
+            "20260826",
+        ]
+    )
+
+    assert from_yaml.data_sampling_strategy == "head"
+    assert from_yaml.data_sampling_seed == 7
+    assert overridden.data_sampling_strategy == "proportional_stratified"
+    assert overridden.data_sampling_seed == 20260826
+
+
+def test_stratified_v2_config_enables_proportional_sampling_only_opt_in() -> None:
+    import yaml
+
+    v2 = yaml.safe_load(
+        Path("config/train_grpo_stratified_v2.yml").read_text(encoding="utf-8")
+    )
+    default = yaml.safe_load(
+        Path("config/train_grpo.yml").read_text(encoding="utf-8")
+    )
+
+    assert v2["data_sampling_strategy"] == "proportional_stratified"
+    assert v2["data_sampling_seed"] == 20260826
+    assert "data_sampling_strategy" not in default
+    assert "data_sampling_seed" not in default
