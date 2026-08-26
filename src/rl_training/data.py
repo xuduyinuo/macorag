@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import random
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -193,12 +193,45 @@ def _build_sample(row: dict[str, Any], fallback_dataset: str) -> RLSample | None
     )
 
 
+def _sampling_stratum(dataset: str, row: dict[str, Any]) -> str:
+    if dataset == "2wiki":
+        value = str(row.get("question_type") or "").strip()
+    elif dataset == "hotpotqa":
+        level = str((row.get("metadata") or {}).get("level") or "").strip()
+        question_type = str(row.get("question_type") or "").strip()
+        value = f"{level}/{question_type}" if level and question_type else ""
+    elif dataset == "musique":
+        qid = str(row.get("qid") or "")
+        value = qid.split("__", 1)[0] if "__" in qid else ""
+    else:
+        raise ValueError(f"Unsupported proportional sampling dataset: {dataset}")
+    if not value:
+        raise ValueError(
+            f"Missing sampling stratum for {dataset}/{row.get('qid', '')}"
+        )
+    if value not in STRATA_BY_DATASET[dataset]:
+        raise ValueError(f"Unknown sampling stratum for {dataset}: {value!r}")
+    return value
+
+
 def load_rl_samples(
     *,
     data_root: str | Path,
     data_files: list[str] | tuple[str, ...] | None = None,
     max_samples: int | None = None,
+    data_sampling_strategy: str = "head",
+    data_sampling_seed: int = 20260826,
 ) -> tuple[list[RLSample], dict[str, Any]]:
+    if data_sampling_strategy not in {"head", "proportional_stratified"}:
+        raise ValueError(
+            "data_sampling_strategy must be 'head' or 'proportional_stratified'; "
+            f"got {data_sampling_strategy!r}."
+        )
+    if type(data_sampling_seed) is not int:
+        raise TypeError("data_sampling_seed must be an integer.")
+    if max_samples is not None and max_samples < 0:
+        raise ValueError("max_samples must be non-negative or None.")
+
     root = Path(data_root)
     files = _resolve_files(root, tuple(data_files or ()))
     if not files:
@@ -207,6 +240,7 @@ def load_rl_samples(
     samples: list[RLSample] = []
     skipped = 0
     counts_by_dataset: dict[str, int] = {}
+    all_by_dataset: dict[str, list[RLSample]] = defaultdict(list)
     source_files: list[str] = []
     for path in files:
         if not path.exists():
@@ -218,10 +252,31 @@ def load_rl_samples(
             if sample is None:
                 skipped += 1
                 continue
+            if data_sampling_strategy == "proportional_stratified":
+                sample = replace(
+                    sample,
+                    sampling_stratum=_sampling_stratum(sample.dataset, row),
+                )
+                all_by_dataset[sample.dataset].append(sample)
+                continue
             dataset_count = counts_by_dataset.get(sample.dataset, 0)
             if max_samples is None or dataset_count < max_samples:
                 samples.append(sample)
                 counts_by_dataset[sample.dataset] = dataset_count + 1
+
+    counts_by_dataset_and_stratum: dict[str, dict[str, int]] = {}
+    if data_sampling_strategy == "proportional_stratified":
+        for dataset in sorted(all_by_dataset):
+            selected = select_proportional_prefix(
+                all_by_dataset[dataset],
+                max_samples=max_samples,
+                seed=data_sampling_seed,
+            )
+            samples.extend(selected)
+            counts_by_dataset[dataset] = len(selected)
+            counts_by_dataset_and_stratum[dataset] = dict(
+                Counter(sample.sampling_stratum for sample in selected)
+            )
 
     if not samples:
         raise ValueError(f"No valid RL samples found in {root}")
@@ -233,5 +288,8 @@ def load_rl_samples(
         "counts_by_dataset": counts_by_dataset,
         "max_samples": max_samples,
         "max_samples_per_dataset": max_samples,
+        "data_sampling_strategy": data_sampling_strategy,
+        "data_sampling_seed": data_sampling_seed,
+        "counts_by_dataset_and_stratum": counts_by_dataset_and_stratum,
     }
     return samples, summary

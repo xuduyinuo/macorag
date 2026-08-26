@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
+from pathlib import Path
 
 import pytest
 
-from rl_training.data import RLSample, select_proportional_prefix
+from rl_training.data import RLSample, load_rl_samples, select_proportional_prefix
 
 
 EXPECTED = {
@@ -141,3 +143,179 @@ def test_proportional_prefix_rejects_invalid_inputs() -> None:
     unsupported = make_samples("unknown", {"other": 1})
     with pytest.raises(ValueError, match="Unsupported"):
         select_proportional_prefix(unsupported, max_samples=1, seed=1)
+
+
+def sample_row(dataset: str, stratum: str, index: int) -> dict[str, object]:
+    qid = f"{dataset}-{stratum}-{index}"
+    metadata: dict[str, object] = {}
+    question_type: str | None = stratum
+    if dataset == "hotpotqa":
+        level, question_type = stratum.split("/", 1)
+        metadata["level"] = level
+    elif dataset == "musique":
+        qid = f"{stratum}__{index}"
+        question_type = None
+    return {
+        "qid": qid,
+        "dataset": dataset,
+        "question": f"question {dataset} {stratum} {index}",
+        "answer": f"answer {index}",
+        "answer_aliases": [],
+        "supporting_facts": [],
+        "context_doc_ids": [],
+        "question_type": question_type,
+        "metadata": metadata,
+    }
+
+
+def write_dataset(
+    root: Path,
+    dataset: str,
+    counts: dict[str, int],
+) -> None:
+    path = root / dataset / f"{dataset}_train.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        sample_row(dataset, stratum, index)
+        for stratum, count in counts.items()
+        for index in range(count)
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+
+def test_loader_proportional_strategy_is_nested_and_reports_strata(
+    tmp_path: Path,
+) -> None:
+    write_dataset(tmp_path, "hotpotqa", EXPECTED["hotpotqa"]["source"])
+
+    samples_500, summary_500 = load_rl_samples(
+        data_root=tmp_path,
+        max_samples=500,
+        data_sampling_strategy="proportional_stratified",
+        data_sampling_seed=20260826,
+    )
+    samples_1000, summary_1000 = load_rl_samples(
+        data_root=tmp_path,
+        max_samples=1000,
+        data_sampling_strategy="proportional_stratified",
+        data_sampling_seed=20260826,
+    )
+
+    assert set(qids(samples_500)) <= set(qids(samples_1000))
+    assert summary_500["counts_by_dataset"] == {"hotpotqa": 500}
+    assert summary_500["counts_by_dataset_and_stratum"] == {
+        "hotpotqa": EXPECTED["hotpotqa"][500]
+    }
+    assert summary_1000["counts_by_dataset_and_stratum"] == {
+        "hotpotqa": EXPECTED["hotpotqa"][1000]
+    }
+    assert summary_500["data_sampling_strategy"] == "proportional_stratified"
+    assert summary_500["data_sampling_seed"] == 20260826
+
+
+def test_loader_derives_all_v2_dataset_strata(tmp_path: Path) -> None:
+    for dataset in ("2wiki", "hotpotqa", "musique"):
+        counts = {stratum: 1 for stratum in EXPECTED[dataset]["source"]}
+        write_dataset(tmp_path, dataset, counts)
+
+    samples, summary = load_rl_samples(
+        data_root=tmp_path,
+        max_samples=None,
+        data_sampling_strategy="proportional_stratified",
+        data_sampling_seed=20260826,
+    )
+
+    assert len(samples) == 12
+    assert summary["counts_by_dataset_and_stratum"] == {
+        dataset: {stratum: 1 for stratum in EXPECTED[dataset]["source"]}
+        for dataset in ("2wiki", "hotpotqa", "musique")
+    }
+
+
+def test_loader_head_strategy_preserves_first_n_without_type_fields(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "legacy" / "legacy_train.jsonl"
+    path.parent.mkdir(parents=True)
+    rows = [
+        {
+            "qid": f"q{index}",
+            "dataset": "legacy",
+            "question": f"question {index}",
+            "answer": f"answer {index}",
+            "supporting_facts": [],
+        }
+        for index in range(2)
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    samples, summary = load_rl_samples(
+        data_root=tmp_path,
+        max_samples=1,
+        data_sampling_strategy="head",
+    )
+
+    assert qids(samples) == ["q0"]
+    assert summary["counts_by_dataset_and_stratum"] == {}
+
+
+@pytest.mark.parametrize(
+    ("dataset", "row", "message"),
+    [
+        (
+            "2wiki",
+            sample_row("2wiki", "compositional", 0) | {"question_type": None},
+            "Missing sampling stratum",
+        ),
+        (
+            "hotpotqa",
+            sample_row("hotpotqa", "hard/bridge", 0) | {"metadata": {}},
+            "Missing sampling stratum",
+        ),
+        (
+            "musique",
+            sample_row("musique", "2hop", 0) | {"qid": "invalid"},
+            "Missing sampling stratum",
+        ),
+        (
+            "other",
+            sample_row("other", "other", 0),
+            "Unsupported proportional sampling dataset",
+        ),
+    ],
+)
+def test_loader_proportional_strategy_rejects_missing_or_unsupported_strata(
+    tmp_path: Path,
+    dataset: str,
+    row: dict[str, object],
+    message: str,
+) -> None:
+    path = tmp_path / dataset / f"{dataset}_train.jsonl"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match=message):
+        load_rl_samples(
+            data_root=tmp_path,
+            data_sampling_strategy="proportional_stratified",
+            data_sampling_seed=20260826,
+        )
+
+
+def test_loader_rejects_unknown_strategy_and_non_integer_seed(tmp_path: Path) -> None:
+    write_dataset(tmp_path, "2wiki", {"compositional": 1})
+
+    with pytest.raises(ValueError, match="data_sampling_strategy"):
+        load_rl_samples(data_root=tmp_path, data_sampling_strategy="random")
+    with pytest.raises(TypeError, match="data_sampling_seed"):
+        load_rl_samples(
+            data_root=tmp_path,
+            data_sampling_strategy="proportional_stratified",
+            data_sampling_seed="20260826",  # type: ignore[arg-type]
+        )
