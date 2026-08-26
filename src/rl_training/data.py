@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import random
 from collections import defaultdict
@@ -18,6 +19,7 @@ class RLSample:
     supporting_facts: list[dict[str, Any]]
     context_doc_ids: list[str]
     metadata: dict[str, Any]
+    sampling_stratum: str = ""
 
     def to_reward_sample(self) -> dict[str, Any]:
         return {
@@ -25,6 +27,67 @@ class RLSample:
             "answer_aliases": self.answer_aliases,
             "supporting_facts": self.supporting_facts,
         }
+
+
+STRATA_BY_DATASET: dict[str, tuple[str, ...]] = {
+    "2wiki": ("compositional", "comparison", "bridge_comparison", "inference"),
+    "hotpotqa": ("hard/bridge", "hard/comparison"),
+    "musique": ("2hop", "3hop1", "3hop2", "4hop1", "4hop2", "4hop3"),
+}
+
+
+def _derive_sampling_seed(seed: int, *parts: str) -> int:
+    payload = "\0".join([str(seed), *parts]).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def select_proportional_prefix(
+    samples: list[RLSample],
+    *,
+    max_samples: int | None,
+    seed: int,
+) -> list[RLSample]:
+    if max_samples is not None and max_samples < 0:
+        raise ValueError("max_samples must be non-negative or None.")
+    if not samples:
+        return []
+
+    dataset = samples[0].dataset
+    if any(sample.dataset != dataset for sample in samples):
+        raise ValueError("Proportional prefix requires exactly one dataset.")
+    canonical = STRATA_BY_DATASET.get(dataset)
+    if canonical is None:
+        raise ValueError(f"Unsupported proportional sampling dataset: {dataset}")
+
+    buckets: dict[str, list[RLSample]] = {stratum: [] for stratum in canonical}
+    for sample in samples:
+        if sample.sampling_stratum not in buckets:
+            raise ValueError(
+                f"Unknown sampling stratum for {dataset}: {sample.sampling_stratum!r}"
+            )
+        buckets[sample.sampling_stratum].append(sample)
+    source_counts = {stratum: len(bucket) for stratum, bucket in buckets.items()}
+    for stratum, bucket in buckets.items():
+        random.Random(_derive_sampling_seed(seed, dataset, stratum)).shuffle(bucket)
+
+    total = len(samples)
+    selected_counts = {stratum: 0 for stratum in canonical}
+    schedule: list[RLSample] = []
+    for position in range(1, total + 1):
+        available = [stratum for stratum in canonical if buckets[stratum]]
+        chosen = max(
+            available,
+            key=lambda stratum: (
+                position * source_counts[stratum]
+                - selected_counts[stratum] * total,
+                -canonical.index(stratum),
+            ),
+        )
+        schedule.append(buckets[chosen].pop())
+        selected_counts[chosen] += 1
+
+    limit = total if max_samples is None else min(max_samples, total)
+    return schedule[:limit]
 
 
 def select_balanced_samples(
