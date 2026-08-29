@@ -356,12 +356,10 @@ git diff --check -- \
   tests/test_rl_training.py
 rg -n 'should_stop|bad_windows_to_stop|protocol_abort' \
   src/rag/protocol_metrics.py \
-  src/rl_training/train_grpo_macorag.py \
-  tests/test_protocol_metrics.py \
-  tests/test_rl_training.py
+  src/rl_training/train_grpo_macorag.py
 ```
 
-Expected: both commands produce no findings and exit successfully for the diff check; `rg` exits 1 because no forbidden names remain.
+Expected: the diff check exits successfully; `rg` exits 1 because no forbidden names remain in production code. Tests intentionally retain negative assertions that `should_stop` is absent from monitor results.
 
 - [ ] **Step 4: Run a one-step GPU smoke training in a new output root**
 
@@ -389,7 +387,7 @@ test -f "$smoke_dir/train_meta.json"
 tail -n 1 "$smoke_dir/train_metrics.jsonl"
 ```
 
-Expected: both file checks succeed and the final JSONL row reports `global_step` equal to `1`.
+Expected: both file checks succeed, `train_meta.json` reports `global_step` equal to `1`, and the final JSONL row reports the existing metrics-schema field `step` equal to `1`.
 
 ---
 
