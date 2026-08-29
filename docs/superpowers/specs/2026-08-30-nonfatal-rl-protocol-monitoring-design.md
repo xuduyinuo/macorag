@@ -39,9 +39,11 @@ warning threshold is reached, training appends a `protocol_warning` event and
 continues through optimization, vLLM synchronization, metrics logging, and
 rollout persistence.
 
-Remove the automatic protocol-quality `SystemExit`. Genuine invariant
-failures, exhausted vLLM retries, CUDA errors, and invalid numerical/runtime
-states remain fatal rather than being silently swallowed.
+Remove the automatic protocol-quality `SystemExit`. Unexpected runtime and
+invariant failures, exhausted vLLM retries, and CUDA errors remain fatal rather
+than being silently swallowed. Preserve the existing explicit handling for
+non-finite gradients: clear gradients, record
+`skipped_update_reason=nonfinite_gradients`, and continue training.
 
 ### Recovery checkpoint separation
 
@@ -70,9 +72,10 @@ Add tests proving that:
 5. Existing checkpoint deferral, full-state resume, prompt-budget, RAG, and RL
    regression tests remain valid.
 
-Run compilation and diff checks, then run a short GPU smoke training. The
-50-sample historical failure pattern is covered deterministically by unit
-tests rather than repeating a 30-minute run.
+Run focused deterministic unit tests, compilation, and diff checks. This
+control-flow-only correction does not require another GPU smoke run; the
+50-sample historical failure pattern is covered by unit tests rather than
+repeating a 30-minute run.
 
 ## Scope and Limitations
 
