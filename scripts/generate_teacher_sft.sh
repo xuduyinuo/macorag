@@ -12,4 +12,9 @@ if [[ -f "${ENV_FILE}" ]]; then
   set +a
 fi
 export PYTHONPATH="${REPO_ROOT}/src${PYTHONPATH:+:${PYTHONPATH}}"
-python -m data_processing.generate_teacher_sft --config "${REPO_ROOT}/config/generate_teacher_sft.yml" "$@"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/generate_teacher_sft.yml}"
+if [[ "${MACORAG_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
+  printf '[teacher] config=%s api_key_env=DASHSCOPE_API_KEY\n' "${CONFIG_PATH}"
+  exit 0
+fi
+"${PYTHON:-python}" -m data_processing.generate_teacher_sft --config "${CONFIG_PATH}" "$@"

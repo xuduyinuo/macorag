@@ -30,6 +30,54 @@ def test_parse_server_args_requires_lora_identity() -> None:
     assert args.lora_adapter_path == "outputs/adapter"
 
 
+def test_parse_server_args_accepts_memory_safe_scheduler_limit() -> None:
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--gpu-memory-utilization",
+            "0.85",
+            "--max-num-seqs",
+            "8",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+
+    assert args.gpu_memory_utilization == pytest.approx(0.85)
+    assert args.max_num_seqs == 8
+
+
+def test_build_llm_kwargs_forwards_memory_and_scheduler_limits() -> None:
+    from rl_training.vllm_lora_server import build_llm_kwargs
+
+    args = parse_server_args(
+        [
+            "--model",
+            "model/Qwen2.5-7B-Instruct",
+            "--gpu-memory-utilization",
+            "0.85",
+            "--max-num-seqs",
+            "8",
+            "--lora-name",
+            "macorag_train",
+            "--lora-int-id",
+            "1",
+            "--lora-adapter-path",
+            "outputs/adapter",
+        ]
+    )
+
+    kwargs = build_llm_kwargs(args)
+
+    assert kwargs["gpu_memory_utilization"] == pytest.approx(0.85)
+    assert kwargs["max_num_seqs"] == 8
+
+
 def test_build_lora_request_uses_configured_identity() -> None:
     from rl_training.vllm_lora_server import build_lora_request, parse_server_args
 
@@ -489,10 +537,12 @@ def test_health_endpoint_exposes_lora_identity_and_capability_status() -> None:
         "status": "ok",
         "sync_mode": "lora",
         "model": "model/Qwen2.5-7B-Instruct",
+        "dtype": "auto",
         "lora_name": "macorag_train",
         "lora_int_id": 1,
         "lora_adapter_path": "outputs/adapter",
         "supports_lora_param_update": True,
+        "supports_prompt_seeds": True,
     }
 
 

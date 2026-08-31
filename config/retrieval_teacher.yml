@@ -1,0 +1,13 @@
+command: build
+backend: e5_faiss
+data_root: "data/trajectory_train"
+retrieval_root: "data/trajectory_train_e5_faiss"
+datasets:
+  - 2wiki
+  - hotpotqa
+  - musique
+embedding_model: "intfloat/e5-base-v2"
+device: "cpu"
+max_length: 512
+batch_size: 128
+retrieval_top_k: 5

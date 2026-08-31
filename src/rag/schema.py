@@ -11,6 +11,26 @@ class AgentRole(str, Enum):
     ANSWER_GENERATOR = "answer_generator"
 
 
+@dataclass(frozen=True)
+class AnswerPromptContext:
+    round_index: int
+    max_rounds: int
+
+    def __post_init__(self) -> None:
+        if self.max_rounds <= 0:
+            raise ValueError("max_rounds must be positive")
+        if self.round_index < 0 or self.round_index >= self.max_rounds:
+            raise ValueError("round_index must satisfy 0 <= round_index < max_rounds")
+
+    @property
+    def is_final_round(self) -> bool:
+        return self.round_index == self.max_rounds - 1
+
+    @property
+    def remaining_rounds(self) -> int:
+        return self.max_rounds - self.round_index - 1
+
+
 @dataclass
 class ParsedAction:
     role: AgentRole
@@ -55,6 +75,7 @@ class SharedPolicy(Protocol):
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None = None,
+        answer_context: AnswerPromptContext | None = None,
     ) -> str:
         ...
 

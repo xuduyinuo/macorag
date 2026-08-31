@@ -1,9 +1,0 @@
-sample_size: 1000
-output_dir: "data/eval_1000"
-split: "dev"
-source_root: "data/processed"
-datasets:
-  - hotpotqa
-  - 2wiki
-  - musique
-seed: 24

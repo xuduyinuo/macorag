@@ -349,17 +349,14 @@ def test_parse_args_loads_and_overrides_data_sampling_options(
     assert overridden.data_sampling_seed == 20260826
 
 
-def test_stratified_v2_config_enables_proportional_sampling_only_opt_in() -> None:
+def test_train_grpo_config_enables_proportional_stratified_sampling() -> None:
     import yaml
 
-    v2 = yaml.safe_load(
-        Path("config/train_grpo_stratified_v2.yml").read_text(encoding="utf-8")
-    )
-    default = yaml.safe_load(
-        Path("config/train_grpo.yml").read_text(encoding="utf-8")
-    )
+    config = yaml.safe_load(Path("config/train_grpo.yml").read_text(encoding="utf-8"))
 
-    assert v2["data_sampling_strategy"] == "proportional_stratified"
-    assert v2["data_sampling_seed"] == 20260826
-    assert "data_sampling_strategy" not in default
-    assert "data_sampling_seed" not in default
+    assert config["max_samples"] == 1000
+    assert config["max_total_samples"] == 1000
+    assert config["max_steps"] == 1000
+    assert config["run_until_step"] == 300
+    assert config["data_sampling_strategy"] == "proportional_stratified"
+    assert config["data_sampling_seed"] == 20260826

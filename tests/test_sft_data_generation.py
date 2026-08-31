@@ -5,6 +5,10 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+import pytest
+
+from rag import AnswerPromptContext
+
 from data_processing.generate_teacher_sft import (
     SFTConfig,
     _retrieve,
@@ -82,8 +86,9 @@ def test_teacher_sft_script_loads_gitignored_env_file() -> None:
 
     assert "ENV_FILE" in script
     assert 'source "${ENV_FILE}"' in script
-    assert "python -m data_processing.generate_teacher_sft" in script
+    assert "-m data_processing.generate_teacher_sft" in script
     assert "config/generate_teacher_sft.yml" in script
+    assert "CONFIG_PATH" in script
     assert ".env" in gitignore.splitlines()
 
 
@@ -99,7 +104,6 @@ def test_final_update_prompt_requires_answer() -> None:
         state={"evidence": [], "retrieval_history": [], "retrieval_count": 3},
         plan={"retrieval": {"query": "Vasco da Gama father"}},
         observation={"passages": ["Vasco da Gama\nHis father was Estêvão da Gama."], "scores": [0.8]},
-        force_final_answer=True,
     )
 
     content = "\n".join(message["content"] for message in messages)
@@ -138,6 +142,7 @@ def test_answer_prompt_uses_accumulated_state_only() -> None:
             "retrieval_history": [{"query": "The Tripper director"}],
             "retrieval_count": 1,
         },
+        context=AnswerPromptContext(round_index=1, max_rounds=4),
     )
 
     content = "\n".join(message["content"] for message in messages)
@@ -146,10 +151,11 @@ def test_answer_prompt_uses_accumulated_state_only() -> None:
     assert "You are a retrieval-augmented reasoning assistant" not in content
     assert "<observation>" not in content
     assert '"answer"' in content
+    assert "can_answer=false" in content
     assert not any(term in content for term in FORBIDDEN_PROMPT_TERMS)
 
 
-def test_finalize_teacher_output_fills_gold_answer_on_last_round() -> None:
+def test_finalize_teacher_output_rejects_false_answer_on_last_round() -> None:
     teacher_output = {
         "plan": {},
         "retrieval": {},
@@ -157,15 +163,12 @@ def test_finalize_teacher_output_fills_gold_answer_on_last_round() -> None:
         "answer": {"can_answer": False, "answer": None, "rationale": "Still not enough evidence."},
     }
 
-    finalized = finalize_teacher_output(
-        teacher_output,
-        example={"answer": "Estêvão da Gama"},
-        force_final_answer=True,
-    )
-
-    assert finalized["answer"]["can_answer"] is False
-    assert finalized["answer"]["answer"] is None
-    assert "supervised" not in finalized["answer"]["rationale"]
+    with pytest.raises(ValueError, match="final answer"):
+        finalize_teacher_output(
+            teacher_output,
+            example={"answer": "Estêvão da Gama"},
+            context=AnswerPromptContext(round_index=3, max_rounds=4),
+        )
 
 
 def test_finalize_teacher_output_normalizes_forced_final_answer() -> None:
@@ -180,12 +183,26 @@ def test_finalize_teacher_output_normalizes_forced_final_answer() -> None:
     finalized = finalize_teacher_output(
         teacher_output,
         example={"answer": "Estêvão da Gama"},
-        force_final_answer=True,
+        context=AnswerPromptContext(round_index=3, max_rounds=4),
     )
 
     assert finalized["answer"]["answer"] == "Wrong"
     assert finalized["answer"]["can_answer"] is True
     assert "inconsistent historical detour" in finalized["answer"]["rationale"]
+
+
+def test_final_teacher_answer_prompt_has_strict_nonempty_answer_semantics() -> None:
+    messages = build_answer_messages(
+        example={"qid": "q1", "dataset": "toyqa", "question": "Q?", "answer": "SECRET"},
+        state={"evidence": [], "retrieval_history": [], "retrieval_count": 4},
+        context=AnswerPromptContext(round_index=3, max_rounds=4),
+    )
+
+    content = "\n".join(message["content"] for message in messages)
+    assert "can_answer=true" in content
+    assert "non-empty" in content
+    assert "fallback_guess:" in content
+    assert "SECRET" not in content
 
 
 def test_build_trajectory_sample_groups_rounds_in_one_record() -> None:
@@ -294,8 +311,8 @@ def test_generate_sft_dataset_reports_filter_reasons(monkeypatch, tmp_path: Path
                 "qid": "q1",
                 "dataset": "toyqa",
                 "split": "train",
-                "question": "Are Adam Gontier and Hayley Williams from the same country?",
-                "answer": "no",
+                "question": "Where was Adam Gontier born?",
+                "answer": "Canada",
                 "hop_count": 1,
             },
             {
@@ -314,7 +331,7 @@ def test_generate_sft_dataset_reports_filter_reasons(monkeypatch, tmp_path: Path
 
     def fake_dry_plan(example, state, top_k):
         if example["qid"] == "q1":
-            query = "Canada country"
+            query = "Canada birthplace"
         else:
             query = "Q2"
         return {
@@ -346,17 +363,25 @@ def test_generate_sft_dataset_reports_filter_reasons(monkeypatch, tmp_path: Path
     assert summary["dataset_stats"]["toyqa"]["samples_written"] == 1
     assert summary["dataset_stats"]["toyqa"]["samples_filtered"] == 1
     assert summary["dataset_stats"]["toyqa"]["filter_reasons"]["unseen_intermediate_query"] == 1
+    filtered_rows = [
+        json.loads(line)
+        for line in (tmp_path / "sft" / "teacher_filtered.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(filtered_rows) == 1
+    assert filtered_rows[0]["stage"] == "planning"
+    assert filtered_rows[0]["filter_reasons"] == ["unseen_intermediate_query"]
+    assert filtered_rows[0]["trajectory"][0]["raw_responses"]["query_retriever"]
 
 
 def test_generate_sft_dataset_reports_dataset_stats(monkeypatch, tmp_path: Path) -> None:
     source_root = tmp_path / "trajectory_test"
     _write_jsonl(
         source_root / "alpha" / "alpha_train.jsonl",
-        [{"qid": "a1", "dataset": "alpha", "split": "train", "question": "A?", "answer": "A"}],
+        [{"qid": "a1", "dataset": "alpha", "split": "train", "question": "Alpha?", "answer": "Alpha"}],
     )
     _write_jsonl(
         source_root / "beta" / "beta_train.jsonl",
-        [{"qid": "b1", "dataset": "beta", "split": "train", "question": "B?", "answer": "B"}],
+        [{"qid": "b1", "dataset": "beta", "split": "train", "question": "Where?", "answer": "Canada"}],
     )
 
     def fake_retrieve(config, dataset, query):
@@ -404,7 +429,8 @@ def test_generate_sft_dataset_counts_filtered_samples_not_error_events(monkeypat
     )
 
     def fake_retrieve(config, dataset, query):
-        return {"query": query, "passages": [f"{query}\n{query} evidence."], "scores": [1.0]}
+        answer = "A1" if str(query).startswith("Q1") else "A2"
+        return {"query": query, "passages": [f"{query}\n{answer} evidence."], "scores": [1.0]}
 
     def fake_dry_plan(example, state, top_k):
         query = example["question"]
@@ -442,6 +468,30 @@ def test_generate_sft_dataset_counts_filtered_samples_not_error_events(monkeypat
     assert summary["samples_written"] == 1
     assert summary["samples_filtered"] == 1
     assert sum(summary["filter_reasons"].values()) == 2
+    assert summary["filtered_records"] == 1
+    assert summary["filter_reason_occurrences"] == summary["filter_reasons"]
+    assert summary["filtered_output"].endswith("teacher_filtered.jsonl")
+
+    filtered_rows = [
+        json.loads(line)
+        for line in (tmp_path / "sft" / "teacher_filtered.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(filtered_rows) == 1
+    record = filtered_rows[0]
+    assert record["dataset"] == "toyqa"
+    assert record["qid"] == "q1"
+    assert record["stage"] == "validation"
+    assert record["validation_errors"] == [
+        "round 0 has leaked evidence",
+        "round 0 retrieval_count mismatch",
+    ]
+    assert record["answer_exact_match"] == 1
+    assert record["answer_contain"] == 1
+    assert record["answer_f1"] == 1.0
+    assert record["evidence_supported"] is True
+    assert record["trajectory"][0]["raw_responses"]["query_retriever"]
+    assert record["prompt_contract_fingerprint"]
+    assert "retrieval_index_fingerprint" in record
 
 
 def test_generate_sft_dataset_reports_resume_skips_separately(monkeypatch, tmp_path: Path) -> None:
@@ -501,15 +551,16 @@ def test_generate_sft_dataset_writes_separate_sft_file_per_dataset(monkeypatch, 
     output_dir = tmp_path / "sft"
     _write_jsonl(
         source_root / "alpha" / "alpha_train.jsonl",
-        [{"qid": "a1", "dataset": "alpha", "split": "train", "question": "A?", "answer": "A"}],
+        [{"qid": "a1", "dataset": "alpha", "split": "train", "question": "Alpha?", "answer": "Alpha"}],
     )
     _write_jsonl(
         source_root / "beta" / "beta_train.jsonl",
-        [{"qid": "b1", "dataset": "beta", "split": "train", "question": "B?", "answer": "B"}],
+        [{"qid": "b1", "dataset": "beta", "split": "train", "question": "Beta?", "answer": "Beta"}],
     )
 
     def fake_retrieve(config, dataset, query):
-        return {"query": query, "passages": [f"{dataset}\n{query[0]} evidence."], "scores": [1.0]}
+        answer = "Alpha" if dataset == "alpha" else "Beta"
+        return {"query": query, "passages": [f"{dataset}\n{answer} evidence."], "scores": [1.0]}
 
     def fake_dry_update(example, state, observation):
         return {
@@ -651,7 +702,7 @@ def test_retrieve_suppresses_nested_retrieval_output(monkeypatch, capsys) -> Non
 
     monkeypatch.setattr("data_processing.generate_teacher_sft.query_linear_rag", noisy_query_linear_rag)
 
-    observation = _retrieve(SFTConfig(), "toyqa", "Q?")
+    observation = _retrieve(SFTConfig(retrieval_backend="linear_rag"), "toyqa", "Q?")
 
     captured = capsys.readouterr()
     assert captured.out == ""
@@ -733,6 +784,150 @@ def test_validate_trajectory_sample_rejects_future_state_and_gold_text() -> None
     assert any("forbidden" in error for error in errors)
 
 
+def test_validate_trajectory_ignores_forbidden_term_inside_retrieved_text() -> None:
+    sample = {
+        "qid": "q1",
+        "question": "Where was the person born?",
+        "gold_answer": "Australia",
+        "answer_aliases": [],
+        "final_answer": "Australia",
+        "trajectory": [
+            {
+                "round": 0,
+                "state": {"evidence": [], "retrieval_history": [], "retrieval_count": 0},
+                "query_retriever": {"sub_goal": "find birthplace", "query": "person birthplace"},
+                "retrieval": {"query": "person birthplace", "top_k": 1},
+                "observation": {
+                    "passages": [
+                        {
+                            "passage_id": 0,
+                            "title": "Gold Coast",
+                            "text": "The person was born in Australia.",
+                        }
+                    ]
+                },
+                "update_evidence": {
+                    "selected_passage_ids": [0],
+                    "evidence": [
+                        {"passage_id": 0, "title": "Gold Coast", "text": "The person was born in Australia."}
+                    ],
+                    "rationale": "supports birthplace",
+                },
+                "answer": {"can_answer": True, "answer": "Australia", "rationale": "supported"},
+            }
+        ],
+    }
+
+    assert validate_trajectory_sample(sample) == []
+
+
+def test_validate_trajectory_still_rejects_forbidden_authored_rationale() -> None:
+    sample = {
+        "question": "Q?",
+        "gold_answer": "A1",
+        "final_answer": "A1",
+        "trajectory": [
+            {
+                "round": 0,
+                "state": {"evidence": [], "retrieval_history": [], "retrieval_count": 0},
+                "query_retriever": {"sub_goal": "find answer", "query": "Q"},
+                "retrieval": {"query": "Q", "top_k": 1},
+                "observation": {"passages": [{"passage_id": 0, "text": "A1"}]},
+                "update_evidence": {
+                    "selected_passage_ids": [0],
+                    "evidence": [{"passage_id": 0, "text": "A1"}],
+                    "rationale": "copied from gold answer",
+                },
+                "answer": {"can_answer": True, "answer": "A1", "rationale": "supported"},
+            }
+        ],
+    }
+
+    assert any("forbidden" in error for error in validate_trajectory_sample(sample))
+
+
+def test_query_leakage_uses_answer_forms_not_title_case() -> None:
+    state = {"evidence": [], "retrieval_history": [], "retrieval_count": 0}
+
+    assert not query_has_unseen_intermediate_terms(
+        "Birth Place biography",
+        question="What country was the actor born in?",
+        state=state,
+        answer_forms=["United States", "USA"],
+    )
+    assert query_has_unseen_intermediate_terms(
+        "United States birthplace",
+        question="What country was the actor born in?",
+        state=state,
+        answer_forms=["United States", "USA"],
+    )
+    assert not query_has_unseen_intermediate_terms(
+        "United States birthplace",
+        question="Was the actor born in the United States?",
+        state=state,
+        answer_forms=["United States", "USA"],
+    )
+
+
+def test_metric_normalized_exact_match_admits_article_variant_but_not_semantic_only_answer() -> None:
+    base = {
+        "question": "Who directed the film?",
+        "gold_answer": "David Arquette",
+        "answer_aliases": [],
+        "trajectory": [
+            {
+                "round": 0,
+                "state": {"evidence": [], "retrieval_history": [], "retrieval_count": 0},
+                "query_retriever": {"sub_goal": "find director", "query": "film director"},
+                "retrieval": {"query": "film director", "top_k": 1},
+                "observation": {"passages": [{"passage_id": 0, "text": "The director was David Arquette."}]},
+                "update_evidence": {
+                    "selected_passage_ids": [0],
+                    "evidence": [{"passage_id": 0, "text": "The director was David Arquette."}],
+                    "rationale": "supports director",
+                },
+                "answer": {"can_answer": True, "answer": "The David Arquette", "rationale": "supported"},
+            }
+        ],
+    }
+    article_variant = {**base, "final_answer": "The David Arquette"}
+    semantic_only = {
+        **base,
+        "gold_answer": "United States",
+        "final_answer": "America",
+        "trajectory": [
+            {
+                **base["trajectory"][0],
+                "answer": {"can_answer": True, "answer": "America", "rationale": "supported"},
+            }
+        ],
+    }
+
+    assert validate_trajectory_sample(article_variant) == []
+    assert any("exact match" in error for error in validate_trajectory_sample(semantic_only))
+
+
+def test_evidence_support_accepts_dataset_alias_for_metric_correct_answer() -> None:
+    assert answer_supported_by_evidence(
+        {"can_answer": True, "answer": "United States"},
+        [{"title": "Biography", "text": "Her birthplace was America."}],
+        accepted_answers=["United States", "America"],
+    )
+    assert answer_supported_by_evidence(
+        {"can_answer": True, "answer": "US"},
+        [{"title": "Biography", "text": "Her birthplace was the U.S."}],
+        accepted_answers=["US", "U.S."],
+    )
+
+
+def test_evidence_support_does_not_use_gold_aliases_for_metric_wrong_answer() -> None:
+    assert not answer_supported_by_evidence(
+        {"can_answer": True, "answer": "Canada"},
+        [{"title": "Biography", "text": "Her birthplace was Paris."}],
+        accepted_answers=["Paris", "City of Paris"],
+    )
+
+
 def test_validate_trajectory_sample_rejects_missing_final_answer() -> None:
     sample = {
         "qid": "q1",
@@ -757,8 +952,10 @@ def test_validate_trajectory_sample_rejects_missing_final_answer() -> None:
 def test_validate_trajectory_sample_rejects_query_with_unseen_intermediate_terms() -> None:
     sample = {
         "qid": "q1",
-        "question": "Are Adam Gontier and Hayley Williams from the same country?",
-        "final_answer": "no",
+        "question": "Where was Adam Gontier born?",
+        "gold_answer": "Canada",
+        "answer_aliases": ["Canadian"],
+        "final_answer": "Canada",
         "trajectory": [
             {
                 "round": 0,
@@ -766,7 +963,7 @@ def test_validate_trajectory_sample_rejects_query_with_unseen_intermediate_terms
                 "retrieval": {"query": "Canada country", "top_k": 1},
                 "observation": {"passages": [{"passage_id": 0, "title": "Canada", "text": "Canada is a country."}]},
                 "update_evidence": {"selected_passage_ids": [0], "evidence": [{"passage_id": 0, "text": "Canada is a country."}]},
-                "answer": {"can_answer": True, "answer": "no", "rationale": ""},
+                "answer": {"can_answer": True, "answer": "Canada", "rationale": ""},
             }
         ],
     }
@@ -783,16 +980,19 @@ def test_query_rejects_unseen_intermediate_answer_terms() -> None:
         "Canada national anthem",
         question="Are Adam Gontier and Hayley Williams from the same country?",
         state=state,
+        answer_forms=["Canada", "Canadian"],
     )
     assert not query_has_unseen_intermediate_terms(
         "Adam Gontier nationality",
         question="Are Adam Gontier and Hayley Williams from the same country?",
         state=state,
+        answer_forms=["Canada", "Canadian"],
     )
     assert not query_has_unseen_intermediate_terms(
         "Canada national anthem",
         question="Are Adam Gontier and Hayley Williams from the same country?",
         state={"evidence": [{"text": "Adam Gontier is a Canadian singer."}], "retrieval_history": [], "retrieval_count": 1},
+        answer_forms=["Canada", "Canadian"],
     )
 
 

@@ -5,11 +5,14 @@ from typing import Any
 
 from rag import (
     AgentRole,
+    AnswerPromptContext,
     RAGState,
     build_answer_generator_prompt,
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
 )
+from prompt_config import system_prompt_for
+from rag.prompt_budget import compact_tagged_json_prompt
 
 from .vllm_client import VLLMGenerationOutput
 
@@ -22,9 +25,11 @@ class GeneratedAction:
     prompt_ids: list[int]
     completion_ids: list[int]
     old_logprobs: Any
+    server_logprobs: Any | None = None
     round_index: int = 0
     local_reward: float = 0.0
     terminal_reward: float = 0.0
+    decision_return: float = 0.0
     advantage: float = 0.0
 
 
@@ -39,6 +44,12 @@ class PolicyGenerationRequest:
     question: str
     state: RAGState
     observation: dict[str, Any] | None = None
+    answer_context: AnswerPromptContext | None = None
+    force_final_answer: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.answer_context is not None:
+            object.__setattr__(self, "force_final_answer", self.answer_context.is_final_round)
 
 
 class HFSharedPolicy:
@@ -47,7 +58,7 @@ class HFSharedPolicy:
         *,
         model: Any,
         tokenizer: Any,
-        system_prompt: str,
+        system_prompt: str | None,
         max_prompt_length: int,
         max_completion_length: int,
         temperature: float,
@@ -77,6 +88,8 @@ class HFSharedPolicy:
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
     ) -> str:
         if role == AgentRole.QUERY_RETRIEVER:
             return build_query_retriever_prompt(question=question, state=state)
@@ -86,19 +99,33 @@ class HFSharedPolicy:
                 state=state,
                 observation=observation or {"passages": []},
             )
-        return build_answer_generator_prompt(question=question, state=state)
-
-    def _encode_prompt(self, prompt: str) -> list[int]:
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": prompt},
-        ]
-        prompt_ids = self.tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
+        return build_answer_generator_prompt(
+            question=question,
+            state=state,
+            context=answer_context,
+            force_final_answer=force_final_answer if answer_context is None else None,
         )
-        return list(prompt_ids)[-self.max_prompt_length :]
+
+    def _encode_prompt(self, prompt: str, *, role: AgentRole) -> list[int]:
+        def encode(text: str) -> list[int]:
+            messages = [
+                {"role": "system", "content": system_prompt_for(role)},
+                {"role": "user", "content": text},
+            ]
+            return list(
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+            )
+
+        compacted = compact_tagged_json_prompt(
+            prompt,
+            token_count=lambda text: len(encode(text)),
+            max_tokens=self.max_prompt_length,
+        )
+        return encode(compacted.text)
 
     def generate(
         self,
@@ -107,11 +134,20 @@ class HFSharedPolicy:
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None = None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
     ) -> str:
         import torch
 
-        prompt = self._prompt_for(role=role, question=question, state=state, observation=observation)
-        prompt_ids = self._encode_prompt(prompt)
+        prompt = self._prompt_for(
+            role=role,
+            question=question,
+            state=state,
+            observation=observation,
+            answer_context=answer_context,
+            force_final_answer=force_final_answer,
+        )
+        prompt_ids = self._encode_prompt(prompt, role=role)
         device = next(self.model.parameters()).device
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
@@ -154,9 +190,20 @@ class HFSharedPolicy:
 
 
 class VLLMSharedPolicy(HFSharedPolicy):
-    def __init__(self, *, vllm_client: Any, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        vllm_client: Any,
+        generation_seed: int = 0,
+        generation_counter: int = 0,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(**kwargs)
+        if generation_counter < 0:
+            raise ValueError("generation_counter must be non-negative")
         self.vllm_client = vllm_client
+        self.generation_seed = int(generation_seed)
+        self.generation_counter = int(generation_counter)
         self.timing: dict[str, float] = {
             "time_vllm_generate_seconds": 0.0,
             "time_behavior_rescore_seconds": 0.0,
@@ -176,6 +223,8 @@ class VLLMSharedPolicy(HFSharedPolicy):
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None = None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
     ) -> str:
         return self.generate_batch(
             [
@@ -184,6 +233,8 @@ class VLLMSharedPolicy(HFSharedPolicy):
                     question=question,
                     state=state,
                     observation=observation,
+                    answer_context=answer_context,
+                    force_final_answer=force_final_answer,
                 )
             ],
             traces=[self.trace],
@@ -213,13 +264,22 @@ class VLLMSharedPolicy(HFSharedPolicy):
                 question=request.question,
                 state=request.state,
                 observation=request.observation,
+                answer_context=request.answer_context,
+                force_final_answer=request.force_final_answer,
             )
             for request in requests
         ]
-        prompt_id_batches = [self._encode_prompt(prompt) for prompt in prompts]
+        prompt_id_batches = [
+            self._encode_prompt(prompt, role=request.role)
+            for prompt, request in zip(prompts, requests)
+        ]
         decoded_prompts = [
             self.tokenizer.decode(prompt_ids, skip_special_tokens=False)
             for prompt_ids in prompt_id_batches
+        ]
+        seeds = [
+            (self.generation_seed + self.generation_counter + offset) % (2**31 - 1)
+            for offset in range(len(decoded_prompts))
         ]
         generate_start = time.perf_counter()
         batch_generator = getattr(self.vllm_client, "generate_batch", None)
@@ -230,25 +290,36 @@ class VLLMSharedPolicy(HFSharedPolicy):
                 temperature=self.temperature,
                 top_p=self.top_p,
                 top_k=self.top_k,
+                seeds=seeds,
             )
         else:
             outputs = []
-            for decoded_prompt in decoded_prompts:
-                completion_ids, text = self.vllm_client.generate(
-                    decoded_prompt,
-                    max_tokens=self.max_completion_length,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    top_k=self.top_k,
-                )
+            import inspect
+
+            generator = self.vllm_client.generate
+            parameters = inspect.signature(generator).parameters
+            supports_seed = "seed" in parameters or any(
+                item.kind == inspect.Parameter.VAR_KEYWORD
+                for item in parameters.values()
+            )
+            for decoded_prompt, seed in zip(decoded_prompts, seeds):
+                generate_kwargs = {
+                    "max_tokens": self.max_completion_length,
+                    "temperature": self.temperature,
+                    "top_p": self.top_p,
+                    "top_k": self.top_k,
+                }
+                if supports_seed:
+                    generate_kwargs["seed"] = seed
+                completion_ids, text = generator(decoded_prompt, **generate_kwargs)
                 outputs.append(VLLMGenerationOutput(completion_ids=completion_ids, text=text))
+        self.generation_counter += len(decoded_prompts)
         self.timing["time_vllm_generate_seconds"] += time.perf_counter() - generate_start
         if len(outputs) != len(requests):
             raise RuntimeError(
                 f"vLLM returned {len(outputs)} outputs for {len(requests)} policy requests."
             )
 
-        device = next(self.model.parameters()).device
         responses: list[str] = []
         for request, trace, prompt, prompt_ids, output in zip(
             requests,
@@ -266,17 +337,11 @@ class VLLMSharedPolicy(HFSharedPolicy):
                     output_logprobs = output_logprobs[:end]
             response = output.text or self.tokenizer.decode(completion_ids, skip_special_tokens=True)
             if output_logprobs is None:
-                rescore_start = time.perf_counter()
-                with torch.no_grad():
-                    old_logprobs = sequence_logprobs(
-                        model=self.model,
-                        prompt_ids=prompt_ids,
-                        completion_ids=completion_ids,
-                        device=device,
-                    ).detach().cpu()
-                self.timing["time_behavior_rescore_seconds"] += time.perf_counter() - rescore_start
+                server_logprobs = None
+                old_logprobs = torch.empty(0, dtype=torch.float32)
             else:
-                old_logprobs = torch.tensor(output_logprobs, dtype=torch.float32)
+                server_logprobs = torch.tensor(output_logprobs, dtype=torch.float32)
+                old_logprobs = torch.empty(0, dtype=torch.float32)
             round_index = sum(1 for action in trace.actions if action.role == request.role)
             trace.actions.append(
                 GeneratedAction(
@@ -286,6 +351,7 @@ class VLLMSharedPolicy(HFSharedPolicy):
                     prompt_ids=prompt_ids,
                     completion_ids=completion_ids,
                     old_logprobs=old_logprobs,
+                    server_logprobs=server_logprobs,
                     round_index=round_index,
                 )
             )

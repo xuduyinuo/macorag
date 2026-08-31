@@ -10,4 +10,9 @@ export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
-python -m data_processing.retrieval_cli --config "${REPO_ROOT}/config/build_retrieval.yml" "$@"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/retrieval_eval.yml}"
+if [[ "${MACORAG_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
+  printf '[build-retrieval] config=%s\n' "${CONFIG_PATH}"
+  exit 0
+fi
+"${PYTHON:-python}" -m data_processing.retrieval_cli --config "${CONFIG_PATH}" "$@"

@@ -7,6 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from prompt_config import load_prompt_contract
+from rag import (
+    AnswerPromptContext,
+    RAGState,
+    advance_rag_state,
+    build_answer_generator_prompt,
+    build_evidence_updater_prompt,
+    build_query_retriever_prompt,
+)
+
 @dataclass
 class TrajectoryRecord:
     qid: str
@@ -16,6 +26,9 @@ class TrajectoryRecord:
     prompt_text: str
     target_text: str
     agent_role: str = ""
+    round_index: int = 0
+    max_rounds: int = 4
+    prompt_contract_fingerprint: str = ""
 
 
 @dataclass
@@ -31,6 +44,54 @@ class TrainingData:
     records: list[TrajectoryRecord]
     source_sample_count: int
     source_sample_counts_by_dataset: dict[str, int]
+
+
+def validate_teacher_dataset_contract(
+    data_root: Path,
+    *,
+    expected_contract: Any,
+    max_rounds: int,
+    retrieval_top_k: int,
+) -> dict[str, Any]:
+    metadata_path = Path(data_root) / "run_config.json"
+    if not metadata_path.is_file():
+        raise SystemExit(f"Teacher dataset provenance is missing: {metadata_path}")
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if str(metadata.get("prompt_contract_version")) != str(expected_contract.version):
+        raise SystemExit(
+            "Teacher prompt contract version mismatch: "
+            f"expected {expected_contract.version}, got {metadata.get('prompt_contract_version')}"
+        )
+    if str(metadata.get("prompt_contract_fingerprint")) != str(expected_contract.fingerprint):
+        raise SystemExit(
+            "Teacher prompt contract fingerprint mismatch: "
+            f"expected {expected_contract.fingerprint}, got {metadata.get('prompt_contract_fingerprint')}"
+        )
+    if int(metadata.get("max_rounds", -1)) != int(max_rounds):
+        raise SystemExit(
+            f"Teacher max_rounds mismatch: expected {max_rounds}, got {metadata.get('max_rounds')}"
+        )
+    if int(metadata.get("retrieval_top_k", -1)) != int(retrieval_top_k):
+        raise SystemExit(
+            "Teacher retrieval_top_k mismatch: "
+            f"expected {retrieval_top_k}, got {metadata.get('retrieval_top_k')}"
+        )
+    target = int(metadata.get("target_valid_per_dataset", 0) or 0)
+    datasets = [str(item) for item in metadata.get("datasets", [])]
+    if target <= 0 or not datasets:
+        raise SystemExit("Teacher dataset run_config is missing target or dataset identity")
+    for dataset in datasets:
+        path = Path(data_root) / f"{dataset}_sft.jsonl"
+        if not path.is_file():
+            raise SystemExit(f"Teacher dataset file is missing: {path}")
+        count = sum(1 for _ in _load_jsonl_records(path))
+        if count != target:
+            raise SystemExit(f"Teacher dataset count mismatch for {dataset}: expected {target}, got {count}")
+    index_provenance = metadata.get("index_provenance") or {}
+    missing_indexes = [dataset for dataset in datasets if not (index_provenance.get(dataset) or {}).get("available")]
+    if missing_indexes:
+        raise SystemExit("Teacher retrieval index provenance is incomplete: " + ", ".join(missing_indexes))
+    return metadata
 
 
 def _load_jsonl_records(path: Path) -> list[dict[str, Any]]:
@@ -54,44 +115,15 @@ def _tagged_json(tag: str, payload: Any) -> str:
     return f"<{tag}>{json.dumps(payload, ensure_ascii=False)}</{tag}>"
 
 
-def _json_block(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
-
-
-def _build_query_retriever_prompt(question: str, state: dict[str, Any]) -> str:
-    return (
-        "Task: plan the next knowledge-base query.\n"
-        "Use only the question and verified facts in <state>. Avoid repeated queries and unsupported intermediate facts.\n"
-        f"Question: {question}\n"
-        f"<state>{_json_block(state)}</state>\n"
-        'Return exactly: <query-retriever>{"sub_goal":"...","query":"..."}</query-retriever>\n'
-        'Use query="" if no more retrieval is needed.'
-    )
-
-
-def _build_evidence_update_prompt(
-    question: str,
-    state: dict[str, Any],
-    observation: dict[str, Any],
-) -> str:
-    return (
-        "Task: select evidence from the latest observation.\n"
-        "Pick only passage IDs from <observation> that support the question, current sub-goal, or a needed reasoning step.\n"
-        f"Question: {question}\n"
-        f"<state>{_json_block(state)}</state>\n"
-        f"<observation>{_json_block(observation)}</observation>\n"
-        'Return exactly: <update-evidence>{"selected_passage_ids":[],"rationale":"..."}</update-evidence>'
-    )
-
-
-def _build_answer_prompt(question: str, state: dict[str, Any]) -> str:
-    return (
-        "Task: answer from accumulated evidence.\n"
-        "Use selected evidence in <state>. If evidence is insufficient and retrieval budget remains, return can_answer=false.\n"
-        'If budget is exhausted, a fallback guess is allowed only with rationale marked "fallback_guess".\n'
-        f"Question: {question}\n"
-        f"<state>{_json_block(state)}</state>\n"
-        'Return exactly: <answer>{"can_answer":false,"answer":null,"rationale":"..."}</answer>'
+def _rag_state_from_dict(question: str, payload: dict[str, Any]) -> RAGState:
+    return RAGState(
+        question=question,
+        current_sub_goal=payload.get("current_sub_goal"),
+        evidence=[dict(item) for item in payload.get("evidence", []) if isinstance(item, dict)],
+        retrieval_history=[
+            dict(item) for item in payload.get("retrieval_history", []) if isinstance(item, dict)
+        ],
+        retrieval_count=int(payload.get("retrieval_count") or 0),
     )
 
 
@@ -138,8 +170,15 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
     if not isinstance(trajectory, list) or not trajectory:
         return []
 
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    max_rounds = int(row.get("max_rounds") or metadata.get("max_rounds") or 4)
+    contract_fingerprint = str(
+        row.get("prompt_contract_fingerprint")
+        or metadata.get("prompt_contract_fingerprint")
+        or load_prompt_contract().fingerprint
+    )
     records: list[TrajectoryRecord] = []
-    for turn in trajectory:
+    for turn_offset, turn in enumerate(trajectory):
         if not isinstance(turn, dict):
             continue
         state = turn.get("state") if isinstance(turn.get("state"), dict) else {}
@@ -148,6 +187,9 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
         observation = turn.get("observation") if isinstance(turn.get("observation"), dict) else None
         update_evidence = turn.get("update_evidence") if isinstance(turn.get("update_evidence"), dict) else None
         answer = turn.get("answer") if isinstance(turn.get("answer"), dict) else None
+        round_index = int(turn.get("round", turn_offset))
+        state_before = _rag_state_from_dict(question, state)
+        query_target = _build_query_retriever_target(plan, retrieval or {})
 
         if retrieval:
             records.append(
@@ -156,9 +198,12 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
                     question=question,
                     dataset=dataset,
                     action_type="query_retriever",
-                    prompt_text=_build_query_retriever_prompt(question, state),
-                    target_text=_tagged_json("query-retriever", _build_query_retriever_target(plan, retrieval)),
+                    prompt_text=build_query_retriever_prompt(question=question, state=state_before),
+                    target_text=_tagged_json("query-retriever", query_target),
                     agent_role="query_retriever",
+                    round_index=round_index,
+                    max_rounds=max_rounds,
+                    prompt_contract_fingerprint=contract_fingerprint,
                 )
             )
 
@@ -167,28 +212,54 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
         else:
             masked_update_evidence = None
         if retrieval and observation and masked_update_evidence:
+            updater_state = RAGState(
+                question=state_before.question,
+                current_sub_goal=query_target.get("sub_goal"),
+                evidence=[dict(item) for item in state_before.evidence],
+                retrieval_history=[dict(item) for item in state_before.retrieval_history],
+                retrieval_count=state_before.retrieval_count,
+            )
             records.append(
                 TrajectoryRecord(
                     qid=qid,
                     question=question,
                     dataset=dataset,
                     action_type="evidence_update",
-                    prompt_text=_build_evidence_update_prompt(question, state, observation),
+                    prompt_text=build_evidence_updater_prompt(
+                        question=question,
+                        state=updater_state,
+                        observation=observation,
+                    ),
                     target_text=_tagged_json("update-evidence", masked_update_evidence),
                     agent_role="evidence_updater",
+                    round_index=round_index,
+                    max_rounds=max_rounds,
+                    prompt_contract_fingerprint=contract_fingerprint,
                 )
             )
         if retrieval and observation and masked_update_evidence and answer:
-            answer_state = _state_with_update_evidence(state, update_evidence or {})
+            answer_state = advance_rag_state(
+                state_before,
+                query_action=query_target,
+                observation=observation,
+                update_action=masked_update_evidence,
+            )
             records.append(
                 TrajectoryRecord(
                     qid=qid,
                     question=question,
                     dataset=dataset,
                     action_type="answer",
-                    prompt_text=_build_answer_prompt(question, answer_state),
+                    prompt_text=build_answer_generator_prompt(
+                        question=question,
+                        state=answer_state,
+                        context=AnswerPromptContext(round_index=round_index, max_rounds=max_rounds),
+                    ),
                     target_text=_tagged_json("answer", answer),
                     agent_role="answer_generator",
+                    round_index=round_index,
+                    max_rounds=max_rounds,
+                    prompt_contract_fingerprint=contract_fingerprint,
                 )
             )
     return records

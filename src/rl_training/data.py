@@ -193,7 +193,7 @@ def _build_sample(row: dict[str, Any], fallback_dataset: str) -> RLSample | None
     )
 
 
-def _sampling_stratum(dataset: str, row: dict[str, Any]) -> str:
+def sampling_stratum(dataset: str, row: dict[str, Any]) -> str:
     if dataset == "2wiki":
         value = str(row.get("question_type") or "").strip()
     elif dataset == "hotpotqa":
@@ -212,6 +212,9 @@ def _sampling_stratum(dataset: str, row: dict[str, Any]) -> str:
     if value not in STRATA_BY_DATASET[dataset]:
         raise ValueError(f"Unknown sampling stratum for {dataset}: {value!r}")
     return value
+
+
+_sampling_stratum = sampling_stratum
 
 
 def load_rl_samples(

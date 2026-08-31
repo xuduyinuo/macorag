@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from data_processing.process_datasets import DATASETS
+from data_processing.e5_faiss import E5Encoder, E5FaissQueryEngine, build_e5_faiss_index
 from data_processing.retrieval import (
     RETRIEVAL_DEFAULT_ROOT,
     RETRIEVAL_DEFAULT_SPLITS,
@@ -24,7 +25,7 @@ def _resolve_repo_root() -> Path:
 
 
 REPO_ROOT = _resolve_repo_root()
-DEFAULT_RETRIEVAL_CONFIG = REPO_ROOT / "config" / "build_retrieval.yml"
+DEFAULT_RETRIEVAL_CONFIG = REPO_ROOT / "config" / "retrieval_eval.yml"
 
 
 def _load_yaml_config(path: Union[str, Path]) -> dict[str, Any]:
@@ -90,12 +91,14 @@ def _coerce_query(value: Any) -> list[str]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build/search a LinearRAG-compatible retrieval environment from processed data."
+        description="Build/search MACORAG retrieval environments."
     )
     parser.add_argument("--config", default=str(DEFAULT_RETRIEVAL_CONFIG))
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     build = subparsers.add_parser("build", help="Build retrieval assets and optional indexes.")
+    build.add_argument("--backend", choices=("e5_faiss", "linear_rag"), default=None)
+    build.add_argument("--data-root", default=None, help="Dataset root containing <dataset>/corpus.jsonl.")
     build.add_argument(
         "--processed-root",
         default=None,
@@ -123,6 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build.add_argument("--build-index", action="store_true", default=None, help="Build LinearRAG indexes now.")
     build.add_argument("--embedding-model", default=None)
+    build.add_argument("--device", default=None)
+    build.add_argument("--max-length", type=int, default=None)
     build.add_argument("--spacy-model", default=None)
     build.add_argument("--max-workers", type=int, default=None)
     build.add_argument("--batch-size", type=int, default=None)
@@ -136,6 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     query = subparsers.add_parser("query", help="Query a built retrieval environment.")
+    query.add_argument("--backend", choices=("e5_faiss", "linear_rag"), default=None)
     query.add_argument("query", nargs="*", help="Query string.")
     query.add_argument("--dataset", choices=DATASETS, default=None)
     query.add_argument(
@@ -144,6 +150,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Directory where linearrag-style files and index were built.",
     )
     query.add_argument("--embedding-model", default=None)
+    query.add_argument("--device", default=None)
+    query.add_argument("--max-length", type=int, default=None)
     query.add_argument("--spacy-model", default=None)
     query.add_argument("--top-k", type=int, default=None)
     query.add_argument("--max-workers", type=int, default=None)
@@ -175,6 +183,70 @@ def main(argv: Optional[list[str]] = None) -> int:
     command = _parse_command(args, config)
 
     if command == "build":
+        backend = str(
+            _coalesce(getattr(args, "backend", None), config.get("backend", "linear_rag"))
+        )
+        if backend == "e5_faiss":
+            data_root = _coalesce(
+                getattr(args, "data_root", None),
+                config.get("data_root", config.get("processed_root", "data/processed")),
+            )
+            retrieval_root = _coalesce(
+                getattr(args, "retrieval_root", None),
+                config.get("retrieval_root", RETRIEVAL_DEFAULT_ROOT),
+            )
+            datasets = _coerce_list(
+                getattr(args, "datasets", None),
+                fallback=_coalesce(config.get("datasets"), list(DATASETS)),
+                name="datasets",
+            )
+            model_name = str(
+                _coalesce(
+                    getattr(args, "embedding_model", None),
+                    config.get("embedding_model", "intfloat/e5-base-v2"),
+                )
+            )
+            device = str(_coalesce(getattr(args, "device", None), config.get("device", "cpu")))
+            max_length = _coerce_int(
+                getattr(args, "max_length", None),
+                _coalesce(config.get("max_length"), 512),
+            )
+            batch_size = _coerce_int(
+                getattr(args, "batch_size", None),
+                _coalesce(config.get("batch_size"), 64),
+            )
+            encoder = E5Encoder(
+                model_name=model_name,
+                device=device,
+                max_length=max_length,
+                batch_size=batch_size,
+            )
+            summary: dict[str, Any] = {}
+            for position, dataset in enumerate(datasets, start=1):
+                print(
+                    f"[e5-build] dataset {position}/{len(datasets)}: {dataset} starting",
+                    flush=True,
+                )
+                summary[dataset] = build_e5_faiss_index(
+                    data_root=data_root,
+                    output_root=retrieval_root,
+                    dataset=dataset,
+                    model_name=model_name,
+                    device=device,
+                    max_length=max_length,
+                    batch_size=batch_size,
+                    encoder=encoder,
+                )
+                status = str(summary[dataset].get("build_status", "built"))
+                status_label = "skipped" if status == "skipped" else "complete"
+                print(
+                    f"[e5-build] dataset {position}/{len(datasets)}: {dataset} {status_label}",
+                    flush=True,
+                )
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            return 0
+        if backend != "linear_rag":
+            raise ValueError(f"Unsupported retrieval backend: {backend}")
         processed_root = _coalesce(
             getattr(args, "processed_root", None),
             config.get("processed_root", "data/processed"),
@@ -260,6 +332,43 @@ def main(argv: Optional[list[str]] = None) -> int:
         dataset = _coalesce(getattr(args, "dataset", None), config.get("dataset"))
         if not dataset:
             raise ValueError("dataset must be provided in query mode.")
+
+        backend = str(
+            _coalesce(getattr(args, "backend", None), config.get("backend", "linear_rag"))
+        )
+        if backend == "e5_faiss":
+            engine = E5FaissQueryEngine(
+                retrieval_root=_coalesce(
+                    getattr(args, "retrieval_root", None),
+                    config.get("retrieval_root", RETRIEVAL_DEFAULT_ROOT),
+                ),
+                dataset=dataset,
+                model_name=str(
+                    _coalesce(
+                        getattr(args, "embedding_model", None),
+                        config.get("embedding_model", "intfloat/e5-base-v2"),
+                    )
+                ),
+                device=str(_coalesce(getattr(args, "device", None), config.get("device", "cpu"))),
+                top_k=_coerce_int(getattr(args, "top_k", None), _coalesce(config.get("top_k"), 5)),
+                max_length=_coerce_int(
+                    getattr(args, "max_length", None),
+                    _coalesce(config.get("max_length"), 512),
+                ),
+                batch_size=_coerce_int(
+                    getattr(args, "batch_size", None),
+                    _coalesce(config.get("batch_size"), 32),
+                ),
+            )
+            result = engine.query(" ".join(query_tokens))
+            for rank, (passage, score) in enumerate(zip(result.passages, result.scores), start=1):
+                text = str(passage.get("text") or "")
+                title = str(passage.get("title") or "")
+                rendered = f"{title}\n{text}" if title else text
+                print(f"[{rank:02d}] {score:.4f}\n{rendered}\n")
+            return 0
+        if backend != "linear_rag":
+            raise ValueError(f"Unsupported retrieval backend: {backend}")
 
         result = query_linear_rag(
             retrieval_root=_coalesce(

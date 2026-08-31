@@ -3,7 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from rag import AgentRole, RAGLoopResult, RAGState, parse_action_text
+from rag import (
+    AgentRole,
+    AnswerPromptContext,
+    RAGLoopResult,
+    RAGState,
+    is_fallback_guess,
+    parse_action_text,
+    validate_final_answer,
+    advance_rag_state,
+)
 from rag.executor import _selected_evidence, normalize_observation
 
 from .policy import PolicyGenerationRequest, RolloutTrace
@@ -44,6 +53,7 @@ def _new_turn(round_index: int, state_before: RAGState) -> dict[str, Any]:
         "round": round_index,
         "state": state_before.to_dict(),
         "generated_roles": [],
+        "raw_responses": {},
         "query_retriever": {},
         "retrieval": {},
         "observation": normalize_observation({"query": "", "passages": []}),
@@ -114,6 +124,7 @@ def run_batched_rollouts(
             candidate = candidates[index]
             turn = turns[index]
             turn["generated_roles"].append(AgentRole.QUERY_RETRIEVER.value)
+            turn["raw_responses"][AgentRole.QUERY_RETRIEVER.value] = response
             try:
                 action = parse_action_text(response, AgentRole.QUERY_RETRIEVER)
             except ValueError as exc:
@@ -179,34 +190,24 @@ def run_batched_rollouts(
             candidate = candidates[index]
             turn = turns[index]
             turn["generated_roles"].append(AgentRole.EVIDENCE_UPDATER.value)
+            turn["raw_responses"][AgentRole.EVIDENCE_UPDATER.value] = response
             try:
                 action = parse_action_text(response, AgentRole.EVIDENCE_UPDATER)
             except ValueError as exc:
                 _record_parse_failure(candidate, turn, AgentRole.EVIDENCE_UPDATER, exc)
                 continue
             update = dict(action.update_evidence or {})
-            update["evidence"] = _selected_evidence(update, turn["observation"])
-            turn["update_evidence"] = update
             state_before = states_before[index]
             query_action = turn["query_retriever"]
-            query = queries_by_index[index]
             observation = turn["observation"]
-            answer_states[index] = RAGState(
-                question=state_before.question,
-                current_sub_goal=query_action.get("sub_goal"),
-                evidence=[*state_before.evidence, *update["evidence"]],
-                retrieval_history=[
-                    *state_before.retrieval_history,
-                    {
-                        "query": query,
-                        "sub_goal": query_action.get("sub_goal"),
-                        "top_score": observation.get("passages", [{}])[0].get("score")
-                        if observation.get("passages")
-                        else None,
-                    },
-                ],
-                retrieval_count=state_before.retrieval_count + (1 if query else 0),
+            answer_states[index] = advance_rag_state(
+                state_before,
+                query_action=query_action,
+                observation=observation,
+                update_action=update,
             )
+            update["evidence"] = answer_states[index].evidence[len(state_before.evidence) :]
+            turn["update_evidence"] = update
             evidence_success_indices.append(index)
 
         answer_requests = [
@@ -214,6 +215,7 @@ def run_batched_rollouts(
                 role=AgentRole.ANSWER_GENERATOR,
                 question=question,
                 state=answer_states[index],
+                answer_context=AnswerPromptContext(round_index=round_index, max_rounds=max_rounds),
             )
             for index in evidence_success_indices
         ]
@@ -225,14 +227,19 @@ def run_batched_rollouts(
         for index, response in zip(evidence_success_indices, answer_responses):
             candidate = candidates[index]
             turn = turns[index]
+            turn["force_final_answer"] = round_index == max_rounds - 1
             turn["generated_roles"].append(AgentRole.ANSWER_GENERATOR.value)
+            turn["raw_responses"][AgentRole.ANSWER_GENERATOR.value] = response
             try:
                 action = parse_action_text(response, AgentRole.ANSWER_GENERATOR)
+                answer = dict(action.answer or {})
+                if turn["force_final_answer"]:
+                    validate_final_answer(answer)
             except ValueError as exc:
                 _record_parse_failure(candidate, turn, AgentRole.ANSWER_GENERATOR, exc)
                 continue
-            answer = dict(action.answer or {})
             turn["answer"] = answer
+            turn["fallback_guess"] = is_fallback_guess(answer)
             candidate.trajectory.append(turn)
             candidate.state = answer_states[index]
             if answer["can_answer"] is True:

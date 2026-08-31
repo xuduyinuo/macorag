@@ -5,16 +5,17 @@ datasets:
 
 # 数据、检索索引和生成结果路径。
 source_root: "data/trajectory_train"
-retrieval_root: "data/trajectory_train_retrieval"
-output_dir: "data/sft/teacher_qwen_plus_trajectory_train"
+retrieval_root: "data/trajectory_train_e5_faiss"
+output_dir: "data/sft/teacher_qwen_plus_trajectory_train_v2"
 split: "train"
 
 # 样本规模和 RAG 轨迹轮次。
 max_examples_per_dataset: 3000
 target_valid_per_dataset: 1000
-max_rounds: 5
+max_rounds: 4
 retrieval_top_k: 5
 resume: true
+prompt_config_path: "config/prompts.yml"
 
 # 教师模型和生成长度。
 model: "qwen-plus"
@@ -22,8 +23,12 @@ temperature: 0.2
 max_tokens: 1200
 
 # 检索模型和并发参数。
-embedding_model: "sentence-transformers/all-mpnet-base-v2"
-spacy_model: "en_core_web_trf"
+retrieval_backend: "e5_faiss"
+embedding_model: "intfloat/e5-base-v2"
+retrieval_device: "cpu"
+retrieval_max_length: 512
+validate_retrieval_contract: true
+spacy_model: "en_core_web_sm"
 sft_sample_workers: 4
 retrieval_workers: 8
 batch_size: 128

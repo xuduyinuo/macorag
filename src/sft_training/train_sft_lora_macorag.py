@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import inspect
 import json
 import math
@@ -12,7 +14,9 @@ from typing import Any
 from .callbacks import (
     _make_eval_metrics_callback,
     _make_jsonl_logging_callback,
+    _make_phase_metrics_callback,
     _make_sample_progress_callback,
+    _prepare_resume_logs,
     make_run_dir,
 )
 from .config import DEFAULT_ARG_VALUES, DEFAULT_CONFIG_PATH, DEFAULT_SYSTEM_PROMPT, parse_args
@@ -27,8 +31,10 @@ from .data import (
     split_records as _split_records,
     split_training_samples,
     trajectory_to_sft_records,
+    validate_teacher_dataset_contract,
 )
-from .dataset import _build_dataset, _pad_batch, _tokenize_records
+from prompt_config import load_prompt_contract
+from .dataset import _build_dataset, _dataset_fingerprint, _pad_batch, _tokenize_records
 from .trainer import _make_target_only_trainer_cls
 
 
@@ -57,13 +63,143 @@ def _world_size() -> int:
 
 
 def _is_main_process() -> bool:
+    try:
+        import torch
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_rank() == 0
+    except ImportError:
+        pass
     return _local_rank() == 0
+
+
+def _synchronize_resume_logs(
+    output_dir: Path,
+    checkpoint: Path,
+    *,
+    samples_per_epoch: int,
+) -> int:
+    import torch
+
+    if (
+        _world_size() > 1
+        and torch.distributed.is_available()
+        and not torch.distributed.is_initialized()
+    ):
+        if torch.cuda.is_available():
+            torch.cuda.set_device(_local_rank())
+            backend = "nccl"
+        else:
+            backend = "gloo"
+        torch.distributed.init_process_group(backend=backend)
+
+    resume_segment = 0
+    if _is_main_process():
+        resume_segment = _prepare_resume_logs(
+            output_dir,
+            checkpoint,
+            samples_per_epoch=samples_per_epoch,
+        )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        values = [resume_segment]
+        torch.distributed.broadcast_object_list(values, src=0)
+        torch.distributed.barrier()
+        resume_segment = int(values[0])
+    return resume_segment
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as file:
         for item in rows:
             file.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, ensure_ascii=False, indent=2)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp_path, path)
+
+
+def _resolve_resume_checkpoint(value: str | Path | None) -> Path | None:
+    if value is None or not str(value).strip():
+        return None
+    checkpoint = Path(value)
+    required_files = (
+        "adapter_model.safetensors",
+        "adapter_config.json",
+        "trainer_state.json",
+        "optimizer.pt",
+        "scheduler.pt",
+    )
+    missing = [name for name in required_files if not (checkpoint / name).is_file()]
+    if not (checkpoint / "rng_state.pth").is_file() and not any(checkpoint.glob("rng_state_*.pth")):
+        missing.append("rng_state.pth or rng_state_<rank>.pth")
+    if missing:
+        raise SystemExit(
+            f"Incomplete SFT resume checkpoint {checkpoint}: missing {', '.join(missing)}"
+        )
+    return checkpoint
+
+
+def _resume_uses_random_sampler(checkpoint: Path) -> bool:
+    manifest_path = checkpoint.parent / "sft_run_manifest.json"
+    if not manifest_path.is_file():
+        return False
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid SFT run manifest {manifest_path}: {exc}") from exc
+    sampler = str(payload.get("train_sampler") or "")
+    if sampler not in {"random", "sequential"}:
+        raise SystemExit(f"Invalid train_sampler in {manifest_path}: {sampler!r}")
+    return sampler == "random"
+
+
+def _validate_resume_runtime_files(checkpoint: Path, *, world_size: int, fp16: bool) -> None:
+    missing: list[str] = []
+    if world_size <= 1:
+        if not (checkpoint / "rng_state.pth").is_file() and not (checkpoint / "rng_state_0.pth").is_file():
+            missing.append("rng_state.pth")
+    else:
+        missing.extend(
+            f"rng_state_{rank}.pth"
+            for rank in range(world_size)
+            if not (checkpoint / f"rng_state_{rank}.pth").is_file()
+        )
+    if fp16 and not (checkpoint / "scaler.pt").is_file():
+        missing.append("scaler.pt")
+    if missing:
+        raise SystemExit(
+            f"Incomplete SFT runtime state in {checkpoint}: missing {', '.join(missing)}"
+        )
+
+
+def _validate_resume_compatibility(checkpoint: Path, expected: dict[str, Any]) -> None:
+    manifest_path = checkpoint.parent / "sft_run_manifest.json"
+    if not manifest_path.is_file():
+        return
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Invalid SFT run manifest {manifest_path}: {exc}") from exc
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if payload.get(key) != expected_value
+    ]
+    if mismatches:
+        raise SystemExit(
+            f"SFT resume contract mismatch in {manifest_path}: {', '.join(mismatches)}"
+        )
+
+
+def _run_trainer(trainer: Any, resume_checkpoint: Path | None) -> Any:
+    if resume_checkpoint is None:
+        return trainer.train()
+    return trainer.train(resume_from_checkpoint=str(resume_checkpoint))
 
 
 def _print_check_only(args: Any, training_data: TrainingData) -> None:
@@ -133,8 +269,42 @@ def _torch_dtype(args: Any, torch: Any) -> Any:
     return torch.float16
 
 
+def _validate_acceleration_runtime(
+    args: Any,
+    torch: Any,
+    find_spec=importlib.util.find_spec,
+    import_module=importlib.import_module,
+) -> None:
+    if args.bf16 and args.fp16:
+        raise SystemExit("bf16 and fp16 cannot both be enabled.")
+    if args.attn_implementation == "flash_attention_2":
+        if find_spec("flash_attn") is None:
+            raise SystemExit(
+                "FlashAttention 2 requested but flash_attn is not installed in the active environment."
+            )
+        try:
+            flash_attn = import_module("flash_attn")
+            flash_attn_func = getattr(flash_attn, "flash_attn_func")
+            if not callable(flash_attn_func):
+                raise ImportError("flash_attn.flash_attn_func is not callable")
+        except (ImportError, OSError, AttributeError) as exc:
+            raise SystemExit(
+                "FlashAttention 2 requested but flash_attn could not be imported: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not torch.cuda.is_available():
+            raise SystemExit("FlashAttention 2 requested but CUDA is unavailable.")
+    if args.bf16 and _world_size() > 1 and torch.cuda.is_available():
+        torch.cuda.set_device(_local_rank())
+    if args.bf16 and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
+        raise SystemExit("bf16 requested but the selected CUDA device does not support bf16.")
+
+
 def _model_kwargs(args: Any, torch_dtype: Any) -> dict[str, Any]:
-    model_kwargs: dict[str, Any] = {"torch_dtype": torch_dtype}
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "attn_implementation": args.attn_implementation,
+    }
     if not args.load_4bit:
         return model_kwargs
     try:
@@ -170,10 +340,17 @@ def _split_train_eval_samples(
 
 
 def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArguments: Any) -> Any:
-    if has_eval and args.eval_steps <= 0:
-        raise SystemExit("validation_split requires eval_steps > 0.")
-    if has_eval and args.early_stopping_patience > 0 and args.save_steps % args.eval_steps != 0:
+    eval_strategy = args.eval_strategy if has_eval else "no"
+    if eval_strategy == "steps" and args.eval_steps <= 0:
+        raise SystemExit("step-based validation requires eval_steps > 0.")
+    if (
+        eval_strategy == "steps"
+        and args.early_stopping_patience > 0
+        and args.save_steps % args.eval_steps != 0
+    ):
         raise SystemExit("early stopping requires save_steps to be a multiple of eval_steps.")
+    load_best_model = has_eval and args.early_stopping_patience > 0
+    save_strategy = eval_strategy if load_best_model else "steps"
 
     training_kwargs: dict[str, Any] = {
         "output_dir": str(output_dir),
@@ -188,17 +365,17 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         "logging_first_step": True,
         "logging_strategy": "steps",
         "save_steps": args.save_steps,
-        "save_strategy": "steps",
+        "save_strategy": save_strategy,
         "save_total_limit": args.save_total_limit,
         "bf16": args.bf16,
         "fp16": args.fp16 and not args.bf16,
         "dataloader_num_workers": 0,
-        "eval_steps": args.eval_steps if has_eval else None,
+        "eval_steps": args.eval_steps if eval_strategy == "steps" else None,
         "max_steps": args.max_steps if args.max_steps > 0 else -1,
         "remove_unused_columns": False,
         "report_to": [],
         "disable_tqdm": True,
-        "load_best_model_at_end": has_eval and args.early_stopping_patience > 0,
+        "load_best_model_at_end": load_best_model,
         "metric_for_best_model": args.metric_for_best_model if has_eval else None,
         "greater_is_better": args.greater_is_better if has_eval else None,
     }
@@ -210,7 +387,7 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         if "eval_strategy" in inspect.signature(TrainingArguments.__init__).parameters
         else "evaluation_strategy"
     )
-    training_kwargs[strategy_key] = "steps" if has_eval else "no"
+    training_kwargs[strategy_key] = eval_strategy
     return TrainingArguments(**training_kwargs)
 
 
@@ -223,6 +400,16 @@ def main() -> None:
     if not resolved_paths or not all(path.exists() for path in resolved_paths):
         missing = [str(path) for path in resolved_paths if path and not path.exists()]
         raise SystemExit(f"Missing trajectory files: {missing} or invalid root: {data_root}")
+
+    prompt_contract = load_prompt_contract(args.prompt_config_path)
+    teacher_metadata: dict[str, Any] = {}
+    if args.require_teacher_provenance:
+        teacher_metadata = validate_teacher_dataset_contract(
+            data_root,
+            expected_contract=prompt_contract,
+            max_rounds=args.max_rounds,
+            retrieval_top_k=args.retrieval_top_k,
+        )
 
     training_data = build_training_data(data_root, max_samples=args.max_samples)
     records = training_data.records
@@ -249,6 +436,7 @@ def main() -> None:
     get_peft_model = deps["get_peft_model"]
     prepare_model_for_kbit_training = deps["prepare_model_for_kbit_training"]
 
+    _validate_acceleration_runtime(args, torch)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -259,9 +447,18 @@ def main() -> None:
     train_source_sample_count = len(train_samples)
 
     base_output_dir = Path(args.output_root)
-    output_dir = make_run_dir(base_output_dir)
+    resume_checkpoint = _resolve_resume_checkpoint(args.resume_from_checkpoint)
+    if resume_checkpoint is not None:
+        _validate_resume_runtime_files(
+            resume_checkpoint,
+            world_size=_world_size(),
+            fp16=bool(args.fp16 and not args.bf16),
+        )
+    output_dir = resume_checkpoint.parent if resume_checkpoint is not None else make_run_dir(base_output_dir)
+    train_shuffle = resume_checkpoint is None or _resume_uses_random_sampler(resume_checkpoint)
     log_jsonl_path = output_dir / "train_metrics.jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
+    resume_segment = 0
     if _is_main_process():
         print(f"Run output directory: {output_dir}")
 
@@ -336,6 +533,47 @@ def main() -> None:
     if args.max_steps > 0:
         progress_epochs = min(args.num_train_epochs, args.max_steps / optimizer_steps_per_epoch)
     total_source_sample_visits = int(math.ceil(train_source_sample_count * progress_epochs))
+    run_manifest = {
+        "schema_version": 1,
+        "model_path": args.model_path,
+        "data_root": args.data_root,
+        "prompt_contract_fingerprint": prompt_contract.fingerprint,
+        "max_length": args.max_length,
+        "seed": args.seed,
+        "train_action_records": len(train_dataset),
+        "eval_action_records": len(eval_dataset) if eval_dataset is not None else 0,
+        "train_dataset_fingerprint": _dataset_fingerprint(train_dataset),
+        "eval_dataset_fingerprint": _dataset_fingerprint(eval_dataset) if eval_dataset is not None else None,
+        "max_samples": args.max_samples,
+        "train_test_seed": args.train_test_seed,
+        "eval_split_ratio": args.eval_split_ratio,
+        "per_device_train_batch_size": args.per_device_train_batch_size,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "num_train_epochs": args.num_train_epochs,
+        "max_steps": args.max_steps,
+        "learning_rate": args.learning_rate,
+        "lr_scheduler_type": args.lr_scheduler_type,
+        "warmup_ratio": args.warmup_ratio,
+        "weight_decay": args.weight_decay,
+        "lora_r": args.lora_r,
+        "lora_alpha": args.lora_alpha,
+        "lora_dropout": args.lora_dropout,
+        "target_modules": list(args.target_modules),
+        "load_4bit": args.load_4bit,
+        "bf16": args.bf16,
+        "fp16": args.fp16,
+        "attn_implementation": args.attn_implementation,
+        "world_size": _world_size(),
+        "train_sampler": "random" if train_shuffle else "sequential",
+        "eval_loss_semantics": "macro_mean_of_per_action_target_token_mean",
+    }
+    if resume_checkpoint is not None:
+        _validate_resume_compatibility(resume_checkpoint, run_manifest)
+        resume_segment = _synchronize_resume_logs(
+            output_dir,
+            resume_checkpoint,
+            samples_per_epoch=train_source_sample_count,
+        )
     if _is_main_process():
         print(f"Training original samples per epoch: {train_source_sample_count}")
         print(f"Validation original samples per eval: {len(val_samples)}")
@@ -345,6 +583,7 @@ def main() -> None:
         print(f"Optimizer steps per epoch: {optimizer_steps_per_epoch}")
         print(f"Total optimizer steps: {total_optimizer_steps}")
         print(f"Total original sample visits: {total_source_sample_visits}")
+        _write_json_atomic(output_dir / "sft_run_manifest.json", run_manifest)
 
     train_args = _training_arguments(args, output_dir, eval_dataset is not None, TrainingArguments)
 
@@ -352,13 +591,24 @@ def main() -> None:
         _make_eval_metrics_callback(
             output_dir / "eval_metrics.jsonl",
             TrainerCallback,
+            resume_segment=resume_segment,
         ),
         _make_jsonl_logging_callback(
             log_jsonl_path,
             TrainerCallback,
             train_source_sample_count,
             args.num_train_epochs,
-        )
+            resume_segment=resume_segment,
+        ),
+        _make_phase_metrics_callback(
+            output_dir / "phase_metrics.jsonl",
+            TrainerCallback,
+            eval_token_count=sum(
+                len(eval_dataset[index]["input_ids"])
+                for index in range(len(eval_dataset))
+            ) if eval_dataset is not None else 0,
+            resume_segment=resume_segment,
+        ),
     ]
     if eval_dataset is not None and args.early_stopping_patience > 0:
         callbacks.append(
@@ -370,7 +620,7 @@ def main() -> None:
     if not args.disable_tqdm:
         callbacks.append(_make_sample_progress_callback(TrainerCallback, train_source_sample_count, args.num_train_epochs))
 
-    trainer_cls = _make_target_only_trainer_cls(Trainer)
+    trainer_cls = _make_target_only_trainer_cls(Trainer, train_shuffle=train_shuffle)
     trainer = trainer_cls(
         model=model,
         args=train_args,
@@ -381,7 +631,7 @@ def main() -> None:
     )
     trainer.remove_callback(PrinterCallback)
 
-    trainer.train()
+    _run_trainer(trainer, resume_checkpoint)
     if _is_main_process():
         model.save_pretrained(output_dir / "adapter")
         tokenizer.save_pretrained(output_dir / "adapter")
@@ -404,11 +654,34 @@ def main() -> None:
             "output_dir": str(output_dir / "adapter"),
             "output_root": str(base_output_dir),
             "log_jsonl_path": str(log_jsonl_path),
+            "phase_metrics_path": str(output_dir / "phase_metrics.jsonl"),
+            "eval_strategy": args.eval_strategy if eval_dataset is not None else "no",
+            "resume_from_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
+            "train_sampler": "random" if train_shuffle else "sequential",
+            "eval_loss_semantics": "macro_mean_of_per_action_target_token_mean",
             "max_length": args.max_length,
             "seed": args.seed,
+            "prompt_contract_version": prompt_contract.version,
+            "prompt_contract_fingerprint": prompt_contract.fingerprint,
+            "prompt_config_path": str(prompt_contract.source_path),
+            "max_rounds": args.max_rounds,
+            "retrieval_top_k": args.retrieval_top_k,
+            "teacher_run_config": teacher_metadata,
         }
         with (output_dir / "train_meta.json").open("w", encoding="utf-8") as file:
             json.dump(train_args_dict, file, ensure_ascii=False, indent=2)
+        with (output_dir / "adapter" / "prompt_contract.json").open("w", encoding="utf-8") as file:
+            json.dump(
+                {
+                    "prompt_contract_version": prompt_contract.version,
+                    "prompt_contract_fingerprint": prompt_contract.fingerprint,
+                    "max_rounds": args.max_rounds,
+                    "retrieval_top_k": args.retrieval_top_k,
+                },
+                file,
+                ensure_ascii=False,
+                indent=2,
+            )
         print(f"Training complete. Adapter saved to {output_dir/'adapter'}.")
 
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
+
+import requests
 
 from .vllm_lora_mapping import collect_lora_named_tensors
 
@@ -68,12 +71,24 @@ class VLLMGenerationClient:
         host: str,
         port: int,
         timeout_seconds: float,
+        max_generate_attempts: int = 3,
+        retry_backoff_seconds: float = 1.0,
         backend: Any | None = None,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        session_factory: Callable[[], Any] | None = None,
     ) -> None:
+        if max_generate_attempts < 1:
+            raise ValueError("max_generate_attempts must be at least 1.")
+        if retry_backoff_seconds < 0:
+            raise ValueError("retry_backoff_seconds must be non-negative.")
         self.host = host
         self.port = port
         self.timeout_seconds = timeout_seconds
+        self.max_generate_attempts = max_generate_attempts
+        self.retry_backoff_seconds = retry_backoff_seconds
         self._backend = backend
+        self._sleep_fn = sleep_fn
+        self._session_factory = session_factory or requests.Session
         self._communicator_initialized = False
 
     @property
@@ -131,6 +146,9 @@ class VLLMGenerationClient:
             mismatches.append(f"lora_int_id expected {expected_lora_int_id!r} got {health.get('lora_int_id')!r}")
         if "model" in health and health.get("model") != getattr(args, "model_path", None):
             mismatches.append(f"model expected {getattr(args, 'model_path', None)!r} got {health.get('model')!r}")
+        expected_dtype = str(getattr(args, "vllm_dtype", "") or "").strip()
+        if expected_dtype and expected_dtype != "auto" and health.get("dtype") != expected_dtype:
+            mismatches.append(f"dtype expected {expected_dtype!r} got {health.get('dtype')!r}")
         if "lora_adapter_path" in health and health.get("lora_adapter_path") != getattr(
             args, "vllm_lora_adapter_path", None
         ):
@@ -145,6 +163,12 @@ class VLLMGenerationClient:
             raise SystemExit(
                 "LoRA hot sync is unsupported by the connected vLLM server: "
                 "health endpoint did not report supports_lora_param_update=true"
+            )
+        if health.get("supports_prompt_seeds") is not True:
+            raise SystemExit(
+                "Deterministic prompt seed generation is unsupported by the connected vLLM server: "
+                "health endpoint did not report supports_prompt_seeds=true. Restart the LoRA server "
+                "with the current MACORAG code before training or resuming."
             )
 
     def _ensure_communicator(self) -> None:
@@ -164,6 +188,7 @@ class VLLMGenerationClient:
         temperature: float,
         top_p: float,
         top_k: int,
+        seed: int | None = None,
     ) -> tuple[list[int], str]:
         outputs = self.generate_batch(
             [prompt],
@@ -171,6 +196,7 @@ class VLLMGenerationClient:
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,
+            seeds=[seed] if seed is not None else None,
         )
         return outputs[0].completion_ids, outputs[0].text
 
@@ -182,9 +208,14 @@ class VLLMGenerationClient:
         temperature: float,
         top_p: float,
         top_k: int,
+        seeds: list[int] | None = None,
     ) -> list[VLLMGenerationOutput]:
         if not prompts:
             return []
+        if seeds is not None and len(seeds) != len(prompts):
+            raise ValueError(
+                f"Expected one seed per prompt, got {len(seeds)} seeds for {len(prompts)} prompts."
+            )
         request_payload = {
             "prompts": prompts,
             "n": 1,
@@ -194,10 +225,28 @@ class VLLMGenerationClient:
             "top_k": top_k,
             "max_tokens": max_tokens,
         }
+        if seeds is not None:
+            request_payload["seeds"] = [int(seed) for seed in seeds]
         session = getattr(self.backend, "session", None)
         base_url = getattr(self.backend, "base_url", None)
         if session is not None and base_url is not None:
-            response = session.post(f"{base_url}/generate/", json=request_payload)
+            response = None
+            for attempt in range(self.max_generate_attempts):
+                try:
+                    response = session.post(f"{base_url}/generate/", json=request_payload)
+                    break
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                    if attempt + 1 >= self.max_generate_attempts:
+                        raise
+                    close = getattr(session, "close", None)
+                    if callable(close):
+                        close()
+                    session = self._session_factory()
+                    self.backend.session = session
+                    backoff = self.retry_backoff_seconds * (2**attempt)
+                    self._sleep_fn(min(backoff, self.timeout_seconds))
+            if response is None:
+                raise RuntimeError("vLLM generation retry loop ended without a response.")
             if response.status_code != 200:
                 raise RuntimeError(f"vLLM generation failed: HTTP {response.status_code}, {response.text}")
             try:

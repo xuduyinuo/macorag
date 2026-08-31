@@ -5,11 +5,13 @@ import argparse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections import Counter
 import copy
+import hashlib
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 import json
 import os
 import random
 import re
+import sys
 import threading
 import time
 import urllib.error
@@ -18,8 +20,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from answer_metrics import calculate_answer_metrics, normalize_answer as normalize_metric_answer
 from data_processing.io_utils import read_jsonl, write_json, write_jsonl
+from data_processing.e5_faiss import (
+    E5Encoder,
+    E5FaissQueryEngine,
+    METADATA_FILE,
+    validate_e5_index_contract,
+)
 from data_processing.retrieval import create_linear_rag_query_engine, query_linear_rag
+from prompt_config import load_prompt_contract
+from rag import AnswerPromptContext
 
 
 DATASETS = ("hotpotqa", "2wiki", "musique")
@@ -29,6 +40,9 @@ DEFAULT_OUTPUT_DIR = "data/sft/teacher_qwen_plus_trajectory_test"
 DEFAULT_MODEL = "qwen-plus"
 DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
 _RETRIEVAL_THREAD_LOCAL = threading.local()
+_E5_LOCK = threading.RLock()
+_E5_ENCODERS: dict[tuple[Any, ...], E5Encoder] = {}
+_E5_ENGINES: dict[tuple[Any, ...], E5FaissQueryEngine] = {}
 
 try:
     from tqdm import tqdm
@@ -63,7 +77,6 @@ class SFTConfig:
     seed: int = 42
     dry_run: bool = False
     resume: bool = True
-    force_final_answer: bool = False
     model: str = DEFAULT_MODEL
     endpoint: str = DEFAULT_ENDPOINT
     api_key_env: str = "DASHSCOPE_API_KEY"
@@ -72,7 +85,12 @@ class SFTConfig:
     request_timeout: int = 120
     request_retries: int = 3
     retry_sleep_seconds: float = 2.0
-    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
+    retrieval_backend: str = "e5_faiss"
+    embedding_model: str = "intfloat/e5-base-v2"
+    retrieval_device: str = "cpu"
+    retrieval_max_length: int = 512
+    prompt_config_path: Union[str, Path, None] = None
+    validate_retrieval_contract: bool = False
     spacy_model: str = "en_core_web_sm"
     sft_sample_workers: int = 4
     retrieval_workers: int = 8
@@ -165,7 +183,6 @@ def _coerce_config(config: dict[str, Any], args: argparse.Namespace) -> SFTConfi
         seed=int(_coalesce(getattr(args, "seed", None), config.get("seed", defaults.seed))),
         dry_run=_coerce_bool(_coalesce(getattr(args, "dry_run", None), config.get("dry_run")), defaults.dry_run),
         resume=_coerce_bool(_coalesce(getattr(args, "resume", None), config.get("resume")), defaults.resume),
-        force_final_answer=_coerce_bool(config.get("force_final_answer"), defaults.force_final_answer),
         model=str(_coalesce(getattr(args, "model", None), config.get("model", defaults.model))),
         endpoint=str(_coalesce(getattr(args, "endpoint", None), config.get("endpoint", defaults.endpoint))),
         api_key_env=str(_coalesce(getattr(args, "api_key_env", None), config.get("api_key_env", defaults.api_key_env))),
@@ -174,7 +191,14 @@ def _coerce_config(config: dict[str, Any], args: argparse.Namespace) -> SFTConfi
         request_timeout=int(_coalesce(config.get("request_timeout"), defaults.request_timeout)),
         request_retries=int(_coalesce(config.get("request_retries"), defaults.request_retries)),
         retry_sleep_seconds=float(_coalesce(config.get("retry_sleep_seconds"), defaults.retry_sleep_seconds)),
+        retrieval_backend=str(_coalesce(config.get("retrieval_backend"), defaults.retrieval_backend)),
         embedding_model=str(_coalesce(config.get("embedding_model"), defaults.embedding_model)),
+        retrieval_device=str(_coalesce(config.get("retrieval_device"), defaults.retrieval_device)),
+        retrieval_max_length=int(_coalesce(config.get("retrieval_max_length"), defaults.retrieval_max_length)),
+        prompt_config_path=_coalesce(config.get("prompt_config_path"), defaults.prompt_config_path),
+        validate_retrieval_contract=_coerce_bool(
+            config.get("validate_retrieval_contract"), defaults.validate_retrieval_contract
+        ),
         spacy_model=str(_coalesce(config.get("spacy_model"), defaults.spacy_model)),
         sft_sample_workers=int(
             _coalesce(
@@ -235,7 +259,7 @@ def parse_teacher_json(content: str) -> dict[str, Any]:
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Teacher response is not valid JSON: {content[:500]}") from exc
+        raise ValueError(f"Teacher response is not valid JSON: {content}") from exc
     if not isinstance(parsed, dict):
         raise ValueError("Teacher response must be a JSON object.")
     return parsed
@@ -278,10 +302,7 @@ def build_update_messages(
     state: dict[str, Any],
     plan: dict[str, Any],
     observation: dict[str, Any],
-    *,
-    force_final_answer: bool = False,
 ) -> list[dict[str, str]]:
-    _ = force_final_answer
     _ = plan
     system = (
         "Task: select evidence from the latest observation. Return strict JSON only."
@@ -307,21 +328,32 @@ def build_answer_messages(
     example: dict[str, Any],
     state: dict[str, Any],
     *,
-    force_final_answer: bool = False,
+    context: AnswerPromptContext,
 ) -> list[dict[str, str]]:
-    _ = force_final_answer
+    is_final_round = context.is_final_round
+    answer_instructions = load_prompt_contract().instructions["answer"]
+    semantic_rule = str(
+        answer_instructions["final"] if is_final_round else answer_instructions["normal"]
+    ).strip()
+    schema_example = (
+        '{"answer":{"can_answer":true,"answer":"best supported answer",'
+        '"rationale":"fallback_guess: strongest available evidence"}}'
+        if is_final_round
+        else '{"answer":{"can_answer":false,"answer":null,"rationale":"more evidence is needed"}}'
+    )
     system = (
         "Task: answer from accumulated evidence. Return strict JSON only."
     )
     user = (
         "Use selected evidence in <state>, not the latest observation alone.\n"
-        'If the evidence is insufficient but retrieval budget remains, set "can_answer" to false and "answer" to null.\n'
-        'If the evidence is insufficient and retrieval budget is exhausted, you may provide a fallback guess using '
-        'parametric knowledge, but you must mark it as "fallback_guess" and explain what evidence is missing.\n\n'
+        f"{semantic_rule}\n"
+        + (
+            f"Round {context.round_index + 1}/{context.max_rounds}; remaining rounds: {context.remaining_rounds}.\n"
+            if context is not None else ""
+        )
+        + "\n"
         "Required JSON schema:\n"
-        "{\n"
-        '  "answer": {"can_answer": boolean, "answer": string or null, "rationale": string}\n'
-        "}\n\n"
+        f"{schema_example}\n\n"
         f"QA example:\n{_json_block(_compact_example(example))}\n\n"
         f"<state>{_json_block(state)}</state>"
     )
@@ -534,24 +566,31 @@ def _allowed_query_text(question: str, state: dict[str, Any]) -> str:
     return f"{question} {evidence_text}"
 
 
-def query_has_unseen_intermediate_terms(query: str, *, question: str, state: dict[str, Any]) -> bool:
-    allowed_text = _normalize_text(_allowed_query_text(question, state))
-    aliases = {
-        "canada": ("canadian",),
-        "america": ("american",),
-        "united states": ("american",),
-        "france": ("french",),
-        "germany": ("german",),
-        "england": ("english", "british"),
-        "russia": ("russian",),
-        "portugal": ("portuguese",),
-    }
-    for phrase in _capitalized_phrases(query):
-        normalized_phrase = _normalize_text(phrase)
-        alias_allowed = any(alias in allowed_text for alias in aliases.get(normalized_phrase, ()))
-        if normalized_phrase and normalized_phrase not in allowed_text and not alias_allowed:
-            return True
-    return False
+def _contains_normalized_form(text: str, form: str) -> bool:
+    normalized_text = normalize_metric_answer(text)
+    normalized_form = normalize_metric_answer(form)
+    if not normalized_text or not normalized_form:
+        return False
+    padded_text = f" {normalized_text} "
+    return f" {normalized_form} " in padded_text
+
+
+def query_has_unseen_intermediate_terms(
+    query: str,
+    *,
+    question: str,
+    state: dict[str, Any],
+    answer_forms: list[str] | tuple[str, ...] = (),
+) -> bool:
+    allowed_text = _allowed_query_text(question, state)
+    usable_forms = [
+        form
+        for form in answer_forms
+        if normalize_metric_answer(form) not in {"", "yes", "no"}
+    ]
+    if any(_contains_normalized_form(allowed_text, form) for form in usable_forms):
+        return False
+    return any(_contains_normalized_form(query, form) for form in usable_forms)
 
 
 def comparison_entities_from_question(question: str) -> list[str]:
@@ -571,30 +610,51 @@ def answer_supported_by_evidence(
     evidence: list[dict[str, Any]],
     *,
     question: str = "",
+    accepted_answers: list[str] | tuple[str, ...] = (),
 ) -> bool:
     if not answer.get("can_answer"):
         return False
     answer_text = _normalize_text(answer.get("answer"))
     if not answer_text:
         return False
-    evidence_text = _normalize_text(
-        " ".join(f"{item.get('title', '')} {item.get('text', '')}" for item in evidence)
+    raw_evidence_text = " ".join(
+        f"{item.get('title', '')} {item.get('text', '')}" for item in evidence
     )
+    evidence_text = _normalize_text(raw_evidence_text)
     if answer_text in {"yes", "no"}:
         entities = comparison_entities_from_question(question)
         if len(entities) >= 2:
             return all(_normalize_text(entity) in evidence_text for entity in entities[:2])
         return len(evidence) >= 2
-    return answer_text in evidence_text
+    answer_value = str(answer.get("answer") or "")
+    support_forms = [answer_value]
+    if accepted_answers and calculate_answer_metrics(answer_value, accepted_answers[0])["exact_match"] == 1:
+        support_forms.extend(str(item) for item in accepted_answers)
+    metric_evidence_text = normalize_metric_answer(raw_evidence_text)
+    return any(
+        normalized_form and normalized_form in metric_evidence_text
+        for normalized_form in (normalize_metric_answer(item) for item in support_forms)
+    )
 
 
-def normalize_answer(answer: dict[str, Any], *, evidence: list[dict[str, Any]], question: str = "") -> dict[str, Any]:
+def normalize_answer(
+    answer: dict[str, Any],
+    *,
+    evidence: list[dict[str, Any]],
+    question: str = "",
+    accepted_answers: list[str] | tuple[str, ...] = (),
+) -> dict[str, Any]:
     normalized = {
         "can_answer": bool(answer.get("can_answer")),
         "answer": answer.get("answer"),
         "rationale": short_rationale(answer.get("rationale")),
     }
-    if normalized["can_answer"] and not answer_supported_by_evidence(normalized, evidence, question=question):
+    if normalized["can_answer"] and not answer_supported_by_evidence(
+        normalized,
+        evidence,
+        question=question,
+        accepted_answers=accepted_answers,
+    ):
         normalized["can_answer"] = False
         normalized["answer"] = None
         normalized["rationale"] = "Current selected evidence does not support a final answer."
@@ -606,6 +666,10 @@ def validate_trajectory_sample(sample: dict[str, Any]) -> list[str]:
     trajectory = sample.get("trajectory", [])
     if not sample.get("final_answer"):
         errors.append("sample final_answer must be non-empty")
+    accepted_answers = [sample.get("gold_answer"), *(sample.get("answer_aliases") or [])]
+    answer_metrics = calculate_answer_metrics(sample.get("final_answer"), sample.get("gold_answer"))
+    if sample.get("gold_answer") is not None and answer_metrics["exact_match"] != 1:
+        errors.append("sample final_answer must have normalized exact match 1 against the primary gold answer")
     if not any(turn.get("answer", {}).get("can_answer") for turn in trajectory):
         errors.append("sample must contain a supported final answer turn")
     for expected_round, turn in enumerate(trajectory):
@@ -630,6 +694,7 @@ def validate_trajectory_sample(sample: dict[str, Any]) -> list[str]:
             str(retrieval.get("query") or ""),
             question=str(sample.get("question") or ""),
             state=state,
+            answer_forms=[str(item) for item in accepted_answers if item is not None],
         ):
             errors.append(f"round {round_index}: retrieval.query contains unseen intermediate answer terms")
         if int(retrieval.get("top_k", -1)) != len(passages):
@@ -656,10 +721,26 @@ def validate_trajectory_sample(sample: dict[str, Any]) -> list[str]:
                 turn.get("answer", {}),
                 cumulative_evidence,
                 question=str(sample.get("question") or ""),
+                accepted_answers=[str(item) for item in accepted_answers if item is not None],
             ):
                 errors.append(f"round {round_index}: final answer is not supported by selected evidence")
 
-    content = json.dumps(sample.get("trajectory", []), ensure_ascii=False).casefold()
+    authored_fields: list[str] = []
+    for turn in trajectory:
+        query_retriever = turn.get("query_retriever") if isinstance(turn.get("query_retriever"), dict) else {}
+        retrieval = turn.get("retrieval") if isinstance(turn.get("retrieval"), dict) else {}
+        update = turn.get("update_evidence") if isinstance(turn.get("update_evidence"), dict) else {}
+        answer = turn.get("answer") if isinstance(turn.get("answer"), dict) else {}
+        authored_fields.extend(
+            [
+                str(query_retriever.get("sub_goal") or ""),
+                str(query_retriever.get("query") or retrieval.get("query") or ""),
+                str(update.get("rationale") or ""),
+                str(answer.get("answer") or ""),
+                str(answer.get("rationale") or ""),
+            ]
+        )
+    content = "\n".join(authored_fields).casefold()
     for term in FORBIDDEN_ASSISTANT_TERMS:
         if term in content:
             errors.append(f"assistant output contains forbidden training label term: {term}")
@@ -704,6 +785,7 @@ def build_trajectory_sample(
         "split": example.get("split"),
         "question": example.get("question"),
         "gold_answer": example.get("answer"),
+        "answer_aliases": example.get("answer_aliases") or [],
         "question_type": example.get("question_type"),
         "hop_count": example.get("hop_count"),
         "trajectory": turns,
@@ -741,28 +823,44 @@ class BailianChatClient:
         )
 
         last_error: Optional[BaseException] = None
+        failed_raw_responses: list[str] = []
         for attempt in range(1, self.config.request_retries + 1):
+            content: Any = None
             try:
                 with urllib.request.urlopen(request, timeout=self.config.request_timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 content = body["choices"][0]["message"]["content"]
-                return parse_teacher_json(content)
+                parsed = parse_teacher_json(content)
+                parsed["_raw_response"] = str(content)
+                return parsed
             except (urllib.error.URLError, urllib.error.HTTPError, KeyError, ValueError) as exc:
                 last_error = exc
+                if content is not None:
+                    failed_raw_responses.append(str(content))
                 if attempt >= self.config.request_retries:
                     break
                 time.sleep(self.config.retry_sleep_seconds * attempt)
-        raise RuntimeError(f"Teacher request failed after {self.config.request_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"Teacher request failed after {self.config.request_retries} attempts: {last_error}; "
+            f"failed_raw_responses={json.dumps(failed_raw_responses, ensure_ascii=False)}"
+        )
 
 
 def finalize_teacher_output(
     teacher_output: dict[str, Any],
     *,
     example: dict[str, Any],
-    force_final_answer: bool,
+    context: AnswerPromptContext,
 ) -> dict[str, Any]:
     _ = example
-    _ = force_final_answer
+    is_final_round = context.is_final_round
+    answer = teacher_output.get("answer") if isinstance(teacher_output.get("answer"), dict) else {}
+    if is_final_round:
+        if answer.get("can_answer") is not True or not str(answer.get("answer") or "").strip():
+            raise ValueError("final answer must set can_answer=true with a non-empty answer")
+        rationale = str(answer.get("rationale") or "").strip()
+        if "fallback_guess" in rationale and not rationale.startswith("fallback_guess:"):
+            raise ValueError("final fallback rationale must start with fallback_guess:")
     return teacher_output
 
 
@@ -827,6 +925,40 @@ def _retrieval_engine_cache() -> dict[tuple[Any, ...], Any]:
 
 
 def _get_retrieval_engine(config: SFTConfig, dataset: str) -> Any:
+    if config.retrieval_backend.strip().casefold() == "e5_faiss":
+        encoder_key = (
+            config.embedding_model,
+            config.retrieval_device,
+            config.retrieval_max_length,
+            config.batch_size,
+        )
+        engine_key = (str(config.retrieval_root), dataset, *encoder_key, config.retrieval_top_k)
+        with _E5_LOCK:
+            encoder = _E5_ENCODERS.get(encoder_key)
+            if encoder is None:
+                encoder = E5Encoder(
+                    model_name=config.embedding_model,
+                    device=config.retrieval_device,
+                    max_length=config.retrieval_max_length,
+                    batch_size=config.batch_size,
+                )
+                _E5_ENCODERS[encoder_key] = encoder
+            engine = _E5_ENGINES.get(engine_key)
+            if engine is None:
+                engine = E5FaissQueryEngine(
+                    retrieval_root=config.retrieval_root,
+                    dataset=dataset,
+                    model_name=config.embedding_model,
+                    device=config.retrieval_device,
+                    top_k=config.retrieval_top_k,
+                    max_length=config.retrieval_max_length,
+                    batch_size=config.batch_size,
+                    encoder=encoder,
+                )
+                _E5_ENGINES[engine_key] = engine
+            return engine
+    if config.retrieval_backend.strip().casefold() != "linear_rag":
+        raise ValueError(f"Unknown teacher retrieval backend: {config.retrieval_backend}")
     key = (
         str(config.retrieval_root),
         dataset,
@@ -858,8 +990,15 @@ def _retrieve(config: SFTConfig, dataset: str, query: str) -> dict[str, Any]:
     os.environ.setdefault("MACORAG_SILENT_RETRIEVAL", "1")
     with _disable_nested_tqdm():
         try:
-            result = _get_retrieval_engine(config, dataset).query(query)
+            engine = _get_retrieval_engine(config, dataset)
+            if config.retrieval_backend.strip().casefold() == "e5_faiss":
+                with _E5_LOCK:
+                    result = engine.query(query)
+            else:
+                result = engine.query(query)
         except Exception:
+            if config.retrieval_backend.strip().casefold() != "linear_rag":
+                raise
             with _suppress_retrieval_output():
                 result = query_linear_rag(
                     retrieval_root=config.retrieval_root,
@@ -923,6 +1062,46 @@ def _dataset_sft_path(output_dir: Path, dataset: str) -> Path:
     return output_dir / f"{dataset}_sft.jsonl"
 
 
+def _index_provenance(config: SFTConfig) -> dict[str, Any]:
+    provenance: dict[str, Any] = {}
+    for dataset in config.datasets:
+        metadata_path = Path(config.retrieval_root) / dataset / METADATA_FILE
+        if not metadata_path.is_file():
+            provenance[dataset] = {"metadata_path": str(metadata_path), "available": False}
+            continue
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        canonical = json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        provenance[dataset] = {
+            "metadata_path": str(metadata_path),
+            "available": True,
+            "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+            "metadata": metadata,
+        }
+    return provenance
+
+
+def _validate_teacher_retrieval_contract(config: SFTConfig) -> None:
+    if not config.validate_retrieval_contract:
+        return
+    if config.retrieval_backend.strip().casefold() != "e5_faiss":
+        raise SystemExit("Formal teacher generation requires retrieval_backend=e5_faiss")
+    for dataset in config.datasets:
+        source_corpus = Path(config.source_root) / dataset / "corpus.jsonl"
+        if not source_corpus.is_file():
+            raise SystemExit(f"Teacher source corpus is missing: {source_corpus}")
+        source_count = sum(1 for _ in read_jsonl(source_corpus))
+        try:
+            validate_e5_index_contract(
+                retrieval_root=config.retrieval_root,
+                dataset=dataset,
+                expected_model=config.embedding_model,
+                expected_max_length=config.retrieval_max_length,
+                expected_corpus_count=source_count,
+            )
+        except RuntimeError as exc:
+            raise SystemExit(f"Teacher E5 index contract mismatch for {dataset}: {exc}") from exc
+
+
 def _existing_dataset_output_state(output_paths: dict[str, Path]) -> tuple[set[str], Counter[str]]:
     seen: set[str] = set()
     counts: Counter[str] = Counter()
@@ -984,6 +1163,67 @@ def _sample_error_record(example: dict[str, Any], *, stage: str, exc: BaseExcept
     }
 
 
+def _answer_forms(example: dict[str, Any]) -> list[str]:
+    return [
+        str(item)
+        for item in [example.get("answer"), *(example.get("answer_aliases") or [])]
+        if item is not None and str(item).strip()
+    ]
+
+
+def _filter_diagnostic(
+    *,
+    example: dict[str, Any],
+    config: SFTConfig,
+    stage: str,
+    validation_errors: list[str],
+    filter_reasons: list[str],
+    trajectory: list[dict[str, Any]],
+    final_answer: Any = None,
+    prompt_contract_version: str | None = None,
+    prompt_contract_fingerprint: str | None = None,
+    retrieval_index_fingerprint: str | None = None,
+) -> dict[str, Any]:
+    contract = load_prompt_contract(config.prompt_config_path)
+    metrics = calculate_answer_metrics(final_answer, example.get("answer"))
+    evidence = [
+        item
+        for turn in trajectory
+        for item in (turn.get("update_evidence", {}).get("evidence", []) or [])
+        if isinstance(item, dict)
+    ]
+    answer_payload = {"can_answer": final_answer is not None, "answer": final_answer}
+    evidence_supported = bool(final_answer) and answer_supported_by_evidence(
+        answer_payload,
+        evidence,
+        question=str(example.get("question") or ""),
+        accepted_answers=_answer_forms(example),
+    )
+    if retrieval_index_fingerprint is None:
+        retrieval_index_fingerprint = _index_provenance(config).get(
+            str(example.get("dataset") or ""), {}
+        ).get("fingerprint")
+    return {
+        "dataset": example.get("dataset"),
+        "qid": example.get("qid"),
+        "question": example.get("question"),
+        "gold_answer": example.get("answer"),
+        "answer_aliases": example.get("answer_aliases") or [],
+        "stage": stage,
+        "validation_errors": list(validation_errors),
+        "filter_reasons": list(filter_reasons),
+        "final_answer": final_answer,
+        "answer_exact_match": int(metrics["exact_match"]),
+        "answer_contain": int(metrics["contain"]),
+        "answer_f1": float(metrics["f1"]),
+        "evidence_supported": bool(evidence_supported),
+        "trajectory": trajectory,
+        "prompt_contract_version": prompt_contract_version or contract.version,
+        "prompt_contract_fingerprint": prompt_contract_fingerprint or contract.fingerprint,
+        "retrieval_index_fingerprint": retrieval_index_fingerprint,
+    }
+
+
 def _process_sft_example(
     *,
     example: dict[str, Any],
@@ -1002,12 +1242,16 @@ def _process_sft_example(
         }
         turns: list[dict[str, Any]] = []
         for round_index in range(config.max_rounds):
-            is_final_round = round_index == config.max_rounds - 1
+            answer_context = AnswerPromptContext(round_index=round_index, max_rounds=config.max_rounds)
             state_before = copy.deepcopy(state)
+            raw_responses: dict[str, str] = {}
 
             stage = "planning"
             query_output = _dry_plan(example, state, config.retrieval_top_k) if config.dry_run else client.complete(
                 build_planning_messages(example, state)
+            )
+            raw_responses["query_retriever"] = str(
+                query_output.pop("_raw_response", json.dumps(query_output, ensure_ascii=False))
             )
             plan = _normalize_query_retriever_output(query_output)
             query = str(plan.get("query_retriever", {}).get("query") or example["question"])
@@ -1015,8 +1259,32 @@ def _process_sft_example(
                 query,
                 question=str(example.get("question") or ""),
                 state=state_before,
+                answer_forms=_answer_forms(example),
             ):
-                return {"status": "filtered", "filter_reasons": ["unseen_intermediate_query"]}
+                filter_reasons = ["unseen_intermediate_query"]
+                validation_errors = [
+                    f"round {round_index}: retrieval.query contains unseen primary-gold or alias answer terms"
+                ]
+                partial_turn = {
+                    "round": round_index,
+                    "state": state_before,
+                    "query_retriever": plan.get("query_retriever", {}),
+                    "plan": plan.get("plan", {}),
+                    "retrieval": plan.get("retrieval", {}),
+                    "raw_responses": raw_responses,
+                }
+                return {
+                    "status": "filtered",
+                    "filter_reasons": filter_reasons,
+                    "diagnostic": _filter_diagnostic(
+                        example=example,
+                        config=config,
+                        stage="planning",
+                        validation_errors=validation_errors,
+                        filter_reasons=filter_reasons,
+                        trajectory=[partial_turn],
+                    ),
+                }
 
             stage = "retrieval"
             observation = normalize_observation(_retrieve(config, dataset_name, query))
@@ -1036,8 +1304,10 @@ def _process_sft_example(
                         state,
                         plan,
                         observation,
-                        force_final_answer=config.force_final_answer and is_final_round,
                     )
+                )
+                raw_responses["evidence_updater"] = str(
+                    update.pop("_raw_response", json.dumps(update, ensure_ascii=False))
                 )
                 interim_update = normalize_update_evidence(
                     update.get("update_evidence", {}),
@@ -1052,13 +1322,19 @@ def _process_sft_example(
                     build_answer_messages(
                         example,
                         answer_state,
-                        force_final_answer=config.force_final_answer and is_final_round,
+                        context=answer_context,
                     )
                 )
+                raw_responses["answer_generator"] = str(
+                    answer_output.pop("_raw_response", json.dumps(answer_output, ensure_ascii=False))
+                )
+            if config.dry_run:
+                raw_responses["evidence_updater"] = json.dumps(update, ensure_ascii=False)
+                raw_responses["answer_generator"] = json.dumps(answer_output, ensure_ascii=False)
             teacher_output = finalize_teacher_output(
                 {**plan, **update, **answer_output},
                 example=example,
-                force_final_answer=config.force_final_answer and is_final_round,
+                context=answer_context,
             )
             normalized_update = normalize_update_evidence(
                 teacher_output.get("update_evidence", {}),
@@ -1070,6 +1346,7 @@ def _process_sft_example(
                 teacher_output.get("answer", {}),
                 evidence=cumulative_evidence,
                 question=str(example.get("question") or ""),
+                accepted_answers=_answer_forms(example),
             )
             turns.append(
                 {
@@ -1081,6 +1358,7 @@ def _process_sft_example(
                     "observation": observation,
                     "update_evidence": normalized_update,
                     "answer": normalized_answer,
+                    "raw_responses": raw_responses,
                 }
             )
 
@@ -1101,11 +1379,31 @@ def _process_sft_example(
 
         stage = "validation"
         sample = build_trajectory_sample(example=example, turns=turns)
+        contract = load_prompt_contract(config.prompt_config_path)
+        sample["max_rounds"] = config.max_rounds
+        sample["retrieval_top_k"] = config.retrieval_top_k
+        sample["prompt_contract_version"] = contract.version
+        sample["prompt_contract_fingerprint"] = contract.fingerprint
+        dataset_index = _index_provenance(config).get(dataset_name, {})
+        sample["retrieval_index_fingerprint"] = dataset_index.get("fingerprint")
         validation_errors = validate_trajectory_sample(sample)
         if validation_errors:
+            filter_reasons = [_filter_reason_key(error) for error in validation_errors]
             return {
                 "status": "filtered",
-                "filter_reasons": [_filter_reason_key(error) for error in validation_errors],
+                "filter_reasons": filter_reasons,
+                "diagnostic": _filter_diagnostic(
+                    example=example,
+                    config=config,
+                    stage="validation",
+                    validation_errors=validation_errors,
+                    filter_reasons=filter_reasons,
+                    trajectory=sample["trajectory"],
+                    final_answer=sample.get("final_answer"),
+                    prompt_contract_version=sample.get("prompt_contract_version"),
+                    prompt_contract_fingerprint=sample.get("prompt_contract_fingerprint"),
+                    retrieval_index_fingerprint=sample.get("retrieval_index_fingerprint"),
+                ),
             }
         return {"status": "written", "sample": sample}
     except BaseException as exc:
@@ -1115,8 +1413,31 @@ def _process_sft_example(
 def generate_sft_dataset(config: SFTConfig) -> dict[str, Any]:
     output_dir = Path(config.output_dir)
     error_path = output_dir / "teacher_errors.jsonl"
+    filtered_path = output_dir / "teacher_filtered.jsonl"
     trace_path = output_dir / "teacher_traces.jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    prompt_contract = load_prompt_contract(config.prompt_config_path)
+    index_provenance = _index_provenance(config)
+    run_config = {
+        "prompt_contract_version": prompt_contract.version,
+        "prompt_contract_fingerprint": prompt_contract.fingerprint,
+        "prompt_config_path": str(prompt_contract.source_path),
+        "model": config.model,
+        "source_root": str(config.source_root),
+        "retrieval_backend": config.retrieval_backend,
+        "retrieval_root": str(config.retrieval_root),
+        "retrieval_embedding_model": config.embedding_model,
+        "retrieval_device": config.retrieval_device,
+        "retrieval_max_length": config.retrieval_max_length,
+        "retrieval_top_k": config.retrieval_top_k,
+        "max_rounds": config.max_rounds,
+        "target_valid_per_dataset": config.target_valid_per_dataset,
+        "datasets": config.datasets,
+        "index_provenance": index_provenance,
+    }
+    write_json(output_dir / "run_config.json", run_config)
+    _validate_teacher_retrieval_contract(config)
 
     client = None if config.dry_run else BailianChatClient(config)
     samples_seen = 0
@@ -1144,10 +1465,9 @@ def generate_sft_dataset(config: SFTConfig) -> dict[str, Any]:
     total_samples = sum(existing_counts.values())
 
     output_mode = "a" if config.resume else "w"
-    with error_path.open(
-        output_mode,
-        encoding="utf-8",
-    ) as error_handle:
+    with error_path.open(output_mode, encoding="utf-8") as error_handle, filtered_path.open(
+        output_mode, encoding="utf-8"
+    ) as filtered_handle:
         for dataset_name, dataset_examples in examples_by_dataset.items():
             current_dataset_stats = dataset_stats[dataset_name]
             current_dataset_stats["target_valid_per_dataset"] = config.target_valid_per_dataset
@@ -1228,6 +1548,9 @@ def generate_sft_dataset(config: SFTConfig) -> dict[str, Any]:
                                     for pending_future in pending:
                                         pending_future.cancel()
                             elif status == "filtered":
+                                diagnostic = result.get("diagnostic")
+                                if isinstance(diagnostic, dict):
+                                    _append_jsonl(filtered_handle, diagnostic)
                                 current_dataset_stats["samples_filtered"] += 1
                                 samples_filtered += 1
                                 for reason in result.get("filter_reasons", []):
@@ -1248,15 +1571,18 @@ def generate_sft_dataset(config: SFTConfig) -> dict[str, Any]:
         "output": str(output_dir),
         "outputs": {dataset: str(path) for dataset, path in output_paths.items()},
         "errors": str(error_path),
+        "filtered_output": str(filtered_path),
         "samples_seen": samples_seen,
         "samples_processed": samples_processed,
         "samples_skipped_existing": samples_skipped_existing,
         "samples_written": samples_written,
         "total_samples": total_samples,
         "samples_filtered": samples_filtered,
+        "filtered_records": samples_filtered,
         "samples_failed": samples_failed,
         "samples_skipped_target": samples_skipped_target,
         "filter_reasons": dict(sorted(filter_reasons.items())),
+        "filter_reason_occurrences": dict(sorted(filter_reasons.items())),
         "dataset_stats": _json_ready_dataset_stats(dataset_stats),
         "sample_format": "trajectory_per_question",
         "contains_messages": False,
@@ -1268,7 +1594,19 @@ def generate_sft_dataset(config: SFTConfig) -> dict[str, Any]:
         "sft_sample_workers": config.sft_sample_workers,
         "retrieval_workers": config.retrieval_workers,
         "model": config.model,
+        "prompt_contract_version": prompt_contract.version,
+        "prompt_contract_fingerprint": prompt_contract.fingerprint,
+        "retrieval_backend": config.retrieval_backend,
+        "retrieval_embedding_model": config.embedding_model,
+        "retrieval_top_k": config.retrieval_top_k,
+        "max_rounds": config.max_rounds,
+        "index_provenance": index_provenance,
     }
+    summary["targets_met"] = all(
+        int(existing_counts.get(dataset, 0)) + int(dataset_stats[dataset]["samples_written"])
+        >= int(config.target_valid_per_dataset)
+        for dataset in config.datasets
+    )
     write_json(output_dir / "summary.json", summary)
     return summary
 
@@ -1302,6 +1640,13 @@ def main(argv: Optional[list[str]] = None) -> int:
     config = _coerce_config(_load_yaml_config(args.config), args)
     summary = generate_sft_dataset(config)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
+    if not config.dry_run and not summary.get("targets_met", False):
+        print(
+            "Teacher generation did not reach target_valid_per_dataset for every dataset; "
+            "inspect summary.json and resume the same output directory.",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

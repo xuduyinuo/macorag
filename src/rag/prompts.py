@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from .schema import RAGState
+from prompt_config import load_prompt_contract
+
+from .schema import AnswerPromptContext, RAGState
 
 
 def _json_block(payload: Any) -> str:
@@ -36,12 +38,35 @@ def build_evidence_updater_prompt(
     )
 
 
-def build_answer_generator_prompt(*, question: str, state: RAGState) -> str:
+def build_answer_generator_prompt(
+    *,
+    question: str,
+    state: RAGState,
+    context: AnswerPromptContext | None = None,
+    force_final_answer: bool | None = None,
+) -> str:
+    if context is not None and force_final_answer is not None:
+        raise ValueError("Pass AnswerPromptContext instead of force_final_answer, not both")
+    is_final_round = context.is_final_round if context is not None else bool(force_final_answer)
+    instructions = load_prompt_contract().instructions["answer"]
+    decision_rule = (
+        str(instructions["final"] if is_final_round else instructions["normal"]).strip()
+    )
+    output_example = str(
+        instructions["final_output_example"] if is_final_round else instructions["normal_output_example"]
+    ).strip()
+    round_line = ""
+    if context is not None:
+        round_line = (
+            f"Round: {context.round_index + 1}/{context.max_rounds}; "
+            f"remaining retrieval rounds after this answer: {context.remaining_rounds}.\n"
+        )
     return (
         "Task: answer from accumulated evidence.\n"
-        "Use selected evidence in <state>. If evidence is insufficient and retrieval budget remains, return can_answer=false.\n"
-        'If budget is exhausted, a fallback guess is allowed only with rationale marked "fallback_guess".\n'
+        "Use selected evidence in <state>.\n"
+        f"{decision_rule}\n"
+        f"{round_line}"
         f"Question: {question}\n"
         f"<state>{_json_block(state.to_dict())}</state>\n"
-        'Return exactly: <answer>{"can_answer":...,"answer":...,"rationale":"..."}</answer>'
+        f"Return exactly: {output_example}"
     )

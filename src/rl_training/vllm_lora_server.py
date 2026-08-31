@@ -25,13 +25,31 @@ def parse_server_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--data-parallel-size", type=int, default=1)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.85)
     parser.add_argument("--max-model-len", type=int, default=8192)
+    parser.add_argument("--max-num-seqs", type=int, default=8)
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--lora-name", required=True)
     parser.add_argument("--lora-int-id", type=int, required=True)
     parser.add_argument("--lora-adapter-path", required=True)
     return parser.parse_args(argv)
+
+
+def build_llm_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {
+        "model": args.model,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "max_model_len": args.max_model_len,
+        "max_num_seqs": args.max_num_seqs,
+        "dtype": args.dtype,
+        "enable_lora": True,
+        "max_loras": 1,
+        "max_lora_rank": 64,
+        "worker_extension_cls": (
+            "rl_training.vllm_lora_server.WeightSyncLoRAWorkerExtension"
+        ),
+    }
 
 
 def build_lora_request(args: argparse.Namespace):
@@ -309,6 +327,20 @@ def _chosen_token_logprobs(output: Any) -> list[float]:
     return chosen
 
 
+def _build_sampling_params(
+    sampling_params_cls: type[Any],
+    sampling_kwargs: dict[str, Any],
+    *,
+    seeds: Optional[list[int]],
+) -> Any:
+    if seeds is None:
+        return sampling_params_cls(**sampling_kwargs)
+    return [
+        sampling_params_cls(**sampling_kwargs, seed=int(seed))
+        for seed in seeds
+    ]
+
+
 def create_app(
     args: argparse.Namespace,
     *,
@@ -328,6 +360,7 @@ def create_app(
 
     class GenerateRequest(BaseModel):
         prompts: list[str]
+        seeds: Optional[list[int]] = None
         n: int = 1
         repetition_penalty: float = 1.0
         temperature: float = 1.0
@@ -356,10 +389,12 @@ def create_app(
             "status": "ok",
             "sync_mode": "lora",
             "model": args.model,
+            "dtype": args.dtype,
             "lora_name": args.lora_name,
             "lora_int_id": args.lora_int_id,
             "lora_adapter_path": args.lora_adapter_path,
             "supports_lora_param_update": True,
+            "supports_prompt_seeds": True,
         }
 
     @app.get("/get_world_size/")
@@ -368,6 +403,14 @@ def create_app(
 
     @app.post("/generate/")
     async def generate(request: GenerateRequest = Body(...)):
+        if request.seeds is not None and len(request.seeds) != len(request.prompts):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Expected one seed per prompt, got "
+                    f"{len(request.seeds)} seeds for {len(request.prompts)} prompts."
+                ),
+            )
         sampling_kwargs = {
             "n": request.n,
             "repetition_penalty": request.repetition_penalty,
@@ -387,7 +430,11 @@ def create_app(
                 backend="outlines",
                 regex=request.guided_decoding_regex,
             )
-        sampling_params = sampling_params_cls(**sampling_kwargs)
+        sampling_params = _build_sampling_params(
+            sampling_params_cls,
+            sampling_kwargs,
+            seeds=request.seeds,
+        )
         outputs = llm.generate(request.prompts, sampling_params=sampling_params, lora_request=lora_request)
         flattened_outputs = [output for outputs_item in outputs for output in outputs_item.outputs]
         completion_ids = [list(output.token_ids) for output in flattened_outputs]
@@ -525,17 +572,7 @@ def main() -> None:
     except ModuleNotFoundError as exc:
         raise SystemExit(f"Missing vLLM LoRA server dependency: {exc}") from exc
 
-    llm = LLM(
-        model=args.model,
-        tensor_parallel_size=args.tensor_parallel_size,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        max_model_len=args.max_model_len,
-        dtype=args.dtype,
-        enable_lora=True,
-        max_loras=1,
-        max_lora_rank=64,
-        worker_extension_cls="rl_training.vllm_lora_server.WeightSyncLoRAWorkerExtension",
-    )
+    llm = LLM(**build_llm_kwargs(args))
     register_lora_adapter_on_workers(llm, args)
     app = create_app(args, llm=llm, sampling_params_cls=SamplingParams)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

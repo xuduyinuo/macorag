@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import os
 from argparse import Namespace
@@ -22,13 +24,16 @@ from rl_training.policy import HFSharedPolicy
 from rl_training.policy import sequence_logprobs
 import rl_training.policy as policy_module
 import rl_training.rewards as reward_module
+import rl_training.train_grpo_macorag as train_grpo_module
 import rl_training.trainer as trainer_module
 from rl_training.rewards import compute_answer_f1, compute_rl_rewards
 from rl_training.train_grpo_macorag import _parse_gpu_indices
+from rl_training.train_grpo_macorag import _protocol_warning_event
 from rl_training.train_grpo_macorag import _build_policy
 from rl_training.train_grpo_macorag import _extract_vllm_server_model_paths
 from rl_training.train_grpo_macorag import _validate_local_vllm_server_model
 from rl_training.train_grpo_macorag import _train_on_rollouts
+from rl_training.train_grpo_macorag import _validate_sft_prompt_contract
 from rl_training.train_grpo_macorag import _validate_vllm_gpu_placement
 from rl_training.train_grpo_macorag import _build_train_metrics_payload
 from rl_training.train_grpo_macorag import _dataset_rollout_path
@@ -38,11 +43,120 @@ from rl_training.trainer import compute_grpo_loss
 from rl_training.vllm_client import collect_trainable_named_parameters
 
 
+def test_main_does_not_gate_recovery_checkpoints_on_protocol_quality() -> None:
+    tree = ast.parse(inspect.getsource(train_grpo_module.main))
+    checkpoint_guard_chains: dict[str, list[tuple[str, ...]]] = {
+        "save_full_checkpoint": [],
+        "_run_final_checkpoint_actions": [],
+    }
+
+    def visit(node: ast.AST, guards: tuple[str, ...] = ()) -> None:
+        if isinstance(node, ast.If):
+            test = ast.unparse(node.test)
+            for child in node.body:
+                visit(child, (*guards, test))
+            for child in node.orelse:
+                visit(child, guards)
+            return
+        if isinstance(node, ast.Call):
+            call_name = getattr(node.func, "id", None)
+            if call_name in checkpoint_guard_chains:
+                checkpoint_guard_chains[call_name].append(guards)
+        for child in ast.iter_child_nodes(node):
+            visit(child, guards)
+
+    visit(tree)
+
+    assert checkpoint_guard_chains == {
+        "save_full_checkpoint": [("should_save",), ()],
+        "_run_final_checkpoint_actions": [()],
+    }
+    assert all(
+        "checkpoint_eligible" not in guard
+        for call_guards in checkpoint_guard_chains.values()
+        for guards in call_guards
+        for guard in guards
+    )
+
+
+def test_pending_gradient_state_survives_skips_until_step_or_explicit_clear() -> None:
+    from rl_training.train_grpo_macorag import _pending_gradients_after_sample
+
+    pending = _pending_gradients_after_sample(
+        has_pending_gradients=False,
+        metrics={"did_backward": True, "did_optimizer_step": False},
+    )
+    assert pending is True
+
+    pending = _pending_gradients_after_sample(
+        has_pending_gradients=pending,
+        metrics={
+            "did_backward": False,
+            "did_optimizer_step": False,
+            "skipped_update_reason": "no_trainable_actions",
+        },
+    )
+    assert pending is True
+
+    pending = _pending_gradients_after_sample(
+        has_pending_gradients=pending,
+        metrics={"did_backward": True, "did_optimizer_step": True},
+    )
+    assert pending is False
+
+    pending = _pending_gradients_after_sample(
+        has_pending_gradients=True,
+        metrics={
+            "did_backward": True,
+            "did_optimizer_step": False,
+            "did_clear_gradients": True,
+            "skipped_update_reason": "nonfinite_gradients",
+        },
+    )
+    assert pending is False
+
+
 def _write_jsonl(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def test_protocol_warning_event_is_nonfatal_log_payload() -> None:
+    status = {"should_warn": True, "parse_failure_rate": 0.03}
+    assert _protocol_warning_event(step=49, protocol_status=status) == {
+        "event": "protocol_warning",
+        "step": 49,
+        "protocol_metrics": status,
+    }
+    assert _protocol_warning_event(
+        step=49,
+        protocol_status={"should_warn": False},
+    ) is None
+
+
+def _write_structural_resume_checkpoint(path: Path) -> None:
+    from safetensors.torch import save_file
+
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "base_model_name_or_path": "model/base",
+                "bias": "none",
+                "inference_mode": True,
+                "lora_alpha": 16,
+                "lora_dropout": 0.0,
+                "peft_type": "LORA",
+                "r": 8,
+                "target_modules": ["q_proj"],
+                "task_type": "CAUSAL_LM",
+            }
+        ),
+        encoding="utf-8",
+    )
+    save_file({"dummy.weight": torch.zeros(1)}, path / "adapter_model.safetensors")
 
 
 def _sample(qid: str, dataset: str) -> RLSample:
@@ -145,14 +259,186 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.disable_tqdm is False
 
 
-def test_parse_args_loads_role_credit_weights(tmp_path: Path) -> None:
+def test_active_config_exposes_manual_sft_adapter_path() -> None:
+    from rl_training.config import parse_args
+
+    args = parse_args([])
+
+    adapter_path = Path(args.sft_adapter_path)
+    assert str(adapter_path) != "/path/to/sft_adapter"
+    assert (adapter_path / "adapter_config.json").is_file()
+    assert (adapter_path / "prompt_contract.json").is_file()
+
+
+def test_active_grpo_config_enables_bf16_flash_attention() -> None:
+    args = parse_args(["--config", "config/train_grpo.yml"])
+
+    assert args.bf16 is True
+    assert args.fp16 is False
+    assert args.load_4bit is False
+    assert args.vllm_dtype == "bfloat16"
+    assert args.vllm_gpu_memory_utilization == pytest.approx(0.85)
+    assert args.vllm_max_num_seqs == 8
+    assert args.attn_implementation == "flash_attention_2"
+    assert args.advantage_granularity == "role_round"
+
+
+def test_vllm_generation_defaults_reserve_bf16_kv_cache(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text("", encoding="utf-8")
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.vllm_gpu_memory_utilization == pytest.approx(0.85)
+    assert args.vllm_max_num_seqs == 8
+
+
+def test_validate_sft_prompt_contract_reads_valid_json(tmp_path: Path) -> None:
+    from prompt_config import load_prompt_contract
+
+    contract = load_prompt_contract("config/prompts.yml")
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    metadata = {
+        "prompt_contract_version": contract.version,
+        "prompt_contract_fingerprint": contract.fingerprint,
+        "max_rounds": 4,
+        "retrieval_top_k": 5,
+    }
+    (adapter / "prompt_contract.json").write_text(
+        json.dumps(metadata),
+        encoding="utf-8",
+    )
+    args = Namespace(
+        prompt_config_path="config/prompts.yml",
+        sft_adapter_path=str(adapter),
+        require_sft_prompt_contract=True,
+        max_rounds=4,
+        retrieval_top_k=5,
+    )
+
+    assert _validate_sft_prompt_contract(args) == metadata
+
+
+def test_grpo_model_kwargs_passes_attention_implementation() -> None:
+    from rl_training.train_grpo_macorag import _model_kwargs
+
+    args = Namespace(
+        bf16=True,
+        fp16=False,
+        load_4bit=False,
+        attn_implementation="flash_attention_2",
+    )
+    fake_torch = Namespace(bfloat16="bf16", float16="fp16")
+
+    assert _model_kwargs(args, fake_torch, local_rank=0) == {
+        "torch_dtype": "bf16",
+        "attn_implementation": "flash_attention_2",
+    }
+
+
+def _grpo_acceleration_validator():
+    from rl_training import train_grpo_macorag
+
+    validator = getattr(train_grpo_macorag, "_validate_acceleration_runtime", None)
+    assert callable(validator), "RL acceleration runtime validator is missing"
+    return validator
+
+
+def test_grpo_acceleration_runtime_rejects_missing_flash_attention() -> None:
+    validator = _grpo_acceleration_validator()
+    args = Namespace(bf16=False, fp16=False, attn_implementation="flash_attention_2")
+    fake_torch = Namespace(cuda=Namespace(is_available=lambda: True))
+
+    with pytest.raises(SystemExit, match="flash_attn is not installed"):
+        validator(args, fake_torch, find_spec=lambda name: None)
+
+
+def test_grpo_acceleration_runtime_rejects_flash_attention_abi_failure() -> None:
+    validator = _grpo_acceleration_validator()
+    args = Namespace(bf16=False, fp16=False, attn_implementation="flash_attention_2")
+    fake_torch = Namespace(cuda=Namespace(is_available=lambda: True))
+
+    def broken_import(name):
+        raise ImportError("flash_attn_2_cuda.so: undefined symbol: c10::Error")
+
+    with pytest.raises(SystemExit, match="undefined symbol: c10::Error"):
+        validator(
+            args,
+            fake_torch,
+            find_spec=lambda name: object(),
+            import_module=broken_import,
+        )
+
+
+def test_grpo_acceleration_runtime_rejects_flash_attention_without_cuda() -> None:
+    validator = _grpo_acceleration_validator()
+    args = Namespace(bf16=False, fp16=False, attn_implementation="flash_attention_2")
+    fake_flash_attn = Namespace(flash_attn_func=lambda: None)
+    fake_torch = Namespace(cuda=Namespace(is_available=lambda: False))
+
+    with pytest.raises(SystemExit, match="CUDA is unavailable"):
+        validator(
+            args,
+            fake_torch,
+            find_spec=lambda name: object(),
+            import_module=lambda name: fake_flash_attn,
+        )
+
+
+def test_grpo_acceleration_runtime_rejects_bf16_and_fp16_together() -> None:
+    validator = _grpo_acceleration_validator()
+    args = Namespace(bf16=True, fp16=True, attn_implementation="sdpa")
+    fake_torch = Namespace(cuda=Namespace(is_available=lambda: True))
+
+    with pytest.raises(SystemExit, match="cannot both be enabled"):
+        validator(args, fake_torch)
+
+
+def test_grpo_acceleration_runtime_selects_local_rank_before_bf16_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validator = _grpo_acceleration_validator()
+    calls = []
+    args = Namespace(bf16=True, fp16=False, attn_implementation="sdpa")
+    fake_torch = Namespace(
+        cuda=Namespace(
+            is_available=lambda: True,
+            set_device=lambda rank: calls.append(("set_device", rank)),
+            is_bf16_supported=lambda: calls.append(("is_bf16_supported", None)) or True,
+        )
+    )
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+
+    validator(args, fake_torch)
+
+    assert calls == [("set_device", 1), ("is_bf16_supported", None)]
+
+
+def test_grpo_acceleration_runtime_rejects_unsupported_bf16() -> None:
+    validator = _grpo_acceleration_validator()
+    args = Namespace(bf16=True, fp16=False, attn_implementation="sdpa")
+    fake_torch = Namespace(
+        cuda=Namespace(
+            is_available=lambda: True,
+            is_bf16_supported=lambda: False,
+        )
+    )
+
+    with pytest.raises(SystemExit, match="does not support bf16"):
+        validator(args, fake_torch)
+
+
+def test_parse_args_loads_agent_global_credit_weights(tmp_path: Path) -> None:
     config = tmp_path / "train_grpo.yml"
     config.write_text(
         "\n".join(
             [
-                "query_local_credit_weight: 0.8",
-                "evidence_local_credit_weight: 0.6",
-                "answer_local_credit_weight: 0.2",
+                "query_global_reward_weight: 0.25",
+                "evidence_global_reward_weight: 0.5",
+                "answer_global_reward_weight: 2.0",
+                "advantage_epsilon: 1.0e-6",
             ]
         ),
         encoding="utf-8",
@@ -160,15 +446,73 @@ def test_parse_args_loads_role_credit_weights(tmp_path: Path) -> None:
 
     args = parse_args(["--config", str(config)])
 
-    assert args.query_local_credit_weight == 0.8
-    assert args.evidence_local_credit_weight == 0.6
-    assert args.answer_local_credit_weight == 0.2
+    assert args.query_global_reward_weight == 0.25
+    assert args.evidence_global_reward_weight == 0.5
+    assert args.answer_global_reward_weight == 2.0
+    assert args.advantage_epsilon == 1.0e-6
+
+
+def test_parse_args_loads_e5_faiss_retrieval_fields(tmp_path: Path) -> None:
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                "retrieval_backend: e5_faiss",
+                "retrieval_embedding_model: intfloat/e5-base-v2",
+                "retrieval_device: cpu",
+                "retrieval_max_length: 512",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.retrieval_backend == "e5_faiss"
+    assert args.retrieval_embedding_model == "intfloat/e5-base-v2"
+    assert args.retrieval_device == "cpu"
+    assert args.retrieval_max_length == 512
 
 
 def test_rl_default_system_prompt_comes_from_shared_prompt_file() -> None:
     args = parse_args(["--config", "config/train_grpo.yml", "--max-samples", "1"])
 
     assert args.system_prompt == load_system_prompt()
+
+
+def test_policy_uses_role_system_prompt_and_structured_answer_context() -> None:
+    from prompt_config import system_prompt_for
+    from rag import AgentRole, AnswerPromptContext, RAGState
+    from rl_training.policy import HFSharedPolicy
+
+    captured = {}
+
+    class Tokenizer:
+        def apply_chat_template(self, messages, add_generation_prompt, tokenize):
+            captured["messages"] = messages
+            return [1, 2, 3]
+
+    policy = HFSharedPolicy(
+        model=None,
+        tokenizer=Tokenizer(),
+        system_prompt=None,
+        max_prompt_length=128,
+        max_completion_length=16,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=5,
+    )
+    prompt = policy._prompt_for(
+        role=AgentRole.ANSWER_GENERATOR,
+        question="Q?",
+        state=RAGState(question="Q?"),
+        observation=None,
+        answer_context=AnswerPromptContext(round_index=3, max_rounds=4),
+    )
+    policy._encode_prompt(prompt, role=AgentRole.ANSWER_GENERATOR)
+
+    assert "fallback_guess:" in prompt
+    assert captured["messages"][0]["content"] == system_prompt_for("answer_generator")
 
 
 def test_parse_args_supports_output_root(tmp_path: Path) -> None:
@@ -220,6 +564,147 @@ def test_parse_args_defaults_vllm_lora_adapter_path_to_sft_adapter_path(tmp_path
     args = parse_args(["--config", str(config)])
 
     assert args.vllm_lora_adapter_path == "outputs/sft/adapter"
+
+
+def test_parse_args_loads_resume_config(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "checkpoint-3600"
+    checkpoint.mkdir()
+    config = tmp_path / "train_grpo.yml"
+    config.write_text(
+        "\n".join(
+            [
+                f'resume_from_checkpoint: "{checkpoint}"',
+                "resume_epoch: 1",
+                "resume_samples_consumed: 3600",
+                "resume_global_step: 3600",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.resume_from_checkpoint == str(checkpoint)
+    assert args.resume_epoch == 1
+    assert args.resume_samples_consumed == 3600
+    assert args.resume_global_step == 3600
+
+
+def test_resolve_resume_state_accepts_policy_only_checkpoint(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-3600"
+    _write_structural_resume_checkpoint(checkpoint)
+    state = _resolve_resume_state(
+        Namespace(
+            resume_from_checkpoint=str(checkpoint),
+            resume_epoch=1,
+            resume_samples_consumed=3600,
+            resume_global_step=3600,
+        ),
+        rank_epoch_size=6000,
+        total_epochs=1,
+    )
+
+    assert state.checkpoint_path == checkpoint
+    assert state.epoch == 1
+    assert state.samples_consumed == 3600
+    assert state.global_step == 3600
+    assert state.optimizer_state_restored is False
+
+
+def test_resolve_resume_state_rejects_consumed_count_beyond_epoch(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-3600"
+    _write_structural_resume_checkpoint(checkpoint)
+    args = Namespace(
+        resume_from_checkpoint=str(checkpoint),
+        resume_epoch=1,
+        resume_samples_consumed=6001,
+        resume_global_step=3600,
+    )
+
+    with pytest.raises(SystemExit, match="resume_samples_consumed"):
+        _resolve_resume_state(args, rank_epoch_size=6000, total_epochs=1)
+
+
+def test_resolve_resume_state_rejects_empty_checkpoint_directory(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-3600"
+    checkpoint.mkdir()
+    args = Namespace(
+        resume_from_checkpoint=str(checkpoint),
+        resume_epoch=1,
+        resume_samples_consumed=3600,
+        resume_global_step=3600,
+    )
+
+    with pytest.raises(SystemExit, match="adapter_config.json"):
+        _resolve_resume_state(args, rank_epoch_size=6000, total_epochs=1)
+
+
+def test_resolve_resume_state_rejects_malformed_adapter_config(tmp_path: Path) -> None:
+    from safetensors.torch import save_file
+
+    from rl_training.train_grpo_macorag import _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-3600"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text("{bad json", encoding="utf-8")
+    save_file({"dummy.weight": torch.zeros(1)}, checkpoint / "adapter_model.safetensors")
+    args = Namespace(
+        resume_from_checkpoint=str(checkpoint),
+        resume_epoch=1,
+        resume_samples_consumed=3600,
+        resume_global_step=3600,
+    )
+
+    with pytest.raises(SystemExit, match="adapter config"):
+        _resolve_resume_state(args, rank_epoch_size=6000, total_epochs=1)
+
+
+def test_resolve_resume_state_rejects_missing_adapter_weights(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-3600"
+    _write_structural_resume_checkpoint(checkpoint)
+    (checkpoint / "adapter_model.safetensors").unlink()
+    args = Namespace(
+        resume_from_checkpoint=str(checkpoint),
+        resume_epoch=1,
+        resume_samples_consumed=3600,
+        resume_global_step=3600,
+    )
+
+    with pytest.raises(SystemExit, match="adapter weights"):
+        _resolve_resume_state(args, rank_epoch_size=6000, total_epochs=1)
+
+
+def test_resume_sequence_skips_consumed_items_from_only_the_resume_epoch(tmp_path: Path) -> None:
+    from rl_training.train_grpo_macorag import _rank_samples_for_epoch, _resolve_resume_state
+
+    checkpoint = tmp_path / "checkpoint-2"
+    _write_structural_resume_checkpoint(checkpoint)
+    samples = [_sample(f"q-{index}", "hotpotqa") for index in range(6)]
+    state = _resolve_resume_state(
+        Namespace(
+            resume_from_checkpoint=str(checkpoint),
+            resume_epoch=1,
+            resume_samples_consumed=2,
+            resume_global_step=2,
+        ),
+        rank_epoch_size=6,
+        total_epochs=2,
+    )
+    full_epoch_one = rl_data_module.epoch_sample_order(samples, seed=42, epoch=1)
+
+    resumed_epoch_one = _rank_samples_for_epoch(samples, seed=42, epoch=1, resume_state=state)
+    epoch_two = _rank_samples_for_epoch(samples, seed=42, epoch=2, resume_state=state)
+
+    assert [sample.qid for _, sample in resumed_epoch_one] == [sample.qid for sample in full_epoch_one[2:]]
+    assert len(epoch_two) == 6
 
 
 def test_make_timestamped_run_dir_uses_linearrag_style_child_directory() -> None:
@@ -360,6 +845,68 @@ def test_load_policy_and_reference_uses_one_shared_base_with_dual_adapters(
     assert bool(shared_model.gradient_checkpointing_calls) is gradient_checkpointing
 
 
+def test_resume_loads_policy_from_checkpoint_and_reference_from_original_sft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import rl_training.train_grpo_macorag as train_module
+
+    tokenizer_loads: list[str] = []
+    peft_loads: list[tuple[str, str, bool]] = []
+    reference_loads: list[tuple[str, str, bool]] = []
+
+    class FakeTokenizer:
+        pad_token = None
+        eos_token = "<eos>"
+
+        @classmethod
+        def from_pretrained(cls, path: str, **kwargs: object):
+            tokenizer_loads.append(path)
+            return cls()
+
+    class FakeBase:
+        def __init__(self) -> None:
+            self.config = Namespace(use_cache=True)
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(path: str, **kwargs: object):
+            return FakeBase()
+
+    class ResumeModel(_FakeDualAdapterModel):
+        def load_adapter(self, path: str, *, adapter_name: str, is_trainable: bool) -> None:
+            reference_loads.append((path, adapter_name, is_trainable))
+
+    shared_model = ResumeModel()
+
+    class FakePeftModel:
+        @staticmethod
+        def from_pretrained(base: object, path: str, *, adapter_name: str, is_trainable: bool):
+            peft_loads.append((path, adapter_name, is_trainable))
+            return shared_model
+
+    monkeypatch.setattr(train_module, "_model_kwargs", lambda *args: {})
+    args = Namespace(
+        model_path="model/base",
+        sft_adapter_path="outputs/sft/adapter",
+        resume_from_checkpoint="outputs/grpo/run/checkpoint-3600",
+        load_4bit=False,
+        gradient_checkpointing=False,
+    )
+    deps = {
+        "torch": torch,
+        "AutoModelForCausalLM": FakeAutoModel,
+        "AutoTokenizer": FakeTokenizer,
+        "PeftModel": FakePeftModel,
+        "prepare_model_for_kbit_training": lambda model, **kwargs: model,
+    }
+
+    train_module._load_policy_and_reference(args, deps, torch.device("cpu"))
+
+    assert tokenizer_loads == ["outputs/grpo/run/checkpoint-3600"]
+    assert peft_loads == [("outputs/grpo/run/checkpoint-3600", "default", True)]
+    assert reference_loads == [("outputs/sft/adapter", "reference", False)]
+
+
 def test_reference_adapter_context_restores_policy_mode_and_freezes_reference() -> None:
     from rl_training.train_grpo_macorag import _reference_adapter_context
 
@@ -498,13 +1045,6 @@ def test_train_grpo_yaml_has_documented_sections() -> None:
         "# 运行环境",
     ]:
         assert heading in text
-
-
-def test_single_gpu_script_forces_hf_offline_mode() -> None:
-    script = Path("src/rl_single/run_train_grpo_single.sh").read_text(encoding="utf-8")
-
-    assert "HF_HUB_OFFLINE" in script
-    assert "TRANSFORMERS_OFFLINE" in script
 
 
 def test_linear_rag_query_engine_loads_sentence_transformer_offline(
@@ -686,8 +1226,10 @@ def test_train_grpo_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() 
         "top_p",
         "top_k",
         "retrieval_top_k",
-        "save_steps",
-        "logging_steps",
+            "save_steps",
+            "logging_steps",
+            "vllm_sync_after_step",
+            "vllm_sync_every_steps",
     ]:
         assert key in config
 
@@ -696,8 +1238,7 @@ def test_train_grpo_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() 
         "vllm_lora_adapter_path",
         "vllm_host",
         "vllm_port",
-        "vllm_sync_after_step",
-        "vllm_sync_trainable_only",
+            "vllm_sync_trainable_only",
         "vllm_timeout_seconds",
         "log_jsonl_path",
         "rollout_jsonl_path",
@@ -739,8 +1280,18 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "policy_forward_batch_count": 1,
         "reference_forward_batch_count": 1,
         "skipped_update_reason": None,
+        "did_optimizer_step": True,
         "gradient_norm": 2.5,
+        "gradient_norm_before_clip": 2.5,
+        "gradient_norm_after_clip": 1.0,
+        "gradient_was_clipped": True,
         "gradients_finite": True,
+        "server_hf_logprob_mae": 0.02,
+        "server_hf_logprob_max_abs": 0.08,
+        "preupdate_logratio_mean": 0.0,
+        "preupdate_logratio_max_abs": 0.0,
+        "ratio_mean": 1.0,
+        "ratio_p95": 1.0,
         "time_policy_forward_seconds": 2.0,
         "time_reference_forward_seconds": 1.5,
         "time_backward_seconds": 4.0,
@@ -770,6 +1321,7 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         time_initial_weight_sync_seconds=0.6,
         time_weight_sync_seconds=0.4,
         time_total_seconds=15.0,
+        successful_optimizer_updates=2,
     )
 
     assert payload["gold_answer"] == "Gold answer"
@@ -785,7 +1337,16 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
     assert payload["action_advantage_std"] == 0.75
     assert payload["clip_fraction"] == 0.125
     assert payload["gradient_norm"] == 2.5
+    assert payload["gradient_norm_before_clip"] == 2.5
+    assert payload["gradient_norm_after_clip"] == 1.0
+    assert payload["gradient_was_clipped"] is True
     assert payload["gradients_finite"] is True
+    assert payload["did_optimizer_step"] is True
+    assert payload["successful_optimizer_updates"] == 2
+    assert payload["server_hf_logprob_mae"] == 0.02
+    assert payload["server_hf_logprob_max_abs"] == 0.08
+    assert payload["preupdate_logratio_max_abs"] == 0.0
+    assert payload["ratio_mean"] == 1.0
     assert payload["trainable_action_count"] == 2
     assert payload["valid_completion_token_count"] == 7
     assert payload["timing"] == {
@@ -1097,6 +1658,8 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
                 "vllm_sync_every_steps: 4",
                 "vllm_sync_trainable_only: true",
                 "vllm_timeout_seconds: 90",
+                "vllm_generate_max_attempts: 4",
+                "vllm_generate_retry_backoff_seconds: 0.25",
                 'gpu_indices: "1"',
             ]
         ),
@@ -1118,6 +1681,8 @@ def test_parse_args_loads_vllm_generation_config(tmp_path: Path) -> None:
     assert args.vllm_sync_every_steps == 4
     assert args.vllm_sync_trainable_only is True
     assert args.vllm_timeout_seconds == 90
+    assert args.vllm_generate_max_attempts == 4
+    assert args.vllm_generate_retry_backoff_seconds == 0.25
     assert args.gpu_indices == "1"
 
 
@@ -1390,6 +1955,20 @@ class _FakeSession:
         )
 
 
+class _FailingGenerationSession:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.posts: list[tuple[str, dict]] = []
+        self.closed = False
+
+    def post(self, url: str, json: dict) -> _FakeResponse:
+        self.posts.append((url, json))
+        raise self.error
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def test_vllm_generation_client_batches_prompts_with_aligned_logprobs() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
@@ -1427,6 +2006,117 @@ def test_vllm_generation_client_batches_prompts_with_aligned_logprobs() -> None:
             },
         )
     ]
+
+
+def test_vllm_generation_retry_replaces_stale_session_after_connection_error() -> None:
+    import requests
+
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    initial = _FailingGenerationSession(requests.exceptions.ConnectionError("stale keep-alive"))
+    replacement = _FakeSession(
+        update_payload={"completion_ids": [[10]], "logprobs": [[-0.1]]}
+    )
+    backend.session = initial
+    backend.base_url = "http://127.0.0.1:8000"
+    sleeps: list[float] = []
+    client = VLLMGenerationClient(
+        host="127.0.0.1",
+        port=8000,
+        timeout_seconds=5,
+        max_generate_attempts=3,
+        retry_backoff_seconds=1.0,
+        backend=backend,
+        sleep_fn=sleeps.append,
+        session_factory=lambda: replacement,
+    )
+
+    outputs = client.generate_batch(
+        ["prompt"],
+        max_tokens=8,
+        temperature=0.7,
+        top_p=0.9,
+        top_k=5,
+    )
+
+    assert outputs[0].completion_ids == [10]
+    assert initial.closed is True
+    assert len(initial.posts) == 1
+    assert len(replacement.posts) == 1
+    assert backend.session is replacement
+    assert sleeps == [1.0]
+
+
+def test_vllm_generation_retry_exhaustion_reraises_transport_error() -> None:
+    import requests
+
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    sessions = [
+        _FailingGenerationSession(requests.exceptions.Timeout("attempt 1")),
+        _FailingGenerationSession(requests.exceptions.Timeout("attempt 2")),
+        _FailingGenerationSession(requests.exceptions.Timeout("attempt 3")),
+    ]
+    backend = _FakeTRLClient()
+    backend.session = sessions[0]
+    backend.base_url = "http://127.0.0.1:8000"
+    replacements = iter(sessions[1:])
+    sleeps: list[float] = []
+    client = VLLMGenerationClient(
+        host="127.0.0.1",
+        port=8000,
+        timeout_seconds=5,
+        max_generate_attempts=3,
+        retry_backoff_seconds=0.5,
+        backend=backend,
+        sleep_fn=sleeps.append,
+        session_factory=lambda: next(replacements),
+    )
+
+    with pytest.raises(requests.exceptions.Timeout, match="attempt 3"):
+        client.generate_batch(
+            ["prompt"],
+            max_tokens=8,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=5,
+        )
+
+    assert [len(session.posts) for session in sessions] == [1, 1, 1]
+    assert [session.closed for session in sessions] == [True, True, False]
+    assert sleeps == [0.5, 1.0]
+
+
+def test_vllm_generation_http_error_is_not_retried() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(update_status_code=500)
+    backend.base_url = "http://127.0.0.1:8000"
+    replacement_calls: list[bool] = []
+    client = VLLMGenerationClient(
+        host="127.0.0.1",
+        port=8000,
+        timeout_seconds=5,
+        max_generate_attempts=3,
+        retry_backoff_seconds=1.0,
+        backend=backend,
+        sleep_fn=lambda _: None,
+        session_factory=lambda: replacement_calls.append(True),
+    )
+
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        client.generate_batch(
+            ["prompt"],
+            max_tokens=8,
+            temperature=0.7,
+            top_p=0.9,
+            top_k=5,
+        )
+
+    assert len(backend.session.posts) == 1
+    assert replacement_calls == []
 
 
 def test_vllm_generation_client_rejects_misaligned_logprobs() -> None:
@@ -1651,6 +2341,7 @@ def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch()
             "model": "model/Qwen2.5-7B-Instruct",
             "lora_adapter_path": "outputs/adapter",
             "supports_lora_param_update": True,
+            "supports_prompt_seeds": True,
         }
     )
     backend.base_url = "http://127.0.0.1:8000"
@@ -1671,6 +2362,37 @@ def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch()
         raise AssertionError("expected LoRA server identity validation to fail")
 
 
+def test_vllm_generation_client_rejects_wrong_server_dtype() -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        health_payload={
+            "status": "ok",
+            "sync_mode": "lora",
+            "dtype": "auto",
+            "lora_name": "macorag_train",
+            "lora_int_id": 1,
+            "model": "model/Qwen2.5-7B-Instruct",
+            "lora_adapter_path": "outputs/adapter",
+            "supports_lora_param_update": True,
+            "supports_prompt_seeds": True,
+        }
+    )
+    backend.base_url = "http://127.0.0.1:8000"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8000, timeout_seconds=5, backend=backend)
+    args = Namespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        vllm_dtype="bfloat16",
+        vllm_lora_name="macorag_train",
+        vllm_lora_int_id=1,
+        vllm_lora_adapter_path="outputs/adapter",
+    )
+
+    with pytest.raises(SystemExit, match="dtype expected 'bfloat16' got 'auto'"):
+        client.validate_lora_server(args)
+
+
 def test_vllm_generation_client_validate_lora_server_rejects_unsupported_update_endpoint() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
@@ -1684,6 +2406,7 @@ def test_vllm_generation_client_validate_lora_server_rejects_unsupported_update_
             "model": "model/Qwen2.5-7B-Instruct",
             "lora_adapter_path": "outputs/adapter",
             "supports_lora_param_update": False,
+            "supports_prompt_seeds": True,
         },
     )
     backend.base_url = "http://127.0.0.1:8000"
@@ -1716,6 +2439,7 @@ def test_vllm_generation_client_validate_lora_server_accepts_health_capability_w
             "model": "model/Qwen2.5-7B-Instruct",
             "lora_adapter_path": "outputs/adapter",
             "supports_lora_param_update": True,
+            "supports_prompt_seeds": True,
         }
     )
     backend.base_url = "http://127.0.0.1:8000"
@@ -2020,11 +2744,11 @@ def test_vllm_shared_policy_generates_and_records_trace() -> None:
     assert action.advantage == 0.0
     assert action.completion_ids == [10, 11]
     assert action.response == "decoded response"
-    assert action.old_logprobs.shape == (2,)
+    assert action.old_logprobs.numel() == 0
     assert policy.timing["time_vllm_generate_seconds"] >= 0.0
 
 
-def test_vllm_shared_policy_batches_requests_and_uses_server_logprobs(monkeypatch) -> None:
+def test_vllm_shared_policy_keeps_server_logprobs_separate(monkeypatch) -> None:
     from rl_training.policy import PolicyGenerationRequest, RolloutTrace, VLLMSharedPolicy
     from rl_training.vllm_client import VLLMGenerationOutput
 
@@ -2074,13 +2798,57 @@ def test_vllm_shared_policy_batches_requests_and_uses_server_logprobs(monkeypatc
     assert responses == ["decoded response", "decoded response"]
     assert len(client.prompt_batches) == 1
     assert [trace.actions[0].completion_ids for trace in traces] == [[10, 11], [20]]
-    assert torch.equal(traces[0].actions[0].old_logprobs, torch.tensor([-0.1, -0.2]))
-    assert torch.equal(traces[1].actions[0].old_logprobs, torch.tensor([-0.3]))
+    assert traces[0].actions[0].old_logprobs.numel() == 0
+    assert traces[1].actions[0].old_logprobs.numel() == 0
+    assert torch.equal(traces[0].actions[0].server_logprobs, torch.tensor([-0.1, -0.2]))
+    assert torch.equal(traces[1].actions[0].server_logprobs, torch.tensor([-0.3]))
     assert [trace.actions[0].round_index for trace in traces] == [0, 0]
     assert policy.timing["time_behavior_rescore_seconds"] == 0.0
 
 
-def test_vllm_shared_policy_falls_back_to_hf_rescore_without_server_logprobs(monkeypatch) -> None:
+def test_behavior_rescore_overwrites_server_values_and_runs_eval(monkeypatch) -> None:
+    from rl_training.policy import GeneratedAction
+    from rl_training.train_grpo_macorag import _rescore_behavior_logprobs
+
+    model = _LogprobModel()
+    model.train()
+    observed_modes: list[bool] = []
+
+    def fake_batched_sequence_logprobs(*, model, completion_id_batches, **kwargs):
+        observed_modes.append(model.training)
+        values = torch.full((len(completion_id_batches), 1), -0.25)
+        return values, torch.ones_like(values, dtype=torch.bool)
+
+    monkeypatch.setattr(
+        "rl_training.train_grpo_macorag.batched_sequence_logprobs",
+        fake_batched_sequence_logprobs,
+    )
+    action = GeneratedAction(
+        role=AgentRole.QUERY_RETRIEVER,
+        prompt="prompt",
+        response="response",
+        prompt_ids=[1, 2],
+        completion_ids=[3],
+        old_logprobs=torch.tensor([-9.0]),
+        server_logprobs=torch.tensor([-9.0]),
+    )
+
+    diagnostics = _rescore_behavior_logprobs(
+        actions=[action],
+        model=model,
+        torch=torch,
+        device=torch.device("cpu"),
+        pad_token_id=0,
+        batch_size=1,
+    )
+
+    assert observed_modes == [False]
+    assert model.training is True
+    assert torch.equal(action.old_logprobs, torch.tensor([-0.25]))
+    assert diagnostics["server_hf_logprob_mae"] == pytest.approx(8.75)
+
+
+def test_vllm_shared_policy_defers_hf_rescore_without_server_logprobs(monkeypatch) -> None:
     from rl_training.policy import PolicyGenerationRequest, RolloutTrace, VLLMSharedPolicy
     from rl_training.vllm_client import VLLMGenerationOutput
 
@@ -2119,9 +2887,9 @@ def test_vllm_shared_policy_falls_back_to_hf_rescore_without_server_logprobs(mon
         traces=[trace],
     )
 
-    assert rescored == [[10, 11]]
-    assert torch.equal(trace.actions[0].old_logprobs, torch.tensor([-1.0, -2.0]))
-    assert policy.timing["time_behavior_rescore_seconds"] >= 0.0
+    assert rescored == []
+    assert trace.actions[0].old_logprobs.numel() == 0
+    assert policy.timing["time_behavior_rescore_seconds"] == 0.0
 
 
 def test_batched_rollout_one_round_batches_each_role_and_retrieval() -> None:
@@ -2374,9 +3142,10 @@ def test_rollout_group_uses_one_batched_executor_call(monkeypatch) -> None:
     args = Namespace(
         group_size=4,
         max_rounds=2,
-        query_local_credit_weight=0.75,
-        evidence_local_credit_weight=0.70,
-        answer_local_credit_weight=0.30,
+        query_global_reward_weight=1.0 / 3.0,
+        evidence_global_reward_weight=3.0 / 7.0,
+        answer_global_reward_weight=7.0 / 3.0,
+        advantage_epsilon=1.0e-8,
     )
 
     rollouts, timing = _rollout_group(
@@ -2415,8 +3184,20 @@ def test_train_on_rollouts_reports_optimizer_step_flag() -> None:
     args = type(
         "Args",
         (),
-        {"gradient_accumulation_steps": 1, "clip_epsilon": 0.2, "kl_beta": 0.0},
+        {
+            "gradient_accumulation_steps": 1,
+            "clip_epsilon": 0.2,
+            "kl_beta": 0.0,
+            "max_grad_norm": 1.0,
+        },
     )()
+    class Scheduler:
+        steps = 0
+
+        def step(self) -> None:
+            self.steps += 1
+
+    scheduler = Scheduler()
     action = type(
         "Action",
         (),
@@ -2439,9 +3220,16 @@ def test_train_on_rollouts_reports_optimizer_step_flag() -> None:
         torch=torch,
         device=torch.device("cpu"),
         should_step=True,
+        scheduler=scheduler,
     )
 
     assert metrics["did_optimizer_step"] is True
+    assert metrics["did_backward"] is True
+    assert metrics["preupdate_logratio_max_abs"] == pytest.approx(0.0)
+    assert metrics["ratio_mean"] == pytest.approx(1.0)
+    assert metrics["gradient_norm_before_clip"] is not None
+    assert metrics["gradient_norm_after_clip"] <= 1.0
+    assert scheduler.steps == 1
     assert "time_optimizer_step_seconds" in metrics
 
 
@@ -2569,7 +3357,24 @@ def test_run_train_grpo_script_derives_gpu_visibility_from_yaml() -> None:
     assert "NPROC_PER_NODE" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"' in script
     assert 'export MACORAG_SILENT_RETRIEVAL="${MACORAG_SILENT_RETRIEVAL:-1}"' in script
-    assert "--nproc_per_node=${NPROC_PER_NODE}" in script
+    assert '--nproc_per_node="${NPROC_PER_NODE}"' in script
+    assert '"${PYTHON:-python}" -m torch.distributed.run' in script
+
+
+def test_only_generic_grpo_resume_launcher_remains() -> None:
+    script = Path("scripts/run_train_grpo_resume.sh").read_text(encoding="utf-8")
+    fixed_resume = Path("scripts") / ("run_train_grpo_resume_" + "3600.sh")
+
+    assert not fixed_resume.exists()
+    assert "set -euo pipefail" in script
+    assert "CONFIG_PATH=" in script
+    assert 'bash "${SCRIPT_DIR}/run_train_grpo.sh"' in script
+    assert '--resume-from-checkpoint "${RESUME_CHECKPOINT}"' in script
+    assert '"$@"' in script
+    assert "2026-08-18_23-11-03" not in script
+    assert "RESUME_EPOCH" not in script
+    assert "RESUME_SAMPLES_CONSUMED" not in script
+    assert "RESUME_GLOBAL_STEP" not in script
 
 
 def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
@@ -2578,6 +3383,7 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
     assert "CONFIG_PATH=" in script
     assert "vllm_sync_mode" in script
     assert "vllm_gpu_indices" in script
+    assert "vllm_max_num_seqs" in script
     assert 'export CUDA_VISIBLE_DEVICES="${YAML_VLLM_GPU_INDICES}"' in script
     assert "trl vllm-serve" in script
     assert "rl_training.vllm_lora_server" in script
@@ -2590,6 +3396,8 @@ def test_run_grpo_vllm_server_script_uses_vllm_gpu_and_trl_server() -> None:
     assert "--port" in script
     assert "--tensor-parallel-size" in script
     assert "--gpu-memory-utilization" in script
+    assert "--max-num-seqs" in script
+    assert 'config.get("vllm_gpu_memory_utilization", 0.85)' in script
 
 
 def test_run_grpo_vllm_lora_server_script_removed_after_merging_into_main_launcher() -> None:
@@ -3038,15 +3846,20 @@ def test_compute_grpo_loss_uses_advantages_clipping_and_kl() -> None:
     assert metrics["policy_loss"] != 0.0
     assert metrics["kl"] >= 0.0
     assert metrics["loss"] == float(loss.item())
+    assert metrics["clip_fraction"] == pytest.approx(1.0 / 3.0)
+    assert metrics["preupdate_logratio_max_abs"] > 0.0
+    assert metrics["ratio_mean"] > 0.0
+    assert metrics["ratio_p95"] >= metrics["ratio_mean"]
 
 
-def test_assign_action_advantages_normalizes_by_role_and_round() -> None:
+def test_assign_action_advantages_normalizes_combined_returns_by_role_across_rounds() -> None:
     class Action:
         def __init__(self, role: AgentRole, round_index: int) -> None:
             self.role = role
             self.round_index = round_index
             self.local_reward = 0.0
             self.terminal_reward = 0.0
+            self.decision_return = 0.0
             self.advantage = 0.0
 
     first_q0 = Action(AgentRole.QUERY_RETRIEVER, 0)
@@ -3055,31 +3868,183 @@ def test_assign_action_advantages_normalizes_by_role_and_round() -> None:
     rollouts = [
         {
             "actions": [first_q0, first_q1],
-            "terminal_reward": 4.0,
+            "terminal_reward": 3.0,
             "action_rewards": [
-                {"role": "query_retriever", "round_index": 0, "local_reward": 1.0},
-                {"role": "query_retriever", "round_index": 1, "local_reward": 5.0},
+                {"role": "query_retriever", "round_index": 0, "local_reward": 0.0},
+                {"role": "query_retriever", "round_index": 1, "local_reward": 2.0},
             ],
         },
         {
             "actions": [second_q0],
-            "terminal_reward": 2.0,
+            "terminal_reward": 3.0,
             "action_rewards": [
-                {"role": "query_retriever", "round_index": 0, "local_reward": 3.0},
+                {"role": "query_retriever", "round_index": 0, "local_reward": 1.0},
             ],
         },
     ]
 
-    trainer_module.assign_action_advantages(
+    stats = trainer_module.assign_action_advantages(
         rollouts,
-        local_weights={"query_retriever": 0.75},
+        global_weights={"query_retriever": 1.0 / 3.0},
+        epsilon=1.0e-8,
     )
 
-    assert first_q0.local_reward == 1.0
-    assert first_q0.terminal_reward == 4.0
-    assert first_q0.advantage == -0.5
-    assert second_q0.advantage == 0.5
-    assert first_q1.advantage == 0.0
+    assert first_q0.local_reward == 0.0
+    assert first_q0.terminal_reward == 3.0
+    assert first_q0.decision_return == pytest.approx(1.0)
+    assert first_q1.decision_return == pytest.approx(3.0)
+    assert second_q0.decision_return == pytest.approx(2.0)
+    assert first_q0.advantage == pytest.approx(-1.224744856, rel=1e-6)
+    assert first_q1.advantage == pytest.approx(1.224744856, rel=1e-6)
+    assert second_q0.advantage == pytest.approx(0.0, abs=1e-7)
+    assert stats["query_retriever"]["count"] == 3
+    assert stats["query_retriever"]["mean"] == pytest.approx(2.0)
+
+
+def test_assign_action_advantages_keeps_roles_independent_and_zeroes_singletons() -> None:
+    class Action:
+        def __init__(self, role: AgentRole) -> None:
+            self.role = role
+            self.round_index = 0
+
+    query_low = Action(AgentRole.QUERY_RETRIEVER)
+    query_high = Action(AgentRole.QUERY_RETRIEVER)
+    evidence_only = Action(AgentRole.EVIDENCE_UPDATER)
+    rollouts = [
+        {
+            "actions": [query_low, evidence_only],
+            "terminal_reward": 0.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 0.0},
+                {"role": "evidence_updater", "round_index": 0, "local_reward": 9.0},
+            ],
+        },
+        {
+            "actions": [query_high],
+            "terminal_reward": 0.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 2.0},
+            ],
+        },
+    ]
+
+    stats = trainer_module.assign_action_advantages(
+        rollouts,
+        global_weights={
+            "query_retriever": 1.0 / 3.0,
+            "evidence_updater": 3.0 / 7.0,
+            "answer_generator": 7.0 / 3.0,
+        },
+    )
+
+    assert query_low.advantage == pytest.approx(-1.0)
+    assert query_high.advantage == pytest.approx(1.0)
+    assert evidence_only.advantage == 0.0
+    assert stats["evidence_updater"]["count"] == 1
+    assert stats["evidence_updater"]["advantage_std"] == 0.0
+
+
+def test_assign_action_advantages_can_normalize_by_role_and_round() -> None:
+    class Action:
+        def __init__(self, round_index: int) -> None:
+            self.role = AgentRole.QUERY_RETRIEVER
+            self.round_index = round_index
+
+    q0_low, q1_low, q0_high, q1_high = (Action(0), Action(1), Action(0), Action(1))
+    rollouts = [
+        {
+            "actions": [q0_low, q1_low],
+            "terminal_reward": 0.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 0.0},
+                {"role": "query_retriever", "round_index": 1, "local_reward": 10.0},
+            ],
+        },
+        {
+            "actions": [q0_high, q1_high],
+            "terminal_reward": 0.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 2.0},
+                {"role": "query_retriever", "round_index": 1, "local_reward": 12.0},
+            ],
+        },
+    ]
+
+    stats = trainer_module.assign_action_advantages(
+        rollouts,
+        global_weights={"query_retriever": 1.0},
+        granularity="role_round",
+    )
+
+    assert q0_low.advantage == pytest.approx(-1.0)
+    assert q0_high.advantage == pytest.approx(1.0)
+    assert q1_low.advantage == pytest.approx(-1.0)
+    assert q1_high.advantage == pytest.approx(1.0)
+    assert set(stats) == {"query_retriever@round=0", "query_retriever@round=1"}
+
+
+@pytest.mark.parametrize(
+    ("weights", "epsilon", "message"),
+    [
+        ({"query_retriever": float("nan")}, 1.0e-8, "must be finite"),
+        ({"query_retriever": 1.0}, 0.0, "positive finite"),
+    ],
+)
+def test_assign_action_advantages_rejects_invalid_normalization_config(
+    weights: dict[str, float],
+    epsilon: float,
+    message: str,
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        trainer_module.assign_action_advantages([], global_weights=weights, epsilon=epsilon)
+
+
+def test_batched_rollout_marks_final_answer_request_and_fallback_guess() -> None:
+    from rl_training.batched_rollout import run_batched_rollouts
+
+    answer_requests = []
+
+    class FakePolicy:
+        def generate_batch(self, requests, traces):
+            role = requests[0].role
+            if role == AgentRole.QUERY_RETRIEVER:
+                return [
+                    '<query-retriever>{"sub_goal":"find","query":"query"}</query-retriever>'
+                    for _ in requests
+                ]
+            if role == AgentRole.EVIDENCE_UPDATER:
+                return [
+                    '<update-evidence>{"selected_passage_ids":[]}</update-evidence>'
+                    for _ in requests
+                ]
+            answer_requests.extend(requests)
+            return [
+                (
+                    '<answer>{"can_answer":true,"answer":"guess",'
+                    '"rationale":"fallback_guess: insufficient evidence"}</answer>'
+                    if request.force_final_answer
+                    else '<answer>{"can_answer":false,"answer":null,"rationale":"wait"}</answer>'
+                )
+                for request in requests
+            ]
+
+    class FakeRetrievalEnv:
+        def query_batch(self, dataset, queries):
+            return [{"query": query, "passages": []} for query in queries]
+
+    [rollout] = run_batched_rollouts(
+        question="question",
+        dataset="hotpotqa",
+        group_size=1,
+        max_rounds=2,
+        policy=FakePolicy(),
+        retrieval_env=FakeRetrievalEnv(),
+    )
+
+    assert [request.force_final_answer for request in answer_requests] == [False, True]
+    assert rollout.result.final_answer == "guess"
+    assert rollout.result.trajectory[-1]["force_final_answer"] is True
+    assert rollout.result.trajectory[-1]["fallback_guess"] is True
 
 
 def test_policy_generate_disables_cache_for_gradient_checkpointing(monkeypatch) -> None:
@@ -3273,6 +4238,9 @@ def test_train_on_rollouts_uses_configured_action_microbatches(monkeypatch) -> N
     )
 
     assert forward_batch_sizes == [
+        (ANY, 2),
+        (ANY, 2),
+        (ANY, 1),
         ("ref", 4),
         ("ref", 1),
         ("train", 2),
@@ -3336,11 +4304,12 @@ def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypat
     )
 
     assert observations == [
+        ("default", False, True, False),
         ("reference", False, False, False),
-        ("default", True, True, False),
+        ("default", False, True, False),
     ]
     assert model.active_adapter == "default"
-    assert model.training is True
+    assert model.training is False
 
 
 def test_save_checkpoint_saves_only_policy_adapter(tmp_path: Path) -> None:
@@ -3407,6 +4376,7 @@ def test_train_on_rollouts_skips_zero_advantage_without_model_work(monkeypatch) 
 
     assert metrics["skipped_update_reason"] == "zero_advantage"
     assert metrics["did_optimizer_step"] is False
+    assert metrics["did_backward"] is False
     assert metrics["time_policy_forward_seconds"] == 0.0
     assert metrics["time_reference_forward_seconds"] == 0.0
 
@@ -3528,3 +4498,42 @@ def test_train_on_rollouts_uses_each_actions_own_advantage(monkeypatch) -> None:
     )
 
     assert captured_advantages == [-0.75, 0.5]
+
+
+def test_grpo_stage_and_scheduler_config_fields(tmp_path: Path) -> None:
+    config = tmp_path / "train.yml"
+    config.write_text(
+        "max_steps: 1000\n"
+        "run_until_step: 300\n"
+        "max_grad_norm: 1.0\n"
+        "lr_scheduler_type: cosine\n"
+        "warmup_ratio: 0.03\n"
+        "min_lr_ratio: 0.1\n",
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert (args.max_steps, args.run_until_step) == (1000, 300)
+    assert (args.max_grad_norm, args.lr_scheduler_type) == (1.0, "cosine")
+    assert (args.warmup_ratio, args.min_lr_ratio) == (0.03, 0.1)
+
+
+def test_run_step_limit_uses_operational_ceiling() -> None:
+    from rl_training.train_grpo_macorag import _run_step_limit
+
+    assert _run_step_limit(Namespace(max_steps=1000, run_until_step=300)) == 300
+    assert _run_step_limit(Namespace(max_steps=1000, run_until_step=0)) == 1000
+
+
+def test_first_300_and_resumed_700_are_disjoint() -> None:
+    from rl_training.data import epoch_sample_order
+
+    samples = [_sample(f"q-{index}", ("2wiki", "hotpotqa", "musique")[index % 3]) for index in range(1000)]
+    ordered = epoch_sample_order(samples, seed=42, epoch=1)
+    first = ordered[:300]
+    resumed = ordered[300:]
+
+    assert not ({item.qid for item in first} & {item.qid for item in resumed})
+    assert len(first) == 300
+    assert len(resumed) == 700

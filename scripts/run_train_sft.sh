@@ -31,5 +31,10 @@ PY
 export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"
 NPROC_PER_NODE="${YAML_NPROC_PER_NODE}"
 
+if [[ "${MACORAG_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
+  printf '[sft] config=%s CUDA_VISIBLE_DEVICES=%s nproc=%s\n' "${CONFIG_PATH}" "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}"
+  exit 0
+fi
+
 torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC_PER_NODE} \
   -m sft_training.train_sft_lora_macorag --config "${CONFIG_PATH}" "$@"

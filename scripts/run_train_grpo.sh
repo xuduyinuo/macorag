@@ -32,5 +32,31 @@ PY
 export CUDA_VISIBLE_DEVICES="${YAML_GPU_INDICES}"
 NPROC_PER_NODE="${YAML_NPROC_PER_NODE}"
 
-torchrun --standalone --nnodes=1 --nproc_per_node=${NPROC_PER_NODE} \
-  -m rl_training.train_grpo_macorag --config "${CONFIG_PATH}" "$@"
+SFT_ADAPTER_PATH="$("${PYTHON:-python}" - "${CONFIG_PATH}" <<'PY'
+import sys
+from pathlib import Path
+
+import yaml
+
+config = yaml.safe_load(Path(sys.argv[1]).read_text(encoding="utf-8")) or {}
+print(str(config.get("sft_adapter_path") or "").strip())
+PY
+)"
+if [[ -z "${SFT_ADAPTER_PATH}" ]]; then
+  printf 'Config key sft_adapter_path is required in %s.\n' "${CONFIG_PATH}" >&2
+  exit 2
+fi
+for required_file in adapter_config.json prompt_contract.json; do
+  if [[ ! -f "${SFT_ADAPTER_PATH}/${required_file}" ]]; then
+    printf 'Invalid SFT_ADAPTER_PATH=%s: missing %s\n' "${SFT_ADAPTER_PATH}" "${required_file}" >&2
+    exit 2
+  fi
+done
+
+if [[ "${MACORAG_LAUNCH_DRY_RUN:-0}" == "1" ]]; then
+  printf '[grpo] config=%s sft_adapter=%s CUDA_VISIBLE_DEVICES=%s nproc=%s\n' "${CONFIG_PATH}" "${SFT_ADAPTER_PATH}" "${CUDA_VISIBLE_DEVICES}" "${NPROC_PER_NODE}"
+  exit 0
+fi
+
+"${PYTHON:-python}" -m torch.distributed.run --standalone --nnodes=1 --nproc_per_node="${NPROC_PER_NODE}" \
+  -m rl_training.train_grpo_macorag --config "${CONFIG_PATH}" "$@" --sft-adapter-path "${SFT_ADAPTER_PATH}"

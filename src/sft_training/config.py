@@ -20,6 +20,10 @@ DATA_DEFAULTS: dict[str, Any] = {
     "max_length": 4096,
     "max_samples": None,
     "seed": 42,
+    "max_rounds": 4,
+    "retrieval_top_k": 5,
+    "prompt_config_path": "config/prompts.yml",
+    "require_teacher_provenance": False,
 }
 
 # LoRA 结构：保留常用 adapter 调参项。
@@ -43,10 +47,12 @@ OPTIM_DEFAULTS: dict[str, Any] = {
     "save_steps": 100,
     "max_steps": 0,
     "save_total_limit": 3,
+    "resume_from_checkpoint": None,
 }
 
 # 验证与早停：按原样驱动 validation split 和 EarlyStoppingCallback。
 EVAL_DEFAULTS: dict[str, Any] = {
+    "eval_strategy": "epoch",
     "eval_steps": 100,
     "eval_split_ratio": 0.05,
     "validation_split": True,
@@ -60,6 +66,7 @@ EVAL_DEFAULTS: dict[str, Any] = {
 RUNTIME_DEFAULTS: dict[str, Any] = {
     "fp16": False,
     "bf16": False,
+    "attn_implementation": "sdpa",
     "load_4bit": False,
     "disable_tqdm": False,
     "gpu_indices": "0,1",
@@ -123,6 +130,14 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--max-length", type=int, default=defaults["max_length"], help="Max input length after prompt+target tokenization.")
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"], help="Optional original-sample cap for smoke tests.")
     parser.add_argument("--seed", type=int, default=defaults["seed"], help="Random seed.")
+    parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
+    parser.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
+    parser.add_argument("--prompt-config-path", default=defaults["prompt_config_path"])
+    parser.add_argument(
+        "--require-teacher-provenance",
+        action=BooleanOptionalAction,
+        default=defaults["require_teacher_provenance"],
+    )
 
     parser.add_argument("--lora-r", type=int, default=defaults["lora_r"], help="LoRA rank.")
     parser.add_argument("--lora-alpha", type=int, default=defaults["lora_alpha"], help="LoRA alpha.")
@@ -138,9 +153,25 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=defaults["weight_decay"], help="Weight decay.")
     parser.add_argument("--logging-steps", type=int, default=defaults["logging_steps"], help="Logging interval.")
     parser.add_argument("--save-steps", type=int, default=defaults["save_steps"], help="Save interval.")
-    parser.add_argument("--eval-steps", type=int, default=defaults["eval_steps"], help="Eval interval. 0 disables eval.")
+    parser.add_argument(
+        "--eval-steps",
+        type=int,
+        default=defaults["eval_steps"],
+        help="Optimizer-step interval used only when eval_strategy=steps.",
+    )
+    parser.add_argument(
+        "--eval-strategy",
+        choices=("epoch", "steps"),
+        default=defaults["eval_strategy"],
+        help="Run validation once per epoch or at a fixed optimizer-step interval.",
+    )
     parser.add_argument("--max-steps", type=int, default=defaults["max_steps"], help="Optional max steps override.")
     parser.add_argument("--save-total-limit", type=int, default=defaults["save_total_limit"], help="Max checkpoints to keep.")
+    parser.add_argument(
+        "--resume-from-checkpoint",
+        default=defaults["resume_from_checkpoint"],
+        help="Resume a full SFT Trainer checkpoint in its existing run directory.",
+    )
     parser.add_argument("--eval-split-ratio", type=float, default=defaults["eval_split_ratio"], help="Validation split ratio by original samples.")
     parser.add_argument("--validation-split", action=BooleanOptionalAction, default=defaults["validation_split"], help="Enable train/validation split.")
     parser.add_argument("--early-stopping-patience", type=int, default=defaults["early_stopping_patience"], help="Stop after this many evals without improvement. 0 disables early stopping.")
@@ -149,6 +180,11 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--greater-is-better", action=BooleanOptionalAction, default=defaults["greater_is_better"], help="Whether the best-model metric should increase.")
     parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"], help="Use fp16.")
     parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"], help="Use bf16.")
+    parser.add_argument(
+        "--attn-implementation",
+        choices=("eager", "sdpa", "flash_attention_2"),
+        default=defaults["attn_implementation"],
+    )
     parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"], help="Enable 4-bit quantized loading (requires bitsandbytes).")
     parser.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"], help="Disable tqdm progress bars.")
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"], help="Comma-separated GPU indices exposed to the training process.")

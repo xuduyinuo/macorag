@@ -87,12 +87,8 @@ def _dry_run_summary(config: dict[str, Any]) -> dict[str, Any]:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Extract paired stratified MACORAG datasets")
-    parser.add_argument(
-        "--train-config", default="config/extract_stratified_train_v2.yml"
-    )
-    parser.add_argument(
-        "--eval-config", default="config/extract_stratified_eval_v2.yml"
-    )
+    parser.add_argument("--train-config", default="config/extract_train.yml")
+    parser.add_argument("--eval-config", default="config/extract_eval.yml")
     parser.add_argument("--repo-root", default=None)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")

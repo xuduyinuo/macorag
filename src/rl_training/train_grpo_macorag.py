@@ -1,25 +1,45 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib
+import importlib.util
+import json
 import math
 import os
 import random
 import statistics
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from rag import RAGLoopExecutor
 
 from .config import parse_args
+from prompt_config import load_prompt_contract
+from rag.protocol_metrics import ProtocolWindowMonitor, compute_protocol_metrics
 from .batched_rollout import run_batched_rollouts
+from .checkpointing import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_COMPLETE_FILE,
+    CHECKPOINT_MANIFEST_FILE,
+    fingerprint_config,
+    fingerprint_dataset,
+    load_full_checkpoint_metadata,
+    restore_full_training_state,
+    save_full_checkpoint,
+    validate_full_checkpoint_identity,
+)
 from .data import RLSample, epoch_sample_order, load_rl_samples, select_balanced_samples
 from .logging_utils import append_jsonl as _append_jsonl
 from .logging_utils import make_timestamped_run_dir
 from .logging_utils import write_json as _write_json
 from .policy import HFSharedPolicy, VLLMSharedPolicy, batched_sequence_logprobs
-from .retrieval import CachedLinearRAGRetrievalEnv
+from .retrieval import create_retrieval_env
+from .scheduling import build_cosine_scheduler
 from .rewards import compute_action_rewards, compute_rl_rewards
 from .runtime import extract_vllm_server_model_paths as _extract_vllm_server_model_paths
 from .runtime import parse_gpu_indices as _parse_gpu_indices
@@ -31,6 +51,18 @@ from .vllm_client import VLLMGenerationClient
 
 _POLICY_ADAPTER_NAME = "default"
 _REFERENCE_ADAPTER_NAME = "reference"
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    checkpoint_path: Path | None
+    epoch: int
+    samples_consumed: int
+    global_step: int
+    generation_counter: int = 0
+    is_full_checkpoint: bool = False
+    optimizer_state_restored: bool = False
+    rng_state_restored: bool = False
 
 
 def _configure_visible_gpus(args: Any) -> None:
@@ -85,8 +117,42 @@ def _torch_dtype(args: Any, torch: Any) -> Any:
     return torch.float16
 
 
+def _validate_acceleration_runtime(
+    args: Any,
+    torch: Any,
+    find_spec=importlib.util.find_spec,
+    import_module=importlib.import_module,
+) -> None:
+    if args.bf16 and args.fp16:
+        raise SystemExit("bf16 and fp16 cannot both be enabled.")
+    if args.attn_implementation == "flash_attention_2":
+        if find_spec("flash_attn") is None:
+            raise SystemExit(
+                "FlashAttention 2 requested but flash_attn is not installed in the active environment."
+            )
+        try:
+            flash_attn = import_module("flash_attn")
+            flash_attn_func = getattr(flash_attn, "flash_attn_func")
+            if not callable(flash_attn_func):
+                raise ImportError("flash_attn.flash_attn_func is not callable")
+        except (ImportError, OSError, AttributeError) as exc:
+            raise SystemExit(
+                "FlashAttention 2 requested but flash_attn could not be imported: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        if not torch.cuda.is_available():
+            raise SystemExit("FlashAttention 2 requested but CUDA is unavailable.")
+    if args.bf16 and _world_size() > 1 and torch.cuda.is_available():
+        torch.cuda.set_device(_local_rank())
+    if args.bf16 and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
+        raise SystemExit("bf16 requested but the selected CUDA device does not support bf16.")
+
+
 def _model_kwargs(args: Any, torch: Any, local_rank: int) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"torch_dtype": _torch_dtype(args, torch)}
+    kwargs: dict[str, Any] = {
+        "torch_dtype": _torch_dtype(args, torch),
+        "attn_implementation": args.attn_implementation,
+    }
     if not args.load_4bit:
         return kwargs
     try:
@@ -176,7 +242,9 @@ def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> 
     PeftModel = deps["PeftModel"]
     prepare_model_for_kbit_training = deps["prepare_model_for_kbit_training"]
 
-    tokenizer = AutoTokenizer.from_pretrained(args.sft_adapter_path, trust_remote_code=True)
+    resume_checkpoint = str(getattr(args, "resume_from_checkpoint", "") or "").strip()
+    policy_adapter_path = resume_checkpoint or args.sft_adapter_path
+    tokenizer = AutoTokenizer.from_pretrained(policy_adapter_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -193,7 +261,7 @@ def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> 
         )
     policy_model = PeftModel.from_pretrained(
         base_model,
-        args.sft_adapter_path,
+        policy_adapter_path,
         adapter_name=_POLICY_ADAPTER_NAME,
         is_trainable=True,
     )
@@ -211,6 +279,25 @@ def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> 
     if not args.load_4bit:
         policy_model.to(device)
     return tokenizer, policy_model, policy_model
+
+
+def _validate_sft_prompt_contract(args: Any) -> dict[str, Any]:
+    contract = load_prompt_contract(args.prompt_config_path)
+    metadata_path = Path(args.sft_adapter_path) / "prompt_contract.json"
+    if not metadata_path.is_file():
+        if args.require_sft_prompt_contract:
+            raise SystemExit(f"SFT adapter prompt contract metadata is missing: {metadata_path}")
+        return {}
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if str(metadata.get("prompt_contract_version")) != contract.version:
+        raise SystemExit("SFT adapter prompt contract version mismatch")
+    if str(metadata.get("prompt_contract_fingerprint")) != contract.fingerprint:
+        raise SystemExit("SFT adapter prompt contract fingerprint mismatch")
+    if int(metadata.get("max_rounds", -1)) != int(args.max_rounds):
+        raise SystemExit("SFT adapter max_rounds mismatch")
+    if int(metadata.get("retrieval_top_k", -1)) != int(args.retrieval_top_k):
+        raise SystemExit("SFT adapter retrieval_top_k mismatch")
+    return metadata
 
 
 def _wrap_ddp(model: Any, torch: Any) -> Any:
@@ -232,10 +319,126 @@ def _rank_samples(samples: list[RLSample]) -> list[tuple[int, RLSample]]:
     return [(index, sample) for index, sample in enumerate(samples) if index % world_size == rank]
 
 
-def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
-    return CachedLinearRAGRetrievalEnv(
+def _validate_resume_checkpoint(checkpoint_path: Path) -> None:
+    config_path = checkpoint_path / "adapter_config.json"
+    if not config_path.is_file():
+        raise SystemExit(f"GRPO resume checkpoint is missing adapter_config.json: {checkpoint_path}")
+    try:
+        from peft import PeftConfig
+
+        PeftConfig.from_pretrained(str(checkpoint_path))
+    except Exception as exc:
+        raise SystemExit(f"Invalid GRPO resume adapter config at {config_path}: {exc}") from exc
+
+    safetensors_path = checkpoint_path / "adapter_model.safetensors"
+    binary_path = checkpoint_path / "adapter_model.bin"
+    if not safetensors_path.is_file() and not binary_path.is_file():
+        raise SystemExit(f"GRPO resume checkpoint is missing adapter weights: {checkpoint_path}")
+    if safetensors_path.is_file():
+        try:
+            from safetensors import safe_open
+
+            with safe_open(str(safetensors_path), framework="pt", device="cpu") as handle:
+                if not list(handle.keys()):
+                    raise ValueError("no tensors found")
+        except Exception as exc:
+            raise SystemExit(f"Invalid GRPO resume adapter weights at {safetensors_path}: {exc}") from exc
+    elif binary_path.stat().st_size <= 0:
+        raise SystemExit(f"Invalid GRPO resume adapter weights at {binary_path}: empty file")
+
+
+def _resolve_resume_state(
+    args: Any,
+    *,
+    rank_epoch_size: int,
+    total_epochs: int,
+) -> ResumeState:
+    checkpoint_value = str(getattr(args, "resume_from_checkpoint", "") or "").strip()
+    resume_epoch = int(getattr(args, "resume_epoch", 1))
+    samples_consumed = int(getattr(args, "resume_samples_consumed", 0))
+    global_step = int(getattr(args, "resume_global_step", 0))
+    if not checkpoint_value:
+        if resume_epoch != 1 or samples_consumed != 0 or global_step != 0:
+            raise SystemExit("Resume position arguments require --resume-from-checkpoint.")
+        return ResumeState(checkpoint_path=None, epoch=1, samples_consumed=0, global_step=0)
+
+    checkpoint_path = Path(checkpoint_value)
+    if not checkpoint_path.is_dir():
+        raise SystemExit(f"GRPO resume checkpoint directory not found: {checkpoint_path}")
+    _validate_resume_checkpoint(checkpoint_path)
+    has_full_state_marker = (
+        (checkpoint_path / CHECKPOINT_MANIFEST_FILE).exists()
+        or (checkpoint_path / CHECKPOINT_COMPLETE_FILE).exists()
+    )
+    if has_full_state_marker:
+        manifest = load_full_checkpoint_metadata(checkpoint_path)
+        resume_epoch = int(manifest["epoch"])
+        samples_consumed = int(manifest["samples_consumed"])
+        global_step = int(manifest["global_step"])
+        generation_counter = int(manifest["generation_counter"])
+    else:
+        generation_counter = 0
+    if resume_epoch < 1 or resume_epoch > total_epochs:
+        raise SystemExit(f"resume_epoch must be between 1 and {total_epochs}, got {resume_epoch}.")
+    if samples_consumed < 0 or samples_consumed > rank_epoch_size:
+        raise SystemExit(
+            "resume_samples_consumed must be between 0 and the rank-local epoch size "
+            f"{rank_epoch_size}, got {samples_consumed}."
+        )
+    if global_step < 0:
+        raise SystemExit(f"resume_global_step must be non-negative, got {global_step}.")
+    return ResumeState(
+        checkpoint_path=checkpoint_path,
+        epoch=resume_epoch,
+        samples_consumed=samples_consumed,
+        global_step=global_step,
+        generation_counter=generation_counter,
+        is_full_checkpoint=has_full_state_marker,
+    )
+
+
+def _rank_samples_for_epoch(
+    samples: list[RLSample],
+    *,
+    seed: int,
+    epoch: int,
+    resume_state: ResumeState,
+) -> list[tuple[int, RLSample]]:
+    rank_samples = _rank_samples(epoch_sample_order(samples, seed=seed, epoch=epoch))
+    if resume_state.checkpoint_path is not None and epoch == resume_state.epoch:
+        return rank_samples[resume_state.samples_consumed :]
+    return rank_samples
+
+
+def _run_step_limit(args: Any) -> int:
+    run_until = int(getattr(args, "run_until_step", 0) or 0)
+    return run_until if run_until > 0 else int(getattr(args, "max_steps", 0) or 0)
+
+
+def _resume_meta_payload(resume_state: ResumeState) -> dict[str, Any]:
+    return {
+        "resume_from_checkpoint": (
+            str(resume_state.checkpoint_path) if resume_state.checkpoint_path is not None else None
+        ),
+        "resume_epoch": resume_state.epoch,
+        "resume_samples_consumed": resume_state.samples_consumed,
+        "resume_global_step": resume_state.global_step,
+        "generation_counter": resume_state.generation_counter,
+        "checkpoint_schema_version": (
+            CHECKPOINT_SCHEMA_VERSION if resume_state.is_full_checkpoint else None
+        ),
+        "optimizer_state_restored": resume_state.optimizer_state_restored,
+        "rng_state_restored": resume_state.rng_state_restored,
+    }
+
+
+def _build_retrieval_env(args: Any) -> Any:
+    return create_retrieval_env(
+        backend=getattr(args, "retrieval_backend", "linear_rag"),
         retrieval_root=args.retrieval_root,
         embedding_model=args.retrieval_embedding_model,
+        device=getattr(args, "retrieval_device", "cpu"),
+        max_length=getattr(args, "retrieval_max_length", 512),
         spacy_model=args.retrieval_spacy_model,
         top_k=args.retrieval_top_k,
         max_workers=args.retrieval_max_workers,
@@ -245,7 +448,13 @@ def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
     )
 
 
-def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedPolicy:
+def _build_policy(
+    args: Any,
+    raw_policy_model: Any,
+    tokenizer: Any,
+    *,
+    generation_counter: int = 0,
+) -> HFSharedPolicy:
     common = {
         "model": raw_policy_model,
         "tokenizer": tokenizer,
@@ -263,12 +472,19 @@ def _build_policy(args: Any, raw_policy_model: Any, tokenizer: Any) -> HFSharedP
         host=args.vllm_host,
         port=args.vllm_port,
         timeout_seconds=args.vllm_timeout_seconds,
+        max_generate_attempts=getattr(args, "vllm_generate_max_attempts", 3),
+        retry_backoff_seconds=getattr(args, "vllm_generate_retry_backoff_seconds", 1.0),
     )
     if getattr(args, "vllm_sync_mode", "dense") == "lora":
         client.validate_lora_server(args)
     else:
         client.check_server()
-    return VLLMSharedPolicy(vllm_client=client, **common)
+    return VLLMSharedPolicy(
+        vllm_client=client,
+        generation_seed=int(getattr(args, "seed", 0)) + (_local_rank() * 1_000_000),
+        generation_counter=int(generation_counter),
+        **common,
+    )
 
 
 def _sync_vllm_after_optimizer_step(
@@ -336,6 +552,33 @@ def _gradient_health(model: Any, *, torch: Any) -> tuple[float | None, bool | No
     )
     total_norm = torch.linalg.vector_norm(per_gradient_norms)
     return float(total_norm.item()), bool(torch.isfinite(total_norm).item())
+
+
+def _flush_pending_gradients_if_finite(
+    *,
+    raw_policy_model: Any,
+    optimizer: Any,
+    torch: Any,
+    sync_weights: Any,
+    scheduler: Any | None = None,
+    max_grad_norm: float = 1.0,
+) -> bool:
+    _, gradients_finite = _gradient_health(raw_policy_model, torch=torch)
+    if gradients_finite is False:
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    trainable_parameters = [
+        parameter
+        for parameter in raw_policy_model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    torch.nn.utils.clip_grad_norm_(trainable_parameters, float(max_grad_norm))
+    optimizer.step()
+    if scheduler is not None:
+        scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+    sync_weights()
+    return True
 
 
 def _rollout_group(
@@ -413,13 +656,15 @@ def _rollout_group(
     advantages = normalize_group_advantages([item["rewards"]["total"] for item in rollouts])
     for rollout, advantage in zip(rollouts, advantages):
         rollout["advantage"] = advantage
-    assign_action_advantages(
+    agent_credit_stats = assign_action_advantages(
         rollouts,
-        local_weights={
-            "query_retriever": float(getattr(args, "query_local_credit_weight", 0.75)),
-            "evidence_updater": float(getattr(args, "evidence_local_credit_weight", 0.70)),
-            "answer_generator": float(getattr(args, "answer_local_credit_weight", 0.30)),
+        global_weights={
+            "query_retriever": float(args.query_global_reward_weight),
+            "evidence_updater": float(args.evidence_global_reward_weight),
+            "answer_generator": float(args.answer_global_reward_weight),
         },
+        epsilon=float(args.advantage_epsilon),
+        granularity=str(getattr(args, "advantage_granularity", "role_only")),
     )
     time_reward_seconds += time.perf_counter() - reward_start
     retrieval_after = retrieval_stats() if callable(retrieval_stats) else {}
@@ -438,6 +683,67 @@ def _rollout_group(
         "retrieval_cache_misses": int(
             retrieval_after.get("cache_misses", 0) - retrieval_before.get("cache_misses", 0)
         ),
+        "agent_credit_stats": agent_credit_stats,
+    }
+
+
+def _rescore_behavior_logprobs(
+    *,
+    actions: list[Any],
+    model: Any,
+    torch: Any,
+    device: Any,
+    pad_token_id: int,
+    batch_size: int,
+) -> dict[str, float]:
+    if not actions:
+        return {
+            "server_hf_logprob_mae": 0.0,
+            "server_hf_logprob_max_abs": 0.0,
+        }
+    was_training = bool(getattr(model, "training", False))
+    if callable(getattr(model, "set_adapter", None)):
+        _activate_policy_adapter(model)
+    if callable(getattr(model, "eval", None)):
+        model.eval()
+    absolute_differences: list[Any] = []
+    try:
+        with torch.no_grad():
+            for offset in range(0, len(actions), max(1, int(batch_size))):
+                batch = actions[offset : offset + max(1, int(batch_size))]
+                values, mask = batched_sequence_logprobs(
+                    model=model,
+                    prompt_id_batches=[action.prompt_ids for action in batch],
+                    completion_id_batches=[action.completion_ids for action in batch],
+                    device=device,
+                    pad_token_id=pad_token_id,
+                )
+                for row, action in enumerate(batch):
+                    length = len(action.completion_ids)
+                    if not bool(mask[row, :length].all().item()):
+                        raise RuntimeError("Behavior completion mask is missing valid tokens.")
+                    rescored = values[row, :length].detach()
+                    if not bool(torch.isfinite(rescored).all().item()):
+                        raise RuntimeError("HF behavior rescore produced non-finite logprobs.")
+                    server = getattr(action, "server_logprobs", None)
+                    if server is not None:
+                        server = server.to(device=device)
+                        if server.numel() != length:
+                            raise ValueError("Server logprobs must align with completion tokens.")
+                        absolute_differences.append((server - rescored).abs().float())
+                    action.old_logprobs = rescored.cpu()
+    finally:
+        if callable(getattr(model, "train", None)):
+            model.train(was_training)
+    if not absolute_differences:
+        return {
+            "server_hf_logprob_mae": 0.0,
+            "server_hf_logprob_max_abs": 0.0,
+        }
+    differences = torch.cat(absolute_differences)
+    return {
+        "server_hf_logprob_mae": float(differences.mean().item()),
+        "server_hf_logprob_max_abs": float(differences.max().item()),
     }
 
 
@@ -452,6 +758,7 @@ def _train_on_rollouts(
     torch: Any,
     device: Any,
     should_step: bool,
+    scheduler: Any | None = None,
     pad_token_id: int = 0,
 ) -> dict[str, Any]:
     trainable_actions = [
@@ -467,13 +774,24 @@ def _train_on_rollouts(
         "policy_loss": 0.0,
         "kl": 0.0,
         "clip_fraction": 0.0,
+        "server_hf_logprob_mae": 0.0,
+        "server_hf_logprob_max_abs": 0.0,
+        "preupdate_logratio_mean": 0.0,
+        "preupdate_logratio_max_abs": 0.0,
+        "ratio_mean": 1.0,
+        "ratio_p95": 1.0,
         "trainable_action_count": action_count,
         "valid_completion_token_count": total_token_count,
         "policy_forward_batch_count": 0,
         "reference_forward_batch_count": 0,
+        "did_backward": False,
         "did_optimizer_step": False,
+        "did_clear_gradients": False,
         "skipped_update_reason": None,
         "gradient_norm": None,
+        "gradient_norm_before_clip": None,
+        "gradient_norm_after_clip": None,
+        "gradient_was_clipped": False,
         "gradients_finite": None,
         "time_policy_forward_seconds": 0.0,
         "time_reference_forward_seconds": 0.0,
@@ -498,15 +816,32 @@ def _train_on_rollouts(
         1,
         int(getattr(args, "reference_per_device_batch_size", microbatch_size)),
     )
+    behavior_diagnostics = _rescore_behavior_logprobs(
+        actions=[action for _, action in trainable_actions],
+        model=raw_policy_model,
+        torch=torch,
+        device=device,
+        pad_token_id=pad_token_id,
+        batch_size=microbatch_size,
+    )
+    if callable(getattr(raw_policy_model, "eval", None)):
+        raw_policy_model.eval()
+    if train_model is not raw_policy_model and callable(getattr(train_model, "eval", None)):
+        train_model.eval()
     loss_total = 0.0
     policy_loss_total = 0.0
     kl_total = 0.0
     clip_fraction_total = 0.0
+    preupdate_logratio_mean_total = 0.0
+    preupdate_logratio_max_abs = 0.0
+    ratio_mean_total = 0.0
+    ratio_p95_total = 0.0
     time_policy_forward_seconds = 0.0
     time_reference_forward_seconds = 0.0
     time_backward_seconds = 0.0
     time_optimizer_step_seconds = 0.0
     did_optimizer_step = False
+    did_clear_gradients = False
     reference_forward_batch_count = 0
     reference_by_action: list[Any] = []
     reference_forward_start = time.perf_counter()
@@ -579,15 +914,35 @@ def _train_on_rollouts(
         policy_loss_total += metrics["policy_loss"] * token_weight
         kl_total += metrics["kl"] * token_weight
         clip_fraction_total += metrics["clip_fraction"] * token_weight
+        preupdate_logratio_mean_total += metrics.get("preupdate_logratio_mean", 0.0) * token_weight
+        preupdate_logratio_max_abs = max(
+            preupdate_logratio_max_abs,
+            metrics.get("preupdate_logratio_max_abs", 0.0),
+        )
+        ratio_mean_total += metrics.get("ratio_mean", 1.0) * token_weight
+        ratio_p95_total += metrics.get("ratio_p95", 1.0) * token_weight
         backward_start = time.perf_counter()
         (loss * token_weight / gradient_accumulation_steps).backward()
         time_backward_seconds += time.perf_counter() - backward_start
     gradient_norm, gradients_finite = _gradient_health(raw_policy_model, torch=torch)
+    gradient_norm_after_clip = gradient_norm
     if should_step and gradients_finite is False:
         optimizer.zero_grad(set_to_none=True)
+        did_clear_gradients = True
     elif should_step:
+        parameter_source = getattr(raw_policy_model, "parameters", None)
+        trainable_parameters = [
+            parameter
+            for parameter in (parameter_source() if callable(parameter_source) else [])
+            if parameter.requires_grad and parameter.grad is not None
+        ]
+        max_grad_norm = float(getattr(args, "max_grad_norm", 1.0))
+        torch.nn.utils.clip_grad_norm_(trainable_parameters, max_grad_norm)
+        gradient_norm_after_clip, _ = _gradient_health(raw_policy_model, torch=torch)
         optimizer_start = time.perf_counter()
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
         optimizer.zero_grad(set_to_none=True)
         did_optimizer_step = True
         time_optimizer_step_seconds += time.perf_counter() - optimizer_start
@@ -596,15 +951,27 @@ def _train_on_rollouts(
         "policy_loss": policy_loss_total,
         "kl": kl_total,
         "clip_fraction": clip_fraction_total,
+        **behavior_diagnostics,
+        "preupdate_logratio_mean": preupdate_logratio_mean_total,
+        "preupdate_logratio_max_abs": preupdate_logratio_max_abs,
+        "ratio_mean": ratio_mean_total,
+        "ratio_p95": ratio_p95_total,
         "trainable_action_count": action_count,
         "valid_completion_token_count": total_token_count,
         "policy_forward_batch_count": policy_forward_batch_count,
         "reference_forward_batch_count": reference_forward_batch_count,
+        "did_backward": True,
         "did_optimizer_step": did_optimizer_step,
+        "did_clear_gradients": did_clear_gradients,
         "skipped_update_reason": (
             "nonfinite_gradients" if gradients_finite is False else None
         ),
         "gradient_norm": gradient_norm,
+        "gradient_norm_before_clip": gradient_norm,
+        "gradient_norm_after_clip": gradient_norm_after_clip,
+        "gradient_was_clipped": bool(
+            gradient_norm is not None and gradient_norm > float(getattr(args, "max_grad_norm", 1.0))
+        ),
         "gradients_finite": gradients_finite,
         "time_policy_forward_seconds": time_policy_forward_seconds,
         "time_reference_forward_seconds": time_reference_forward_seconds,
@@ -627,6 +994,46 @@ def _save_checkpoint(raw_policy_model: Any, tokenizer: Any, output_dir: Path, st
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _save_policy_adapter(raw_policy_model, checkpoint_dir)
     tokenizer.save_pretrained(checkpoint_dir)
+
+
+def _checkpoint_save_decision(
+    *,
+    global_step: int,
+    save_steps: int,
+    optimizer_safe_boundary: bool,
+    pending: bool,
+) -> tuple[bool, bool]:
+    due = bool(pending) or (
+        int(save_steps) > 0 and int(global_step) % int(save_steps) == 0
+    )
+    should_save = due and bool(optimizer_safe_boundary)
+    return should_save, False if should_save else due
+
+
+def _pending_gradients_after_sample(
+    *,
+    has_pending_gradients: bool,
+    metrics: dict[str, Any],
+) -> bool:
+    pending = bool(has_pending_gradients)
+    if metrics.get("did_backward"):
+        pending = True
+    if metrics.get("did_optimizer_step") or metrics.get("did_clear_gradients"):
+        pending = False
+    return pending
+
+
+def _run_final_checkpoint_actions(
+    *,
+    has_pending_gradients: bool,
+    checkpoint_pending: bool,
+    flush_pending_gradients: Any,
+    save_pending_checkpoint: Any,
+) -> None:
+    if has_pending_gradients:
+        flush_pending_gradients()
+    if checkpoint_pending:
+        save_pending_checkpoint()
 
 
 def _safe_dataset_name(dataset: str) -> str:
@@ -678,6 +1085,7 @@ def _build_train_metrics_payload(
     time_initial_weight_sync_seconds: float,
     time_weight_sync_seconds: float,
     time_total_seconds: float,
+    successful_optimizer_updates: int = 0,
 ) -> dict[str, Any]:
     reward_totals = [item["rewards"]["total"] for item in rollouts]
     action_advantages = [
@@ -702,9 +1110,20 @@ def _build_train_metrics_payload(
         "valid_completion_token_count": metrics.get("valid_completion_token_count", 0),
         "policy_forward_batch_count": metrics.get("policy_forward_batch_count", 0),
         "reference_forward_batch_count": metrics.get("reference_forward_batch_count", 0),
+        "did_optimizer_step": bool(metrics.get("did_optimizer_step", False)),
+        "successful_optimizer_updates": int(successful_optimizer_updates),
         "skipped_update_reason": metrics.get("skipped_update_reason"),
         "gradient_norm": metrics.get("gradient_norm"),
+        "gradient_norm_before_clip": metrics.get("gradient_norm_before_clip"),
+        "gradient_norm_after_clip": metrics.get("gradient_norm_after_clip"),
+        "gradient_was_clipped": bool(metrics.get("gradient_was_clipped", False)),
         "gradients_finite": metrics.get("gradients_finite"),
+        "server_hf_logprob_mae": metrics.get("server_hf_logprob_mae", 0.0),
+        "server_hf_logprob_max_abs": metrics.get("server_hf_logprob_max_abs", 0.0),
+        "preupdate_logratio_mean": metrics.get("preupdate_logratio_mean", 0.0),
+        "preupdate_logratio_max_abs": metrics.get("preupdate_logratio_max_abs", 0.0),
+        "ratio_mean": metrics.get("ratio_mean", 1.0),
+        "ratio_p95": metrics.get("ratio_p95", 1.0),
         "reward_total": reward_mean,
         "reward_group": {
             "min": min(reward_totals),
@@ -727,10 +1146,12 @@ def _build_train_metrics_payload(
         "action_advantage_std": (
             statistics.pstdev(action_advantages) if len(action_advantages) > 1 else 0.0
         ),
+        "agent_credit_stats": rollout_timing.get("agent_credit_stats", {}),
         "gold_answer": sample.answer,
         "generated_answer": best_rollout["final_answer"],
         "retrieval_count": len(best_rollout["trajectory"]),
         "parse_errors": best_rollout["parse_errors"],
+        "protocol_metrics": rollout_timing.get("protocol_metrics", {}),
         "learning_rate": learning_rate,
         "timing": {
             "rollout_seconds": rollout_timing["time_rollout_seconds"],
@@ -763,6 +1184,7 @@ def _action_credit_payload(action: Any) -> dict[str, Any]:
         "round_index": action.round_index,
         "local_reward": action.local_reward,
         "terminal_reward": action.terminal_reward,
+        "decision_return": getattr(action, "decision_return", 0.0),
         "advantage": action.advantage,
     }
 
@@ -809,6 +1231,20 @@ def _rollout_log_payload(
     return payload
 
 
+def _protocol_warning_event(
+    *,
+    step: int,
+    protocol_status: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not protocol_status.get("should_warn"):
+        return None
+    return {
+        "event": "protocol_warning",
+        "step": step,
+        "protocol_metrics": protocol_status,
+    }
+
+
 def _make_progress_bar(args: Any, total: int) -> Any:
     if not _is_main_process() or args.disable_tqdm:
         return None
@@ -827,13 +1263,24 @@ def _make_progress_bar(args: Any, total: int) -> Any:
 
 def main() -> None:
     args = parse_args()
+    sft_prompt_metadata = _validate_sft_prompt_contract(args)
+    active_prompt_contract = load_prompt_contract(args.prompt_config_path)
+    checkpoint_prompt_metadata = {
+        "prompt_contract_version": active_prompt_contract.version,
+        "prompt_contract_fingerprint": active_prompt_contract.fingerprint,
+        "max_rounds": int(args.max_rounds),
+        "retrieval_top_k": int(args.retrieval_top_k),
+        "sft_adapter_path": str(args.sft_adapter_path),
+    }
     _validate_vllm_gpu_placement(args)
     _configure_visible_gpus(args)
     deps = _load_training_dependencies()
     torch = deps["torch"]
     _setup_distributed(torch)
+    _validate_acceleration_runtime(args, torch)
     device = _device(torch)
     random.seed(args.seed + _local_rank())
+    np.random.seed(args.seed + _local_rank())
     torch.manual_seed(args.seed + _local_rank())
 
     samples, data_summary = load_rl_samples(
@@ -856,9 +1303,40 @@ def main() -> None:
         dataset: sum(sample.dataset == dataset for sample in samples)
         for dataset in sorted({sample.dataset for sample in samples})
     }
+    dataset_fingerprint = fingerprint_dataset(samples)
+    config_fingerprint = fingerprint_config(args)
+    total_epochs = max(1, int(math.ceil(args.num_train_epochs)))
+    resume_state = _resolve_resume_state(
+        args,
+        rank_epoch_size=len(_rank_samples(samples)),
+        total_epochs=total_epochs,
+    )
+    if resume_state.is_full_checkpoint:
+        try:
+            validate_full_checkpoint_identity(
+                resume_state.checkpoint_path,
+                expected_dataset_fingerprint=dataset_fingerprint,
+                expected_config_fingerprint=config_fingerprint,
+                expected_gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+                expected_world_size=_world_size(),
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
     if _is_main_process():
         print(f"Loaded {len(samples)} RL samples from {args.rl_data_root}")
         print(f"Counts by dataset: {data_summary['counts_by_dataset']}")
+        if resume_state.checkpoint_path is not None:
+            suffix = (
+                "full optimizer and RNG state will be restored."
+                if resume_state.is_full_checkpoint
+                else "optimizer state will be reinitialized (legacy warm start)."
+            )
+            print(
+                "Resuming policy from "
+                f"{resume_state.checkpoint_path} at epoch {resume_state.epoch}, "
+                f"after {resume_state.samples_consumed} samples, global step {resume_state.global_step}; "
+                f"{suffix}"
+            )
     if args.check_only:
         if _is_main_process():
             print("Check-only complete. No model training started.")
@@ -874,9 +1352,40 @@ def main() -> None:
         lr=args.learning_rate,
         weight_decay=args.weight_decay,
     )
+    training_step_horizon = (
+        int(args.max_steps)
+        if int(args.max_steps) > 0
+        else len(_rank_samples(samples)) * total_epochs
+    )
+    scheduler_total_updates = max(
+        1,
+        math.ceil(training_step_horizon / max(1, int(args.gradient_accumulation_steps))),
+    )
+    scheduler = build_cosine_scheduler(
+        optimizer,
+        total_updates=scheduler_total_updates,
+        warmup_ratio=float(args.warmup_ratio),
+        min_lr_ratio=float(args.min_lr_ratio),
+    )
+    scheduler_warmup_updates = int(math.ceil(scheduler_total_updates * float(args.warmup_ratio)))
+    successful_optimizer_updates = 0
+    optimization_contract = {
+        "max_grad_norm": float(args.max_grad_norm),
+        "logprob_source": "hf_rescore_v1",
+        "load_4bit": bool(args.load_4bit),
+        "bf16": bool(args.bf16),
+        "vllm_dtype": str(args.vllm_dtype),
+        "vllm_sync_mode": str(args.vllm_sync_mode),
+        "vllm_sync_every_steps": int(args.vllm_sync_every_steps),
+    }
     retrieval_env = _build_retrieval_env(args)
     retrieval_env.prewarm(sorted({sample.dataset for sample in samples}))
-    policy = _build_policy(args, raw_policy_model, tokenizer)
+    policy = _build_policy(
+        args,
+        raw_policy_model,
+        tokenizer,
+        generation_counter=resume_state.generation_counter,
+    )
     time_initial_weight_sync_seconds = _sync_vllm_before_first_rollout(
         policy,
         raw_policy_model,
@@ -885,28 +1394,88 @@ def main() -> None:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         torch.distributed.barrier()
 
+    if resume_state.is_full_checkpoint:
+        try:
+            restored_state = restore_full_training_state(
+                resume_state.checkpoint_path,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                torch_module=torch,
+                expected_dataset_fingerprint=dataset_fingerprint,
+                expected_config_fingerprint=config_fingerprint,
+                expected_gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+                expected_world_size=_world_size(),
+            )
+        except RuntimeError as exc:
+            raise SystemExit(str(exc)) from exc
+        if int(restored_state["generation_counter"]) != int(
+            getattr(policy, "generation_counter", 0)
+        ):
+            raise SystemExit("Restored vLLM generation counter does not match the policy state.")
+        resume_state = replace(
+            resume_state,
+            optimizer_state_restored=True,
+            rng_state_restored=True,
+        )
+        successful_optimizer_updates = int(
+            restored_state.get("successful_optimizer_updates", 0)
+        )
+
     base_output_dir = Path(args.output_root)
     output_dir = make_timestamped_run_dir(base_output_dir)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        shared_output = [str(output_dir) if _is_main_process() else None]
+        torch.distributed.broadcast_object_list(shared_output, src=0)
+        output_dir = Path(shared_output[0])
     log_path = output_dir / "train_metrics.jsonl"
     rollout_dir = output_dir / "rollout_samples"
     if _is_main_process():
         output_dir.mkdir(parents=True, exist_ok=True)
         _write_json(output_dir / "rl_dataset_summary.json", data_summary)
+        _write_json(output_dir / "resume_meta.json", _resume_meta_payload(resume_state))
         print(f"Run output directory: {output_dir}")
 
-    total_epochs = max(1, int(math.ceil(args.num_train_epochs)))
-    global_step = 0
-    progress_total = len(_rank_samples(samples)) * total_epochs
-    if args.max_steps > 0:
-        progress_total = min(progress_total, args.max_steps)
-    progress_bar = _make_progress_bar(args, progress_total)
-    try:
-        for epoch in range(1, total_epochs + 1):
-            rank_samples = _rank_samples(
-                epoch_sample_order(samples, seed=args.seed, epoch=epoch)
+    global_step = resume_state.global_step
+    progress_total = sum(
+        len(
+            _rank_samples_for_epoch(
+                samples,
+                seed=args.seed,
+                epoch=epoch,
+                resume_state=resume_state,
             )
-            for sample_index, sample in rank_samples:
-                if args.max_steps > 0 and global_step >= args.max_steps:
+        )
+        for epoch in range(resume_state.epoch, total_epochs + 1)
+    )
+    run_step_limit = _run_step_limit(args)
+    if run_step_limit > 0:
+        progress_total = min(progress_total, max(0, run_step_limit - global_step))
+    progress_bar = _make_progress_bar(args, progress_total)
+    checkpoint_pending = False
+    has_pending_gradients = False
+    protocol_monitor = ProtocolWindowMonitor(
+        window_size=100,
+        max_parse_failure_rate=0.02,
+        bad_windows_to_warn=2,
+    )
+    latest_protocol_status: dict[str, Any] = {"checkpoint_eligible": False}
+    last_epoch = resume_state.epoch
+    last_samples_consumed = resume_state.samples_consumed
+    try:
+        for epoch in range(resume_state.epoch, total_epochs + 1):
+            rank_samples = _rank_samples_for_epoch(
+                samples,
+                seed=args.seed,
+                epoch=epoch,
+                resume_state=resume_state,
+            )
+            consumed_before_epoch = (
+                resume_state.samples_consumed
+                if resume_state.checkpoint_path is not None and epoch == resume_state.epoch
+                else 0
+            )
+            for consumed_offset, (sample_index, sample) in enumerate(rank_samples, start=1):
+                if run_step_limit > 0 and global_step >= run_step_limit:
                     break
                 sample_start_time = time.perf_counter()
                 rollouts, rollout_timing = _rollout_group(
@@ -914,6 +1483,19 @@ def main() -> None:
                     sample=sample,
                     policy=policy,
                     retrieval_env=retrieval_env,
+                )
+                rollout_timing["protocol_metrics"] = compute_protocol_metrics(rollouts)
+                latest_protocol_status = protocol_monitor.add(rollouts)
+                protocol_warning = _protocol_warning_event(
+                    step=global_step,
+                    protocol_status=latest_protocol_status,
+                )
+                if protocol_warning is not None and _is_main_process():
+                    _append_jsonl(log_path, protocol_warning)
+                should_step = (
+                    (global_step + 1)
+                    % max(1, int(args.gradient_accumulation_steps))
+                    == 0
                 )
                 metrics = _train_on_rollouts(
                     rollouts=rollouts,
@@ -924,11 +1506,17 @@ def main() -> None:
                     args=args,
                     torch=torch,
                     device=device,
-                    should_step=(global_step + 1) % max(1, int(args.gradient_accumulation_steps)) == 0,
+                    should_step=should_step,
+                    scheduler=scheduler,
                     pad_token_id=int(tokenizer.pad_token_id or 0),
+                )
+                has_pending_gradients = _pending_gradients_after_sample(
+                    has_pending_gradients=has_pending_gradients,
+                    metrics=metrics,
                 )
                 time_weight_sync_seconds = 0.0
                 if metrics.get("did_optimizer_step"):
+                    successful_optimizer_updates += 1
                     time_weight_sync_seconds = _sync_vllm_after_optimizer_step(
                         policy,
                         raw_policy_model,
@@ -937,6 +1525,8 @@ def main() -> None:
                     )
                 time_total_seconds = time.perf_counter() - sample_start_time
                 global_step += 1
+                last_epoch = epoch
+                last_samples_consumed = consumed_before_epoch + consumed_offset
                 reward_totals = [item["rewards"]["total"] for item in rollouts]
                 best_rollout = max(rollouts, key=lambda item: item["rewards"]["total"])
                 if progress_bar is not None:
@@ -959,11 +1549,12 @@ def main() -> None:
                         metrics=metrics,
                         rollouts=rollouts,
                         best_rollout=best_rollout,
-                        learning_rate=args.learning_rate,
+                        learning_rate=float(optimizer.param_groups[0]["lr"]),
                         rollout_timing=rollout_timing,
                         time_initial_weight_sync_seconds=time_initial_weight_sync_seconds,
                         time_weight_sync_seconds=time_weight_sync_seconds,
                         time_total_seconds=time_total_seconds,
+                        successful_optimizer_updates=successful_optimizer_updates,
                     )
                     _append_jsonl(log_path, payload)
                     _append_jsonl(
@@ -977,27 +1568,112 @@ def main() -> None:
                             log_all_group_rollouts=bool(args.log_all_group_rollouts),
                         ),
                     )
-                if _is_main_process() and args.save_steps > 0 and global_step % args.save_steps == 0:
-                    _save_checkpoint(raw_policy_model, tokenizer, output_dir, global_step)
-            if args.max_steps > 0 and global_step >= args.max_steps:
+                should_save, checkpoint_pending = _checkpoint_save_decision(
+                    global_step=global_step,
+                    save_steps=int(args.save_steps),
+                    optimizer_safe_boundary=not has_pending_gradients,
+                    pending=checkpoint_pending,
+                )
+                if should_save:
+                    save_full_checkpoint(
+                        raw_policy_model=raw_policy_model,
+                        tokenizer=tokenizer,
+                        optimizer=optimizer,
+                        scheduler=scheduler,
+                        successful_optimizer_updates=successful_optimizer_updates,
+                        scheduler_total_updates=scheduler_total_updates,
+                        scheduler_warmup_updates=scheduler_warmup_updates,
+                        optimization_contract=optimization_contract,
+                        prompt_contract_metadata=checkpoint_prompt_metadata,
+                        output_dir=output_dir,
+                        step=global_step,
+                        epoch=epoch,
+                        samples_consumed=last_samples_consumed,
+                        generation_counter=int(getattr(policy, "generation_counter", 0)),
+                        gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+                        dataset_fingerprint=dataset_fingerprint,
+                        config_fingerprint=config_fingerprint,
+                        torch_module=torch,
+                        save_total_limit=int(args.save_total_limit),
+                        milestone_steps=int(args.save_milestone_steps),
+                    )
+            if run_step_limit > 0 and global_step >= run_step_limit:
                 break
     finally:
         if progress_bar is not None:
             progress_bar.close()
 
-    if global_step % max(1, int(args.gradient_accumulation_steps)) != 0:
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        _sync_vllm_after_optimizer_step(policy, raw_policy_model, args, completed_step=global_step)
+    def flush_pending_gradients() -> None:
+        nonlocal successful_optimizer_updates
+        stepped = _flush_pending_gradients_if_finite(
+            raw_policy_model=raw_policy_model,
+            optimizer=optimizer,
+            torch=torch,
+            scheduler=scheduler,
+            max_grad_norm=float(args.max_grad_norm),
+            sync_weights=lambda: _sync_vllm_after_optimizer_step(
+                policy,
+                raw_policy_model,
+                args,
+                completed_step=global_step,
+            ),
+        )
+        if stepped:
+            successful_optimizer_updates += 1
+
+    def save_pending_checkpoint() -> None:
+        save_full_checkpoint(
+            raw_policy_model=raw_policy_model,
+            tokenizer=tokenizer,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            successful_optimizer_updates=successful_optimizer_updates,
+            scheduler_total_updates=scheduler_total_updates,
+            scheduler_warmup_updates=scheduler_warmup_updates,
+            optimization_contract=optimization_contract,
+            prompt_contract_metadata=checkpoint_prompt_metadata,
+            output_dir=output_dir,
+            step=global_step,
+            epoch=last_epoch,
+            samples_consumed=last_samples_consumed,
+            generation_counter=int(getattr(policy, "generation_counter", 0)),
+            gradient_accumulation_steps=int(args.gradient_accumulation_steps),
+            dataset_fingerprint=dataset_fingerprint,
+            config_fingerprint=config_fingerprint,
+            torch_module=torch,
+            save_total_limit=int(args.save_total_limit),
+            milestone_steps=int(args.save_milestone_steps),
+        )
+
+    _run_final_checkpoint_actions(
+        has_pending_gradients=has_pending_gradients,
+        checkpoint_pending=checkpoint_pending,
+        flush_pending_gradients=flush_pending_gradients,
+        save_pending_checkpoint=save_pending_checkpoint,
+    )
 
     if _is_main_process():
         _save_policy_adapter(raw_policy_model, output_dir / "adapter")
         tokenizer.save_pretrained(output_dir / "adapter")
         _write_json(
+            output_dir / "adapter" / "prompt_contract.json",
+            {
+                "prompt_contract_version": active_prompt_contract.version,
+                "prompt_contract_fingerprint": active_prompt_contract.fingerprint,
+                "max_rounds": args.max_rounds,
+                "retrieval_top_k": args.retrieval_top_k,
+                "sft_adapter_path": args.sft_adapter_path,
+            },
+        )
+        _write_json(
             output_dir / "train_meta.json",
             {
                 "model_path": args.model_path,
                 "sft_adapter_path": args.sft_adapter_path,
+                "prompt_contract_version": active_prompt_contract.version,
+                "prompt_contract_fingerprint": active_prompt_contract.fingerprint,
+                "prompt_config_path": str(active_prompt_contract.source_path),
+                "sft_prompt_contract": sft_prompt_metadata,
                 "output_root": str(base_output_dir),
                 "output_dir": str(output_dir / "adapter"),
                 "rl_data_root": args.rl_data_root,
@@ -1007,9 +1683,10 @@ def main() -> None:
                 "max_rounds": args.max_rounds,
                 "kl_beta": args.kl_beta,
                 "clip_epsilon": args.clip_epsilon,
-                "query_local_credit_weight": args.query_local_credit_weight,
-                "evidence_local_credit_weight": args.evidence_local_credit_weight,
-                "answer_local_credit_weight": args.answer_local_credit_weight,
+                "query_global_reward_weight": args.query_global_reward_weight,
+                "evidence_global_reward_weight": args.evidence_global_reward_weight,
+                "answer_global_reward_weight": args.answer_global_reward_weight,
+                "advantage_epsilon": args.advantage_epsilon,
                 "world_size": _world_size(),
                 "global_step": global_step,
                 "log_jsonl_path": str(log_path),
@@ -1023,6 +1700,7 @@ def main() -> None:
                 "vllm_sync_mode": args.vllm_sync_mode,
                 "vllm_sync_every_steps": args.vllm_sync_every_steps,
                 "time_initial_weight_sync_seconds": time_initial_weight_sync_seconds,
+                "resume": _resume_meta_payload(resume_state),
                 "resolved_args": _resolved_args_payload(args),
                 "selected_qids": [sample.qid for sample in samples],
                 "selected_counts_by_dataset": {

@@ -38,8 +38,8 @@ PY
 
 export CUDA_VISIBLE_DEVICES="${EFFECTIVE_GPU_INDICES}"
 
-if [[ "${MACORAG_EVAL_DRY_RUN:-0}" == "1" ]]; then
-  printf 'CUDA_VISIBLE_DEVICES=%s\n' "${CUDA_VISIBLE_DEVICES}"
+if [[ "${MACORAG_LAUNCH_DRY_RUN:-${MACORAG_EVAL_DRY_RUN:-0}}" == "1" ]]; then
+  printf '[evaluation] config=%s CUDA_VISIBLE_DEVICES=%s\n' "${CONFIG_PATH}" "${CUDA_VISIBLE_DEVICES}"
   exit 0
 fi
 

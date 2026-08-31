@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from data_processing.extract_stratified_datasets import load_extraction_config, main
+from data_processing.extract_stratified_datasets import build_parser, load_extraction_config, main
 from data_processing.io_utils import write_jsonl
 from data_processing.stratified_extraction import (
     SelectionResult,
@@ -531,10 +531,10 @@ def test_cli_audits_existing_pair(tmp_path: Path, capsys) -> None:
 def test_production_configs_match_approved_contract() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     train = load_extraction_config(
-        repo_root / "config" / "extract_stratified_train_v2.yml", repo_root=repo_root
+        repo_root / "config" / "extract_train.yml", repo_root=repo_root
     )
     evaluation = load_extraction_config(
-        repo_root / "config" / "extract_stratified_eval_v2.yml", repo_root=repo_root
+        repo_root / "config" / "extract_eval.yml", repo_root=repo_root
     )
 
     assert train["seed"] == evaluation["seed"] == 20260826
@@ -560,26 +560,45 @@ def test_production_configs_match_approved_contract() -> None:
     }
 
 
-def test_opt_in_downstream_configs_use_only_v2_roots() -> None:
+def test_extraction_defaults_and_launcher_use_canonical_pair() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    args = build_parser().parse_args([])
+    script = (repo_root / "scripts" / "extract_datasets.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert args.train_config == "config/extract_train.yml"
+    assert args.eval_config == "config/extract_eval.yml"
+    assert "data_processing.extract_stratified_datasets" in script
+    assert "config/extract_train.yml" in script
+    assert "config/extract_eval.yml" in script
+    assert "data_processing.extract_trajectory_datasets" not in script
+
+
+def test_canonical_downstream_configs_use_only_stratified_roots() -> None:
     repo_root = Path(__file__).resolve().parents[1]
 
     train_retrieval = yaml.safe_load(
-        (repo_root / "config" / "build_retrieval_train_stratified_v2_e5.yml").read_text()
+        (repo_root / "config" / "retrieval_train.yml").read_text()
     )
     eval_retrieval = yaml.safe_load(
-        (repo_root / "config" / "build_retrieval_eval_stratified_v2_e5.yml").read_text()
+        (repo_root / "config" / "retrieval_eval.yml").read_text()
     )
     train_runtime = yaml.safe_load(
-        (repo_root / "config" / "train_grpo_stratified_v2.yml").read_text()
+        (repo_root / "config" / "train_grpo.yml").read_text()
     )
     eval_runtime = yaml.safe_load(
-        (repo_root / "config" / "eval_macorag_stratified_v2.yml").read_text()
+        (repo_root / "config" / "eval_macorag.yml").read_text()
     )
 
     assert train_retrieval["data_root"] == "data/rl_train_2000_stratified_v2"
     assert train_retrieval["retrieval_root"] == "data/rl_train_2000_stratified_v2_e5_faiss"
     assert eval_retrieval["data_root"] == "data/eval_1000_stratified_v2"
     assert eval_retrieval["retrieval_root"] == "data/eval_1000_stratified_v2_e5_faiss"
+    for config in (train_retrieval, eval_retrieval):
+        assert config["backend"] == "e5_faiss"
+        assert config["embedding_model"] == "intfloat/e5-base-v2"
+        assert config["device"] == "cpu"
     assert train_runtime["rl_data_root"] == "data/rl_train_2000_stratified_v2"
     assert train_runtime["retrieval_root"] == "data/rl_train_2000_stratified_v2_e5_faiss"
     assert train_runtime["max_samples"] == 2000

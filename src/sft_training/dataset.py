@@ -1,8 +1,29 @@
 from __future__ import annotations
 
+from array import array
+import hashlib
+import struct
+import sys
 from typing import Any
 
 from .data import TrajectoryRecord
+from rag.prompt_budget import PromptBudgetError, compact_tagged_json_prompt
+from prompt_config import DEFAULT_SYSTEM_PROMPT, system_prompt_for
+
+
+def _dataset_fingerprint(dataset: Any) -> str:
+    digest = hashlib.sha256()
+    digest.update(struct.pack("<Q", len(dataset)))
+    for index in range(len(dataset)):
+        row = dataset[index]
+        for key in ("input_ids", "labels"):
+            values = array("i", (int(value) for value in row[key]))
+            if sys.byteorder != "little":
+                values.byteswap()
+            digest.update(key.encode("ascii"))
+            digest.update(struct.pack("<Q", len(values)))
+            digest.update(values.tobytes())
+    return digest.hexdigest()
 
 
 def _tokenize_records(
@@ -16,12 +37,30 @@ def _tokenize_records(
     attention_rows: list[list[int]] = []
     label_rows: list[list[int]] = []
     for row in records:
-        prompt_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": row.prompt_text},
-        ]
-        prompt_tokens = tokenizer.apply_chat_template(prompt_messages, add_generation_prompt=True, tokenize=True)
+        active_system_prompt = (
+            system_prompt_for(row.agent_role)
+            if system_prompt == DEFAULT_SYSTEM_PROMPT and row.agent_role
+            else system_prompt
+        )
         target_tokens = tokenizer(row.target_text, add_special_tokens=False)["input_ids"]
+        prompt_budget = max_length - len(target_tokens) - 1
+
+        def encode_prompt(text: str) -> list[int]:
+            prompt_messages = [
+                {"role": "system", "content": active_system_prompt},
+                {"role": "user", "content": text},
+            ]
+            return list(tokenizer.apply_chat_template(prompt_messages, add_generation_prompt=True, tokenize=True))
+
+        try:
+            compacted = compact_tagged_json_prompt(
+                row.prompt_text,
+                token_count=lambda text: len(encode_prompt(text)),
+                max_tokens=prompt_budget,
+            )
+            prompt_tokens = encode_prompt(compacted.text)
+        except PromptBudgetError:
+            prompt_tokens = encode_prompt(row.prompt_text)
         if not isinstance(prompt_tokens, list) or not isinstance(target_tokens, list):
             continue
         input_ids = list(prompt_tokens) + list(target_tokens) + [tokenizer.eos_token_id]
@@ -90,9 +129,9 @@ def _pad_batch(features: list[dict[str, Any]], pad_token_id: int, max_length: in
         attention = feature["attention_mask"]
         label = feature["labels"]
         pad_len = max_len - len(input_ids)
-        padded_input.append(input_ids + [pad_token_id] * pad_len)
-        padded_attention.append(attention + [0] * pad_len)
-        padded_labels.append(label + [-100] * pad_len)
+        padded_input.append([pad_token_id] * pad_len + input_ids)
+        padded_attention.append([0] * pad_len + attention)
+        padded_labels.append([-100] * pad_len + label)
 
     return {
         "input_ids": torch.tensor(padded_input, dtype=torch.long),

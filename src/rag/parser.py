@@ -33,6 +33,23 @@ def parse_can_answer(value: Any) -> bool:
     raise ValueError("answer.can_answer must be a JSON boolean.")
 
 
+def validate_final_answer(answer: dict[str, Any]) -> None:
+    if answer.get("can_answer") is not True:
+        raise ValueError(
+            "final_answer_required: answer.can_answer must be true in the final round"
+        )
+    if not str(answer.get("answer") or "").strip():
+        raise ValueError(
+            "final_answer_required: answer.answer must be non-empty in the final round"
+        )
+
+
+def is_fallback_guess(answer: dict[str, Any]) -> bool:
+    return str(answer.get("rationale") or "").strip().casefold().startswith(
+        "fallback_guess:"
+    )
+
+
 def _require_string(
     payload: dict[str, Any],
     key: str,

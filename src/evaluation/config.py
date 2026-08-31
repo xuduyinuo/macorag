@@ -14,6 +14,12 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "data_files": (),
     "retrieval_root": "data/eval_1000_retrieval",
     "output_root": "outputs/eval_rag_model",
+    "output_dir": "",
+    "resume": False,
+    "manifest_meta_path": "",
+    "adapter_label": "",
+    "adapter_identity_path": "",
+    "prompt_config_path": "config/prompts.yml",
     # 推理采样。
     "max_samples": None,
     "max_rounds": 3,
@@ -23,23 +29,15 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "top_p": 0.95,
     "gpu_indices": "1",
     # 检索配置：retrieval_top_k 才是每次检索返回的段落数量。
-    "retrieval_embedding_model": "sentence-transformers/all-mpnet-base-v2",
+    "retrieval_backend": "e5_faiss",
+    "retrieval_embedding_model": "intfloat/e5-base-v2",
+    "retrieval_device": "cpu",
+    "retrieval_max_length": 512,
     "retrieval_spacy_model": "en_core_web_trf",
     "retrieval_top_k": 5,
     "retrieval_max_workers": 4,
     "retrieval_batch_size": 32,
     "use_vectorized_retrieval": True,
-    # 评测配置：默认继续使用百炼兼容 OpenAI 接口进行自动判分。
-    "skip_judge": False,
-    "judge_model": "qwen-plus",
-    "judge_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-    "judge_api_key_env": "DASHSCOPE_API_KEY",
-    "judge_temperature": 0.0,
-    "judge_max_tokens": 8,
-    "judge_timeout": 120,
-    "judge_retries": 3,
-    "judge_retry_sleep_seconds": 2.0,
-    "judge_workers": 4,
     # 推理服务：评估端只调用 OpenAI-compatible vLLM 服务，模型加载由服务端配置负责。
     "vllm_base_urls": (),
     "vllm_model": "",
@@ -91,6 +89,12 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--data-files", nargs="*", default=defaults["data_files"])
     parser.add_argument("--retrieval-root", default=defaults["retrieval_root"])
     parser.add_argument("--output-root", default=defaults["output_root"])
+    parser.add_argument("--output-dir", default=defaults["output_dir"])
+    parser.add_argument("--resume", action=BooleanOptionalAction, default=defaults["resume"])
+    parser.add_argument("--manifest-meta-path", default=defaults["manifest_meta_path"])
+    parser.add_argument("--adapter-label", default=defaults["adapter_label"])
+    parser.add_argument("--adapter-identity-path", default=defaults["adapter_identity_path"])
+    parser.add_argument("--prompt-config-path", default=defaults["prompt_config_path"])
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"])
     parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     parser.add_argument("--max-prompt-length", type=int, default=defaults["max_prompt_length"])
@@ -98,22 +102,15 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--temperature", type=float, default=defaults["temperature"])
     parser.add_argument("--top-p", type=float, default=defaults["top_p"])
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"])
+    parser.add_argument("--retrieval-backend", choices=("e5_faiss", "linear_rag"), default=defaults["retrieval_backend"])
     parser.add_argument("--retrieval-embedding-model", default=defaults["retrieval_embedding_model"])
+    parser.add_argument("--retrieval-device", default=defaults["retrieval_device"])
+    parser.add_argument("--retrieval-max-length", type=int, default=defaults["retrieval_max_length"])
     parser.add_argument("--retrieval-spacy-model", default=defaults["retrieval_spacy_model"])
     parser.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
     parser.add_argument("--retrieval-max-workers", type=int, default=defaults["retrieval_max_workers"])
     parser.add_argument("--retrieval-batch-size", type=int, default=defaults["retrieval_batch_size"])
     parser.add_argument("--use-vectorized-retrieval", action=BooleanOptionalAction, default=defaults["use_vectorized_retrieval"])
-    parser.add_argument("--skip-judge", action=BooleanOptionalAction, default=defaults["skip_judge"])
-    parser.add_argument("--judge-model", default=defaults["judge_model"])
-    parser.add_argument("--judge-endpoint", default=defaults["judge_endpoint"])
-    parser.add_argument("--judge-api-key-env", default=defaults["judge_api_key_env"])
-    parser.add_argument("--judge-temperature", type=float, default=defaults["judge_temperature"])
-    parser.add_argument("--judge-max-tokens", type=int, default=defaults["judge_max_tokens"])
-    parser.add_argument("--judge-timeout", type=int, default=defaults["judge_timeout"])
-    parser.add_argument("--judge-retries", type=int, default=defaults["judge_retries"])
-    parser.add_argument("--judge-retry-sleep-seconds", type=float, default=defaults["judge_retry_sleep_seconds"])
-    parser.add_argument("--judge-workers", type=int, default=defaults["judge_workers"])
     parser.add_argument("--vllm-base-urls", nargs="*", default=defaults["vllm_base_urls"])
     parser.add_argument("--vllm-model", default=defaults["vllm_model"])
     parser.add_argument("--vllm-api-key-env", default=defaults["vllm_api_key_env"])

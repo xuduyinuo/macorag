@@ -2,28 +2,34 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
 from rag import (
     AgentRole,
+    AnswerPromptContext,
     RAGLoopExecutor,
     RAGState,
     build_answer_generator_prompt,
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
 )
-from rl_training.retrieval import CachedLinearRAGRetrievalEnv
+from prompt_config import load_prompt_contract, system_prompt_for
+from rag.protocol_metrics import compute_protocol_metrics
+from rl_training.retrieval import create_retrieval_env
+from rl_training.retrieval import validate_retrieval_assets as validate_runtime_retrieval_assets
 
-from .bailian_evaluator import BailianJudgeClient, evaluate_predictions
 from .config import parse_args
 from .data import EvalSample, load_eval_samples
+from .local_evaluator import evaluate_predictions
 from .output import make_run_dir
 
 
@@ -35,7 +41,6 @@ except Exception:
         return iterable
 
 
-DEFAULT_SYSTEM_PROMPT = "Follow the role-specific prompt. Output exactly the requested XML-style tag with valid JSON."
 DEFAULT_SEED = 42
 
 
@@ -48,6 +53,138 @@ def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a JSON object in {path}")
+    return payload
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_fixed_manifest(
+    *,
+    args: Any,
+    samples: list[EvalSample],
+    sample_summary: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
+    meta_path_value = str(getattr(args, "manifest_meta_path", "") or "").strip()
+    if not meta_path_value:
+        return None, {}
+    meta_path = Path(meta_path_value)
+    meta = _read_json(meta_path)
+    source_files = [Path(value) for value in sample_summary.get("source_files", [])]
+    if len(source_files) != 1:
+        raise ValueError("Fixed evaluation requires exactly one manifest JSONL source file.")
+    manifest_path = source_files[0]
+    actual_fingerprint = _sha256_path(manifest_path)
+    if actual_fingerprint != meta.get("manifest_fingerprint"):
+        raise ValueError("Fixed evaluation manifest fingerprint does not match manifest_meta.json.")
+    actual_counts = dict(Counter(sample.dataset for sample in samples))
+    expected_counts = {str(key): int(value) for key, value in (meta.get("counts_by_dataset") or {}).items()}
+    if actual_counts != expected_counts:
+        raise ValueError(f"Fixed evaluation dataset counts mismatch: {actual_counts} != {expected_counts}")
+    actual_qids = [sample.qid for sample in samples]
+    if actual_qids != [str(value) for value in meta.get("qids", [])]:
+        raise ValueError("Fixed evaluation qid order does not match manifest metadata.")
+    expected_total = int(meta.get("per_dataset", 0)) * len(expected_counts)
+    if len(samples) != expected_total or int(sample_summary.get("skipped_samples", 0)) != 0:
+        raise ValueError("Fixed evaluation manifest contains missing or invalid samples.")
+    return actual_fingerprint, meta
+
+
+def _adapter_identity(args: Any) -> dict[str, Any]:
+    value = str(getattr(args, "adapter_identity_path", "") or "").strip()
+    if not value:
+        return {}
+    root = Path(value)
+    required = [root / "adapter_config.json", root / "prompt_contract.json"]
+    weights = [path for path in (root / "adapter_model.safetensors", root / "adapter_model.bin") if path.is_file()]
+    missing = [path for path in required if not path.is_file()]
+    if missing or len(weights) != 1:
+        raise ValueError(f"Invalid adapter identity path: {root}")
+    hashes = {path.name: _sha256_path(path) for path in [*required, weights[0]]}
+    serialized = json.dumps(hashes, sort_keys=True, separators=(",", ":"))
+    return {
+        "path": str(root),
+        "files": hashes,
+        "fingerprint": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    }
+
+
+def _retrieval_metadata_fingerprints(args: Any, datasets: list[str]) -> dict[str, str]:
+    root = Path(args.retrieval_root)
+    fingerprints = {}
+    for dataset in sorted(set(datasets)):
+        path = root / dataset / "index_metadata.json"
+        if path.is_file():
+            fingerprints[dataset] = _sha256_path(path)
+    return fingerprints
+
+
+def _build_evaluation_contract(
+    *,
+    args: Any,
+    prompt_contract: Any,
+    manifest_fingerprint: str | None,
+    datasets: list[str],
+) -> dict[str, Any]:
+    payload = {
+        "manifest_fingerprint": manifest_fingerprint,
+        "prompt_contract_fingerprint": prompt_contract.fingerprint,
+        "retrieval": {
+            "backend": getattr(args, "retrieval_backend", "linear_rag"),
+            "root": str(args.retrieval_root),
+            "embedding_model": args.retrieval_embedding_model,
+            "max_length": getattr(args, "retrieval_max_length", None),
+            "top_k": args.retrieval_top_k,
+            "index_metadata_fingerprints": _retrieval_metadata_fingerprints(args, datasets),
+        },
+        "generation": {
+            "model": getattr(args, "vllm_model", ""),
+            "max_rounds": args.max_rounds,
+            "max_prompt_length": args.max_prompt_length,
+            "max_completion_length": args.max_completion_length,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+        },
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["contract_fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    return payload
+
+
+def _prepare_resume_identity(
+    *,
+    output_dir: Path,
+    args: Any,
+    contract: dict[str, Any],
+    adapter_identity: dict[str, Any],
+) -> dict[str, Any]:
+    payload = {
+        "contract_fingerprint": contract["contract_fingerprint"],
+        "adapter_label": str(getattr(args, "adapter_label", "") or ""),
+        "adapter_fingerprint": adapter_identity.get("fingerprint"),
+    }
+    serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    payload["resume_fingerprint"] = hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+    path = output_dir / "resume_identity.json"
+    progress_exists = any(output_dir.glob("*/predictions.jsonl"))
+    if bool(getattr(args, "resume", False)) and progress_exists:
+        if not path.is_file() or _read_json(path) != payload:
+            raise ValueError("Existing fixed evaluation predictions do not match the requested resume identity.")
+    temporary = path.with_suffix(".json.tmp")
+    _write_json(temporary, payload)
+    temporary.replace(path)
+    return payload
 
 
 def _dataset_name_for_path(value: Any) -> str:
@@ -77,7 +214,7 @@ class VLLMOpenAIPolicy:
         base_urls: list[str] | tuple[str, ...],
         model: str,
         api_key_env: str,
-        system_prompt: str,
+        system_prompt: str | None,
         max_prompt_length: int | None,
         max_completion_length: int,
         temperature: float,
@@ -120,6 +257,8 @@ class VLLMOpenAIPolicy:
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
     ) -> str:
         if role == AgentRole.QUERY_RETRIEVER:
             return build_query_retriever_prompt(question=question, state=state)
@@ -129,7 +268,12 @@ class VLLMOpenAIPolicy:
                 state=state,
                 observation=observation or {"passages": []},
             )
-        return build_answer_generator_prompt(question=question, state=state)
+        return build_answer_generator_prompt(
+            question=question,
+            state=state,
+            context=answer_context,
+            force_final_answer=force_final_answer if answer_context is None else None,
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"Content-Type": "application/json"}
@@ -166,21 +310,31 @@ class VLLMOpenAIPolicy:
         question: str,
         state: RAGState,
         observation: dict[str, Any] | None = None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
     ) -> str:
         role = AgentRole(role)
-        prompt = self._prompt_for(role=role, question=question, state=state, observation=observation)
+        prompt = self._prompt_for(
+            role=role,
+            question=question,
+            state=state,
+            observation=observation,
+            answer_context=answer_context,
+            force_final_answer=force_final_answer,
+        )
         payload = {
             "model": self.model,
             "messages": [
-                {"role": "system", "content": self.system_prompt},
+                {
+                    "role": "system",
+                    "content": self.system_prompt if self.system_prompt is not None else system_prompt_for(role),
+                },
                 {"role": "user", "content": prompt},
             ],
             "temperature": self.temperature,
             "top_p": self.top_p,
             "max_tokens": self.max_completion_length,
         }
-        if self.max_prompt_length is not None and int(self.max_prompt_length) > 0:
-            payload["truncate_prompt_tokens"] = int(self.max_prompt_length)
         response = self._post_chat_completion(payload)
         try:
             return str(response["choices"][0]["message"]["content"])
@@ -197,7 +351,7 @@ def format_prediction(sample: EvalSample, result: Any, error: str | None = None)
         "gold_answer": sample.answer,
         "answer_aliases": sample.answer_aliases,
         "trajectory": [] if error else list(result.trajectory),
-        "parse_errors": [] if error else list(result.parse_errors),
+        "parse_errors": [f"evaluation_error: {error}"] if error else list(result.parse_errors),
         "retrieval_count": 0 if error else int(getattr(result.state, "retrieval_count", 0)),
     }
     if error is not None:
@@ -274,12 +428,36 @@ def run_predictions(
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     progress_path = output_dir / "predictions.jsonl"
-    if progress_path.exists():
+    resume = bool(getattr(args, "resume", False))
+    if progress_path.exists() and not resume:
         progress_path.unlink()
     predictions_json_path = output_dir / "predictions.json"
     if predictions_json_path.exists():
         predictions_json_path.unlink()
     predictions_by_index: dict[int, dict[str, Any]] = {}
+    sample_index_by_qid = {sample.qid: index for index, sample in enumerate(samples)}
+    if resume and progress_path.exists():
+        seen: set[str] = set()
+        with progress_path.open("r", encoding="utf-8") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                prediction = json.loads(line)
+                qid = str(prediction.get("qid") or "")
+                if qid in seen:
+                    raise ValueError(f"Duplicate resumed prediction qid: {qid}")
+                if qid not in sample_index_by_qid:
+                    raise ValueError(f"Unknown resumed prediction qid: {qid}")
+                sample = samples[sample_index_by_qid[qid]]
+                if (
+                    str(prediction.get("dataset")) != sample.dataset
+                    or str(prediction.get("question")) != sample.question
+                    or str(prediction.get("gold_answer")) != sample.answer
+                ):
+                    raise ValueError(f"Resumed prediction contract mismatch for qid: {qid}")
+                seen.add(qid)
+                predictions_by_index[sample_index_by_qid[qid]] = prediction
+    pending = [(index, sample) for index, sample in enumerate(samples) if index not in predictions_by_index]
     eval_workers = max(1, int(getattr(args, "eval_request_workers", 1) or 1))
     use_threads = eval_workers > 1
     if use_threads:
@@ -294,7 +472,7 @@ def run_predictions(
                     policy=policy,
                     retrieval_env=retrieval_env,
                 )
-                for index, sample in enumerate(samples)
+                for index, sample in pending
             ]
             iterator = tqdm(
                 as_completed(futures),
@@ -310,12 +488,13 @@ def run_predictions(
                     _append_jsonl(progress_path, prediction)
     else:
         iterator = tqdm(
-            samples,
+            pending,
+            total=len(pending),
             desc="Evaluating RAG samples",
             unit="sample",
             disable=bool(getattr(args, "disable_tqdm", False)),
         )
-        for index, sample in enumerate(iterator):
+        for index, sample in iterator:
             _, prediction = _run_one_prediction(
                 index=index,
                 sample=sample,
@@ -326,6 +505,11 @@ def run_predictions(
             predictions_by_index[index] = prediction
             _append_jsonl(progress_path, prediction)
     predictions = [predictions_by_index[index] for index in range(len(samples))]
+    temporary_path = progress_path.with_suffix(".jsonl.tmp")
+    with temporary_path.open("w", encoding="utf-8") as file:
+        for prediction in predictions:
+            file.write(json.dumps(prediction, ensure_ascii=False) + "\n")
+    temporary_path.replace(progress_path)
     return predictions
 
 
@@ -341,7 +525,7 @@ def _load_policy(args: Any) -> VLLMOpenAIPolicy:
         base_urls=list(getattr(args, "vllm_base_urls", []) or []),
         model=getattr(args, "vllm_model", ""),
         api_key_env=getattr(args, "vllm_api_key_env", ""),
-        system_prompt=getattr(args, "system_prompt", DEFAULT_SYSTEM_PROMPT),
+        system_prompt=getattr(args, "system_prompt", None),
         max_prompt_length=getattr(args, "max_prompt_length", 4096),
         max_completion_length=args.max_completion_length,
         temperature=args.temperature,
@@ -352,10 +536,13 @@ def _load_policy(args: Any) -> VLLMOpenAIPolicy:
     )
 
 
-def _build_retrieval_env(args: Any) -> CachedLinearRAGRetrievalEnv:
-    return CachedLinearRAGRetrievalEnv(
+def _build_retrieval_env(args: Any) -> Any:
+    return create_retrieval_env(
+        backend=getattr(args, "retrieval_backend", "linear_rag"),
         retrieval_root=args.retrieval_root,
         embedding_model=args.retrieval_embedding_model,
+        device=getattr(args, "retrieval_device", "cpu"),
+        max_length=getattr(args, "retrieval_max_length", 512),
         spacy_model=args.retrieval_spacy_model,
         top_k=args.retrieval_top_k,
         max_workers=args.retrieval_max_workers,
@@ -385,6 +572,11 @@ def validate_retrieval_assets(retrieval_root: str | Path, datasets: list[str] | 
 
 
 def _resolved_output_dir(args: Any) -> Path:
+    explicit = str(getattr(args, "output_dir", "") or "").strip()
+    if explicit:
+        path = Path(explicit)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     return make_run_dir(args.output_root)
 
 
@@ -404,53 +596,92 @@ def main(argv: list[str] | None = None) -> int:
 
     random.seed(DEFAULT_SEED)
     output_dir = _resolved_output_dir(args)
-    _write_json(output_dir / "run_config.json", _args_to_jsonable(args))
-
+    prompt_contract = load_prompt_contract(getattr(args, "prompt_config_path", None))
     samples, sample_summary = load_eval_samples(
         data_root=args.data_root,
         data_files=list(args.data_files or []),
         max_samples=args.max_samples,
     )
+    manifest_fingerprint, manifest_meta = _validate_fixed_manifest(
+        args=args,
+        samples=samples,
+        sample_summary=sample_summary,
+    )
+    adapter_identity = _adapter_identity(args)
+    contract_payload = _build_evaluation_contract(
+        args=args,
+        prompt_contract=prompt_contract,
+        manifest_fingerprint=manifest_fingerprint,
+        datasets=[sample.dataset for sample in samples],
+    )
+    resume_identity = _prepare_resume_identity(
+        output_dir=output_dir,
+        args=args,
+        contract=contract_payload,
+        adapter_identity=adapter_identity,
+    )
+    run_config = _args_to_jsonable(args)
+    run_config.update(
+        {
+            "prompt_contract_version": prompt_contract.version,
+            "prompt_contract_fingerprint": prompt_contract.fingerprint,
+            "prompt_config_path": str(prompt_contract.source_path),
+            "manifest_fingerprint": manifest_fingerprint,
+            "adapter_identity": adapter_identity,
+            "resume_identity": resume_identity,
+        }
+    )
+    _write_json(output_dir / "run_config.json", run_config)
     _write_json(output_dir / "data_summary.json", sample_summary)
-    validate_retrieval_assets(args.retrieval_root, [sample.dataset for sample in samples])
+    validate_runtime_retrieval_assets(
+        backend=getattr(args, "retrieval_backend", "linear_rag"),
+        retrieval_root=args.retrieval_root,
+        datasets=[sample.dataset for sample in samples],
+        embedding_model=args.retrieval_embedding_model,
+    )
     policy = _load_policy(args)
     retrieval_env = _build_retrieval_env(args)
 
-    client = None
-    judge_metadata = None
-    if not args.skip_judge:
-        client = BailianJudgeClient(
-            model=args.judge_model,
-            endpoint=args.judge_endpoint,
-            api_key_env=args.judge_api_key_env,
-            temperature=args.judge_temperature,
-            max_tokens=args.judge_max_tokens,
-            timeout=args.judge_timeout,
-            retries=args.judge_retries,
-            retry_sleep_seconds=args.judge_retry_sleep_seconds,
-        )
-        judge_metadata = {
-            "judge_model": args.judge_model,
-            "judge_endpoint": args.judge_endpoint,
-            "judge_api_key_env": args.judge_api_key_env,
-            "judge_temperature": args.judge_temperature,
-            "judge_max_tokens": args.judge_max_tokens,
-            "judge_timeout": args.judge_timeout,
-            "judge_retries": args.judge_retries,
-            "judge_retry_sleep_seconds": args.judge_retry_sleep_seconds,
-            "judge_workers": args.judge_workers,
-        }
-
+    dataset_metrics: dict[str, dict[str, Any]] = {}
+    all_predictions: list[dict[str, Any]] = []
     for dataset, dataset_samples in _group_samples_by_dataset(samples):
         dataset_dir = _dataset_output_dir(output_dir, dataset)
-        run_predictions(args, dataset_samples, policy, retrieval_env, dataset_dir)
-        if client is not None:
-            evaluate_predictions(
-                dataset_dir / "predictions.jsonl",
-                client=client,
-                max_workers=args.judge_workers,
-                judge_metadata=judge_metadata,
-            )
+        predictions = run_predictions(args, dataset_samples, policy, retrieval_env, dataset_dir)
+        protocol_metrics = compute_protocol_metrics(
+            [
+                {"trajectory": item.get("trajectory", []), "parse_errors": item.get("parse_errors", [])}
+                for item in predictions
+            ]
+        )
+        protocol_metrics["error_count"] = sum(bool(item.get("error")) for item in predictions)
+        protocol_metrics["error_rate"] = (
+            protocol_metrics["error_count"] / len(predictions) if predictions else 0.0
+        )
+        _write_json(dataset_dir / "protocol_metrics.json", protocol_metrics)
+        dataset_metrics[dataset] = evaluate_predictions(dataset_dir / "predictions.jsonl")
+        all_predictions.extend(predictions)
+
+    aggregate_metrics = {
+        "macro_f1": sum(item["f1"] for item in dataset_metrics.values()) / len(dataset_metrics),
+        "datasets": dataset_metrics,
+        "num_samples": len(all_predictions),
+    }
+    aggregate_protocol = compute_protocol_metrics(
+        [
+            {"trajectory": item.get("trajectory", []), "parse_errors": item.get("parse_errors", [])}
+            for item in all_predictions
+        ]
+    )
+    aggregate_protocol["error_count"] = sum(bool(item.get("error")) for item in all_predictions)
+    aggregate_protocol["error_rate"] = (
+        aggregate_protocol["error_count"] / len(all_predictions) if all_predictions else 0.0
+    )
+    contract_payload["adapter_label"] = str(getattr(args, "adapter_label", "") or "")
+    contract_payload["adapter_identity"] = adapter_identity
+    contract_payload["manifest_meta"] = manifest_meta
+    _write_json(output_dir / "aggregate_metrics.json", aggregate_metrics)
+    _write_json(output_dir / "aggregate_protocol_metrics.json", aggregate_protocol)
+    _write_json(output_dir / "evaluation_contract.json", contract_payload)
 
     print(f"Evaluation artifacts written to {output_dir}")
     return 0

@@ -3,9 +3,11 @@ from __future__ import annotations
 import pytest
 
 from rag import (
+    AnswerPromptContext,
     AgentRole,
     RAGLoopExecutor,
     RAGState,
+    advance_rag_state,
     build_answer_generator_prompt,
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
@@ -165,6 +167,37 @@ def test_agent_prompts_use_dedicated_english_templates() -> None:
     assert "<observation>" not in prompts[2]
 
 
+def test_final_answer_prompt_requires_nonempty_fallback_guess() -> None:
+    state = RAGState(question="Who directed Bullitt?")
+
+    prompt = build_answer_generator_prompt(
+        question=state.question,
+        state=state,
+        force_final_answer=True,
+    )
+
+    assert "can_answer=true" in prompt
+    assert "non-empty" in prompt
+    assert "fallback_guess:" in prompt
+    assert "can_answer=false" not in prompt
+
+
+def test_answer_prompt_context_derives_finality_and_remaining_rounds() -> None:
+    normal = AnswerPromptContext(round_index=1, max_rounds=4)
+    final = AnswerPromptContext(round_index=3, max_rounds=4)
+
+    assert normal.is_final_round is False
+    assert normal.remaining_rounds == 2
+    assert final.is_final_round is True
+    assert final.remaining_rounds == 0
+
+
+@pytest.mark.parametrize("round_index,max_rounds", [(-1, 4), (0, 0), (4, 4)])
+def test_answer_prompt_context_rejects_invalid_rounds(round_index: int, max_rounds: int) -> None:
+    with pytest.raises(ValueError, match="round"):
+        AnswerPromptContext(round_index=round_index, max_rounds=max_rounds)
+
+
 def test_rag_executor_reuses_one_policy_for_both_agent_roles() -> None:
     class FakePolicy:
         def __init__(self) -> None:
@@ -251,6 +284,35 @@ def test_rag_executor_continues_after_string_false_is_canonicalized() -> None:
     assert result.final_answer == "done"
 
 
+def test_rag_executor_rejects_false_answer_in_final_round() -> None:
+    class FakePolicy:
+        def generate(self, *, role, question, state, observation=None, answer_context=None):
+            if role == AgentRole.QUERY_RETRIEVER:
+                return '<query-retriever>{"sub_goal":"find","query":"query"}</query-retriever>'
+            if role == AgentRole.EVIDENCE_UPDATER:
+                return '<update-evidence>{"selected_passage_ids":[]}</update-evidence>'
+            assert answer_context == AnswerPromptContext(round_index=0, max_rounds=1)
+            return '<answer>{"can_answer":false,"answer":null,"rationale":"insufficient"}</answer>'
+
+    class FakeRetrievalEnv:
+        def query(self, dataset, query):
+            return {"query": query, "passages": []}
+
+    result = RAGLoopExecutor(
+        policy=FakePolicy(),
+        retrieval_env=FakeRetrievalEnv(),
+        max_rounds=1,
+    ).run(question="question", dataset="hotpotqa")
+
+    assert result.final_answer is None
+    assert result.trajectory[0]["force_final_answer"] is True
+    assert result.trajectory[0]["parse_error_role"] == "answer_generator"
+    assert result.trajectory[0]["raw_responses"]["answer_generator"].startswith("<answer>")
+    assert result.parse_errors == [
+        "final_answer_required: answer.can_answer must be true in the final round"
+    ]
+
+
 def test_parse_answer_accepts_null_only_when_can_answer_is_false() -> None:
     action = parse_action_text(
         '<answer>{"can_answer":false,"answer":null,"rationale":"need more evidence"}</answer>',
@@ -299,8 +361,39 @@ def test_rag_executor_records_partial_round_and_parse_error_role() -> None:
     assert len(result.trajectory) == 1
     assert result.trajectory[0]["parse_error_role"] == "evidence_updater"
     assert result.trajectory[0]["generated_roles"] == ["query_retriever", "evidence_updater"]
+    assert result.trajectory[0]["raw_responses"] == {
+        "query_retriever": '<query-retriever>{"sub_goal":"find director","query":"Bullitt director"}</query-retriever>',
+        "evidence_updater": "invalid evidence output",
+    }
     assert result.trajectory[0]["observation"]["passages"][0]["doc_id"] == "d1"
     assert len(result.parse_errors) == 1
+
+
+def test_advance_rag_state_applies_one_shared_transition() -> None:
+    state = RAGState(question="q", evidence=[{"text": "old"}], retrieval_count=1)
+    observation = {
+        "passages": [
+            {"passage_id": 0, "title": "T", "text": "new", "score": 0.9},
+            {"passage_id": 1, "title": "U", "text": "unused", "score": 0.8},
+        ]
+    }
+
+    advanced = advance_rag_state(
+        state,
+        query_action={"sub_goal": "goal", "query": "lookup"},
+        observation=observation,
+        update_action={"selected_passage_ids": [0]},
+    )
+
+    assert advanced.current_sub_goal == "goal"
+    assert advanced.retrieval_count == 2
+    assert [item["text"] for item in advanced.evidence] == ["old", "new"]
+    assert advanced.retrieval_history[-1] == {
+        "query": "lookup",
+        "sub_goal": "goal",
+        "passage_ids": [0],
+        "scores": [0.9],
+    }
 
 
 def test_compute_reward_terms_scores_answer_evidence_format_and_cost() -> None:

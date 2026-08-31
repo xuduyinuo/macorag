@@ -7,7 +7,6 @@ import sys
 import threading
 from types import SimpleNamespace
 from pathlib import Path
-import socket
 
 import pytest
 
@@ -17,6 +16,8 @@ from evaluation.data import EvalSample, load_eval_samples
 from evaluation.output import make_run_dir
 from evaluation.vllm_servers import build_commands, parse_args as parse_vllm_server_args, run_commands
 from evaluation.evaluate_rag_model import (
+    _prepare_resume_identity,
+    _validate_fixed_manifest,
     _build_retrieval_env,
     _configure_visible_gpus,
     _load_policy,
@@ -27,13 +28,136 @@ from evaluation.evaluate_rag_model import (
 )
 
 
-from evaluation.bailian_evaluator import (
-    calculate_contain,
-    calculate_exact_match,
-    calculate_f1,
-    calculate_llm_accuracy,
-    evaluate_predictions,
-)
+from evaluation.local_evaluator import evaluate_predictions
+
+
+def test_fixed_manifest_selects_per_dataset_deterministically(tmp_path: Path) -> None:
+    from evaluation.fixed_manifest import build_fixed_manifest
+
+    source = tmp_path / "source"
+    strata = {
+        "2wiki": ["compositional", "comparison"],
+        "hotpotqa": ["hard/bridge", "hard/comparison"],
+        "musique": ["2hop", "3hop1"],
+    }
+    for dataset, dataset_strata in strata.items():
+        rows = []
+        for index in range(120):
+            stratum = dataset_strata[index % len(dataset_strata)]
+            row = {
+                "qid": f"{dataset}-{index}",
+                "dataset": dataset,
+                "question": f"question {index}",
+                "answer": "answer",
+                "supporting_facts": [],
+            }
+            if dataset == "2wiki":
+                row["question_type"] = stratum
+            elif dataset == "hotpotqa":
+                level, question_type = stratum.split("/", 1)
+                row["metadata"] = {"level": level}
+                row["question_type"] = question_type
+            else:
+                row["qid"] = f"{stratum}__{index}"
+            rows.append(row)
+        _write_jsonl(source / f"{dataset}.jsonl", rows)
+
+    first = build_fixed_manifest(source, tmp_path / "one", per_dataset=100, seed=7)
+    second = build_fixed_manifest(source, tmp_path / "two", per_dataset=100, seed=7)
+
+    assert first["manifest_fingerprint"] == second["manifest_fingerprint"]
+    assert first["counts_by_dataset"] == {"2wiki": 100, "hotpotqa": 100, "musique": 100}
+    rows = [json.loads(line) for line in (tmp_path / "one" / "manifest.jsonl").read_text().splitlines()]
+    assert all(row["sampling_stratum"] for row in rows)
+
+    samples, summary = load_eval_samples(
+        data_root=tmp_path / "one",
+        data_files=["manifest.jsonl"],
+    )
+    fingerprint, _ = _validate_fixed_manifest(
+        args=SimpleNamespace(manifest_meta_path=str(tmp_path / "one" / "manifest_meta.json")),
+        samples=samples,
+        sample_summary=summary,
+    )
+    assert fingerprint == first["manifest_fingerprint"]
+
+    with (tmp_path / "one" / "manifest.jsonl").open("a", encoding="utf-8") as file:
+        file.write("\n")
+    with pytest.raises(ValueError, match="fingerprint"):
+        _validate_fixed_manifest(
+            args=SimpleNamespace(manifest_meta_path=str(tmp_path / "one" / "manifest_meta.json")),
+            samples=samples,
+            sample_summary=summary,
+        )
+
+
+def test_fixed_evaluation_resume_identity_rejects_adapter_or_contract_change(tmp_path: Path) -> None:
+    contract = {"contract_fingerprint": "contract-a"}
+    initial_args = SimpleNamespace(resume=False, adapter_label="sft")
+    _prepare_resume_identity(
+        output_dir=tmp_path,
+        args=initial_args,
+        contract=contract,
+        adapter_identity={"fingerprint": "adapter-a"},
+    )
+    dataset_dir = tmp_path / "2wiki"
+    dataset_dir.mkdir()
+    (dataset_dir / "predictions.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="resume identity"):
+        _prepare_resume_identity(
+            output_dir=tmp_path,
+            args=SimpleNamespace(resume=True, adapter_label="rl-step-300"),
+            contract=contract,
+            adapter_identity={"fingerprint": "adapter-b"},
+        )
+
+
+def test_run_predictions_resumes_completed_qids(tmp_path: Path, monkeypatch) -> None:
+    samples = [
+        EvalSample("done", "2wiki", "q1", "a1", [], [], {}),
+        EvalSample("pending", "2wiki", "q2", "a2", [], [], {}),
+    ]
+    completed = {
+        "qid": "done",
+        "dataset": "2wiki",
+        "question": "q1",
+        "pred_answer": "a1",
+        "gold_answer": "a1",
+        "answer_aliases": [],
+        "trajectory": [],
+        "parse_errors": [],
+        "retrieval_count": 0,
+    }
+    _write_jsonl(tmp_path / "predictions.jsonl", [completed])
+    generated = []
+
+    def fake_run_one_prediction(*, index, sample, **kwargs):
+        generated.append(sample.qid)
+        return index, {**completed, "qid": sample.qid, "question": sample.question, "gold_answer": sample.answer}
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model._run_one_prediction", fake_run_one_prediction)
+    args = SimpleNamespace(eval_request_workers=1, disable_tqdm=True, resume=True)
+
+    predictions = run_predictions(args, samples, object(), object(), tmp_path)
+
+    assert generated == ["pending"]
+    assert [row["qid"] for row in predictions] == ["done", "pending"]
+
+
+def test_fixed_eval_config_supports_stable_resumable_output(tmp_path: Path) -> None:
+    config = tmp_path / "eval.yml"
+    config.write_text(
+        "output_dir: outputs/fixed/sft\nresume: true\n"
+        "manifest_meta_path: data/fixed/manifest_meta.json\nadapter_label: sft\n"
+        "adapter_identity_path: outputs/sft/adapter\n",
+        encoding="utf-8",
+    )
+    args = parse_args(["--config", str(config)])
+    assert args.output_dir == "outputs/fixed/sft"
+    assert args.resume is True
+    assert args.adapter_label == "sft"
+    assert args.adapter_identity_path == "outputs/sft/adapter"
 
 
 def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> str:
@@ -107,7 +231,7 @@ def test_model_vllm_server_config_file_exists() -> None:
 
     assert 'vllm_bin: "/data/conda/envs/macorag/bin/vllm"' in text
     assert 'model_path: "model/Qwen2.5-7B-Instruct"' in text
-    assert "adapter_path:" in text
+    assert 'adapter_path: "' in text
     assert "vllm_model:" in text
     assert "gpu_indices:" in text
     assert "vllm_base_urls:" in text
@@ -124,6 +248,8 @@ def test_eval_macorag_config_is_vllm_client_only() -> None:
     text = Path("config/eval_macorag.yml").read_text(encoding="utf-8")
     eval_args = parse_args(["--config", "config/eval_macorag.yml"])
 
+    assert eval_args.data_root == "data/eval_1000_stratified_v2"
+    assert eval_args.retrieval_root == "data/eval_1000_stratified_v2_e5_faiss"
     assert "model_path:" not in text
     assert "adapter_path:" not in text
     assert "inference_backend:" not in text
@@ -172,13 +298,17 @@ def test_vllm_server_module_builds_commands_from_config_and_cli(tmp_path: Path) 
 
 
 def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> None:
+    adapter = tmp_path / "chosen-adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "prompt_contract.json").write_text("{}", encoding="utf-8")
     config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
                 'vllm_bin: "/opt/vllm/bin/vllm"',
                 'model_path: "model/base"',
-                'adapter_path: "outputs/adapter"',
+                f'adapter_path: "{adapter}"',
                 'vllm_model: "adapter-name"',
                 'gpu_indices: "2,3"',
                 "vllm_base_urls:",
@@ -201,6 +331,7 @@ def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> 
     )
     env = os.environ.copy()
     env["MACORAG_VLLM_DRY_RUN"] = "1"
+    env.pop("ADAPTER_PATH", None)
 
     result = subprocess.run(
         ["bash", "scripts/eval_vllm_server.sh", "--config", str(config)],
@@ -213,19 +344,23 @@ def test_model_vllm_server_script_dry_run_uses_config_values(tmp_path: Path) -> 
 
     assert "CUDA_VISIBLE_DEVICES=2 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 0.0.0.0 --port 8100" in result.stdout
     assert "VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN" in result.stdout
-    assert "--enable-lora --lora-modules adapter-name=outputs/adapter" in result.stdout
+    assert f"--enable-lora --lora-modules adapter-name={adapter}" in result.stdout
     assert "--dtype float16 --gpu-memory-utilization 0.8 --max-model-len 2048 --trust-remote-code --max-num-seqs 32" in result.stdout
     assert "CUDA_VISIBLE_DEVICES=3 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 0.0.0.0 --port 8101" in result.stdout
 
 
 def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
+    adapter = tmp_path / "chosen-adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text("{}", encoding="utf-8")
+    (adapter / "prompt_contract.json").write_text("{}", encoding="utf-8")
     config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
                 'vllm_bin: "/opt/vllm/bin/vllm"',
                 'model_path: "model/base"',
-                'adapter_path: "outputs/adapter"',
+                f'adapter_path: "{adapter}"',
                 'vllm_model: "adapter-name"',
                 'gpu_indices: "2"',
                 "vllm_base_urls:",
@@ -236,6 +371,7 @@ def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
     )
     env = os.environ.copy()
     env["MACORAG_VLLM_DRY_RUN"] = "1"
+    env.pop("ADAPTER_PATH", None)
 
     result = subprocess.run(
         [
@@ -258,14 +394,15 @@ def test_model_vllm_server_script_cli_overrides_config(tmp_path: Path) -> None:
     assert "CUDA_VISIBLE_DEVICES=4 VLLM_USE_FLASHINFER_SAMPLER=0 VLLM_ATTENTION_BACKEND=FLASH_ATTN /opt/vllm/bin/vllm serve model/base --host 127.0.0.1 --port 8200" in result.stdout
 
 
-def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path: Path) -> None:
+def test_model_vllm_server_script_rejects_invalid_manual_adapter_path(tmp_path: Path) -> None:
+    missing_adapter = tmp_path / "missing-adapter"
     config = tmp_path / "eval_vllm_server.yml"
     config.write_text(
         "\n".join(
             [
                 'vllm_bin: "/opt/vllm/bin/vllm"',
                 'model_path: "model/base"',
-                "adapter_path: null",
+                f'adapter_path: "{missing_adapter}"',
                 'vllm_model: "adapter-name"',
                 'gpu_indices: "2"',
                 "vllm_base_urls:",
@@ -276,20 +413,18 @@ def test_model_vllm_server_script_omits_lora_when_adapter_path_is_empty(tmp_path
     )
     env = os.environ.copy()
     env["MACORAG_VLLM_DRY_RUN"] = "1"
+    env.pop("ADAPTER_PATH", None)
 
     result = subprocess.run(
         ["bash", "scripts/eval_vllm_server.sh", "--config", str(config)],
-        check=True,
         capture_output=True,
         text=True,
         cwd=Path.cwd(),
         env=env,
     )
 
-    assert "/opt/vllm/bin/vllm serve model/base" in result.stdout
-    assert "--served-model-name adapter-name" in result.stdout
-    assert "--enable-lora" not in result.stdout
-    assert "--lora-modules" not in result.stdout
+    assert result.returncode == 2
+    assert "missing adapter_config.json" in result.stderr
 
 
 def test_vllm_server_run_commands_leaves_process_output_on_console(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -337,14 +472,17 @@ def test_evaluate_configure_visible_gpus_respects_existing_env(monkeypatch: pyte
 def test_evaluate_build_retrieval_env_uses_eval_retrieval_config(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 
-    class FakeRetrievalEnv:
-        def __init__(self, **kwargs) -> None:
-            captured.update(kwargs)
+    def fake_create_retrieval_env(**kwargs):
+        captured.update(kwargs)
+        return object()
 
-    monkeypatch.setattr("evaluation.evaluate_rag_model.CachedLinearRAGRetrievalEnv", FakeRetrievalEnv)
+    monkeypatch.setattr("evaluation.evaluate_rag_model.create_retrieval_env", fake_create_retrieval_env)
     args = SimpleNamespace(
-        retrieval_root="data/eval_1000_retrieval",
-        retrieval_embedding_model="sentence-transformers/all-mpnet-base-v2",
+        retrieval_backend="e5_faiss",
+        retrieval_root="data/eval_1000_e5_faiss",
+        retrieval_embedding_model="intfloat/e5-base-v2",
+        retrieval_device="cpu",
+        retrieval_max_length=512,
         retrieval_spacy_model="en_core_web_trf",
         retrieval_top_k=5,
         retrieval_max_workers=4,
@@ -354,9 +492,34 @@ def test_evaluate_build_retrieval_env_uses_eval_retrieval_config(monkeypatch: py
 
     _build_retrieval_env(args)
 
-    assert captured["retrieval_root"] == "data/eval_1000_retrieval"
-    assert captured["embedding_model"] == "sentence-transformers/all-mpnet-base-v2"
+    assert captured["backend"] == "e5_faiss"
+    assert captured["retrieval_root"] == "data/eval_1000_e5_faiss"
+    assert captured["embedding_model"] == "intfloat/e5-base-v2"
+    assert captured["device"] == "cpu"
+    assert captured["max_length"] == 512
     assert captured["top_k"] == 5
+
+
+def test_evaluate_config_loads_e5_faiss_backend_fields(tmp_path: Path) -> None:
+    config = tmp_path / "eval.yml"
+    config.write_text(
+        "\n".join(
+            [
+                "retrieval_backend: e5_faiss",
+                "retrieval_embedding_model: intfloat/e5-base-v2",
+                "retrieval_device: cpu",
+                "retrieval_max_length: 512",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.retrieval_backend == "e5_faiss"
+    assert args.retrieval_embedding_model == "intfloat/e5-base-v2"
+    assert args.retrieval_device == "cpu"
+    assert args.retrieval_max_length == 512
 
 
 def test_cached_retrieval_env_shares_dataset_engine_across_threads(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -609,26 +772,19 @@ def test_cached_retrieval_env_evicts_lru_and_zero_disables_cache(
     assert uncached.stats()["cache_misses"] == 2
 
 
-def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
+def test_evaluate_main_writes_local_metrics_for_each_dataset(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {"prediction_dirs": [], "evaluation_paths": []}
 
-    class FakeJudgeClient:
-        def __init__(self, **kwargs) -> None:
-            captured["judge_client_kwargs"] = kwargs
-
-    def fake_evaluate_predictions(predictions_path: Path, *, client, max_workers: int, judge_metadata=None):
+    def fake_evaluate_predictions(predictions_path: Path):
         captured["evaluation_paths"].append(predictions_path)
-        captured["client"] = client
-        captured["max_workers"] = max_workers
-        captured["judge_metadata"] = judge_metadata
         return {
-            "llm_accuracy": 0.0,
             "contain_accuracy": 0.0,
+            "exact_match": 0.0,
+            "f1": 0.0,
             "num_samples": 0,
-            "judge_metadata": judge_metadata,
         }
 
     args = SimpleNamespace(
@@ -655,16 +811,6 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
         retrieval_max_workers=4,
         retrieval_batch_size=32,
         use_vectorized_retrieval=True,
-        skip_judge=False,
-        judge_model="qwen-plus",
-        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        judge_api_key_env="DASHSCOPE_API_KEY",
-        judge_temperature=0.0,
-        judge_max_tokens=8,
-        judge_timeout=120,
-        judge_retries=3,
-        judge_retry_sleep_seconds=2.0,
-        judge_workers=4,
     )
 
     monkeypatch.setattr("evaluation.evaluate_rag_model.parse_args", lambda argv=None: args)
@@ -688,7 +834,6 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
         return []
 
     monkeypatch.setattr("evaluation.evaluate_rag_model.run_predictions", fake_run_predictions)
-    monkeypatch.setattr("evaluation.evaluate_rag_model.BailianJudgeClient", FakeJudgeClient)
     monkeypatch.setattr("evaluation.evaluate_rag_model.evaluate_predictions", fake_evaluate_predictions)
 
     assert main([]) == 0
@@ -700,18 +845,11 @@ def test_evaluate_main_passes_judge_metadata_to_evaluate_predictions(
         tmp_path / "eval_run" / "hotpotqa" / "predictions.jsonl",
         tmp_path / "eval_run" / "musique" / "predictions.jsonl",
     ]
-    assert captured["judge_metadata"] == {
-        "judge_model": "qwen-plus",
-        "judge_endpoint": "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        "judge_api_key_env": "DASHSCOPE_API_KEY",
-        "judge_temperature": 0.0,
-        "judge_max_tokens": 8,
-        "judge_timeout": 120,
-        "judge_retries": 3,
-        "judge_retry_sleep_seconds": 2.0,
-        "judge_workers": 4,
-    }
-    assert captured["max_workers"] == 4
+    aggregate = json.loads((tmp_path / "eval_run" / "aggregate_metrics.json").read_text(encoding="utf-8"))
+    assert aggregate["macro_f1"] == 0.0
+    assert set(aggregate["datasets"]) == {"hotpotqa", "musique"}
+    assert (tmp_path / "eval_run" / "aggregate_protocol_metrics.json").is_file()
+    assert (tmp_path / "eval_run" / "evaluation_contract.json").is_file()
 
 
 def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
@@ -722,30 +860,41 @@ def test_parse_eval_config_loads_yaml_and_cli_overrides(tmp_path: Path) -> None:
                 'data_root: "data/eval_1000"',
                 'retrieval_root: "data/eval_1000_retrieval"',
                 'output_root: "outputs/eval"',
-                'judge_model: "qwen-plus"',
-                'judge_api_key_env: "DASHSCOPE_API_KEY"',
                 "max_samples: 20",
                 "max_rounds: 2",
                 "retrieval_top_k: 4",
                 'gpu_indices: "1"',
-                "skip_judge: false",
             ]
         ),
         encoding="utf-8",
     )
 
-    args = parse_args(["--config", str(config), "--max-samples", "3", "--skip-judge"])
+    args = parse_args(["--config", str(config), "--max-samples", "3"])
 
     assert args.data_root == "data/eval_1000"
     assert args.retrieval_root == "data/eval_1000_retrieval"
     assert args.output_root == "outputs/eval"
-    assert args.judge_model == "qwen-plus"
-    assert args.judge_api_key_env == "DASHSCOPE_API_KEY"
     assert args.max_samples == 3
     assert args.max_rounds == 2
     assert args.retrieval_top_k == 4
     assert args.gpu_indices == "1"
-    assert args.skip_judge is True
+
+
+def test_eval_config_has_no_external_judge_fields() -> None:
+    args = parse_args(["--config", "config/eval_macorag.yml"])
+    text = Path("config/eval_macorag.yml").read_text(encoding="utf-8")
+
+    assert "skip_judge" not in text
+    assert "judge_" not in text
+    assert not any(name == "skip_judge" or name.startswith("judge_") for name in vars(args))
+
+
+def test_obsolete_judge_yaml_fields_are_rejected(tmp_path: Path) -> None:
+    config = tmp_path / "stale.yml"
+    config.write_text("judge_model: qwen-plus\n", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="Unknown evaluation config keys.*judge_model"):
+        parse_args(["--config", str(config)])
 
 
 def test_parse_eval_config_loads_vllm_backend_fields(tmp_path: Path) -> None:
@@ -788,7 +937,7 @@ def test_parse_eval_config_rejects_unknown_yaml_keys(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "removed_key",
-    ["output_dir", "fixed_output_dir", "gpu_index", "seed", "system_prompt", "disable_tqdm", "top_k"],
+    ["fixed_output_dir", "gpu_index", "seed", "system_prompt", "disable_tqdm", "top_k"],
 )
 def test_parse_eval_config_rejects_removed_yaml_keys(tmp_path: Path, removed_key: str) -> None:
     config = tmp_path / "evaluate_rag_model.yml"
@@ -972,31 +1121,19 @@ def test_explicit_data_files_accepts_dataset_directory(tmp_path: Path) -> None:
     assert summary["source_files"] == [str(data_root / "2wiki" / "2wiki_dev.jsonl")]
 
 
-class FakeJudgeClient:
-    def __init__(self, responses: list[str]) -> None:
-        self.responses = list(responses)
-        self.messages: list[list[dict[str, str]]] = []
+def test_shared_answer_metrics_preserve_bidirectional_contain_contract() -> None:
+    from answer_metrics import calculate_answer_metrics
 
-    def infer(self, messages: list[dict[str, str]]) -> str:
-        self.messages.append(messages)
-        return self.responses.pop(0)
-
-
-def test_bailian_evaluator_maps_correct_response_and_contain_accuracy() -> None:
-    client = FakeJudgeClient(["correct"])
-
-    llm_acc = calculate_llm_accuracy(client, "David Arquette", "David Arquette")
-
-    assert llm_acc == 1.0
-    assert calculate_contain("The answer is David Arquette.", "David Arquette") == 1
-    assert calculate_contain("London", "London, England, United Kingdom") == 1
-    assert calculate_contain("The answer is Wes Craven.", "David Arquette") == 0
-    assert calculate_exact_match("The David Arquette", "David Arquette") == 1
-    assert calculate_exact_match("London", "London, England") == 0
-    assert calculate_f1("London", "London, England") == pytest.approx(2 / 3)
-    assert calculate_f1("David Arquette", "David Arquette") == 1.0
-    assert calculate_f1("", "David Arquette") == 0.0
-    assert "Respond with ONLY 'correct' or 'incorrect'." in client.messages[0][1]["content"]
+    assert calculate_answer_metrics("The David Arquette", "David Arquette") == {
+        "exact_match": 1,
+        "contain": 1,
+        "f1": 1.0,
+    }
+    assert calculate_answer_metrics("London", "London, England") == {
+        "exact_match": 0,
+        "contain": 1,
+        "f1": pytest.approx(2 / 3),
+    }
 
 
 def test_evaluate_predictions_reads_jsonl_and_writes_summary_without_rewriting_predictions(tmp_path: Path) -> None:
@@ -1019,18 +1156,15 @@ def test_evaluate_predictions_reads_jsonl_and_writes_summary_without_rewriting_p
         ]
     )
     predictions_path.write_text(original_text, encoding="utf-8")
-    client = FakeJudgeClient(["correct", "incorrect", "correct"])
+    summary = evaluate_predictions(predictions_path)
 
-    summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
-
-    assert summary["llm_accuracy"] == pytest.approx(2 / 3)
     assert summary["contain_accuracy"] == pytest.approx(2 / 3)
     assert summary["exact_match"] == pytest.approx(2 / 3)
     assert summary["f1"] == pytest.approx(2 / 3)
     assert summary["num_samples"] == 3
     assert predictions_path.read_text(encoding="utf-8") == original_text
     evaluation_results = json.loads((tmp_path / "evaluation_results.json").read_text(encoding="utf-8"))
-    assert evaluation_results["llm_accuracy"] == pytest.approx(2 / 3)
+    assert "llm_accuracy" not in evaluation_results
     assert evaluation_results["contain_accuracy"] == pytest.approx(2 / 3)
     assert evaluation_results["exact_match"] == pytest.approx(2 / 3)
     assert evaluation_results["f1"] == pytest.approx(2 / 3)
@@ -1049,9 +1183,7 @@ def test_evaluate_predictions_preserves_falsy_answers(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
-    client = FakeJudgeClient(["correct", "correct"])
-
-    summary = evaluate_predictions(predictions_path, client=client, max_workers=1)
+    summary = evaluate_predictions(predictions_path)
 
     assert summary["contain_accuracy"] == 1.0
 
@@ -1068,36 +1200,6 @@ class _FakeHTTPResponse:
 
     def __exit__(self, exc_type: object, exc_val: object, exc_tb: object) -> None:
         return None
-
-
-def test_bailian_judge_client_retries_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    called: dict[str, int] = {"count": 0}
-
-    def fake_urlopen(_request: object, timeout: int) -> _FakeHTTPResponse:
-        called["count"] += 1
-        if called["count"] == 1:
-            raise socket.timeout("temporary timeout")
-        return _FakeHTTPResponse({"choices": [{"message": {"content": "correct"}}]})
-
-    monkeypatch.setenv("TEST_BAILIAN_API_KEY", "k")
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
-
-    from evaluation.bailian_evaluator import BailianJudgeClient
-
-    client = BailianJudgeClient(
-        model="test",
-        endpoint="https://example.com/api/v1/chat/completions",
-        api_key_env="TEST_BAILIAN_API_KEY",
-        temperature=0.0,
-        max_tokens=16,
-        timeout=1,
-        retries=2,
-        retry_sleep_seconds=0.0,
-    )
-    result = client.infer([{"role": "user", "content": "Is this correct?"}])
-
-    assert result == "correct"
-    assert called["count"] == 2
 
 
 def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1139,7 +1241,7 @@ def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPat
     assert payload["temperature"] == 0.0
     assert payload["top_p"] == 0.95
     assert payload["max_tokens"] == 32
-    assert payload["truncate_prompt_tokens"] == 128
+    assert "truncate_prompt_tokens" not in payload
     assert response == '<answer>{"can_answer": true}</answer>'
 
 
@@ -1174,27 +1276,6 @@ def test_vllm_policy_round_robins_base_urls(monkeypatch: pytest.MonkeyPatch) -> 
         "http://127.0.0.1:8000/v1/chat/completions",
         "http://127.0.0.1:8001/v1/chat/completions",
     ]
-
-
-def test_evaluate_predictions_includes_judge_metadata_when_provided(tmp_path: Path) -> None:
-    predictions_path = tmp_path / "predictions.json"
-    predictions_path.write_text(
-        json.dumps([{"qid": "q1", "pred_answer": "David Arquette", "gold_answer": "David Arquette"}], ensure_ascii=False),
-        encoding="utf-8",
-    )
-    client = FakeJudgeClient(["correct"])
-    metadata = {"judge_model": "test-model", "temperature": 0.0}
-
-    summary = evaluate_predictions(
-        predictions_path,
-        client=client,
-        max_workers=1,
-        judge_metadata=metadata,
-    )
-    evaluation_results = json.loads((tmp_path / "evaluation_results.json").read_text(encoding="utf-8"))
-
-    assert summary["judge_metadata"] == metadata
-    assert evaluation_results["judge_metadata"] == metadata
 
 
 def test_format_prediction_matches_linearrag_evaluator_schema() -> None:
@@ -1483,16 +1564,6 @@ def test_main_validates_retrieval_assets_before_loading_model(
         retrieval_max_workers=4,
         retrieval_batch_size=32,
         use_vectorized_retrieval=True,
-        skip_judge=True,
-        judge_model="qwen-plus",
-        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        judge_api_key_env="DASHSCOPE_API_KEY",
-        judge_temperature=0.0,
-        judge_max_tokens=8,
-        judge_timeout=120,
-        judge_retries=3,
-        judge_retry_sleep_seconds=2.0,
-        judge_workers=4,
     )
     samples = [
         EvalSample(
@@ -1567,16 +1638,6 @@ def test_main_uses_timestamped_output_root_before_startup_failure(
         retrieval_max_workers=4,
         retrieval_batch_size=32,
         use_vectorized_retrieval=True,
-        skip_judge=True,
-        judge_model="qwen-plus",
-        judge_endpoint="https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions",
-        judge_api_key_env="DASHSCOPE_API_KEY",
-        judge_temperature=0.0,
-        judge_max_tokens=8,
-        judge_timeout=120,
-        judge_retries=3,
-        judge_retry_sleep_seconds=2.0,
-        judge_workers=4,
     )
     samples = [
         EvalSample(
