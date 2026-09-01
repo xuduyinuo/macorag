@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -1470,6 +1471,67 @@ def test_load_policy_uses_vllm_without_loading_local_model() -> None:
     policy = _load_policy(args)
 
     assert isinstance(policy, VLLMOpenAIPolicy)
+
+
+def test_vllm_policy_bypasses_http_proxy_for_loopback_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TargetHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.dumps({"choices": [{"message": {"content": "ok"}}]}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    class ProxyHandler(BaseHTTPRequestHandler):
+        calls = 0
+
+        def do_POST(self) -> None:
+            type(self).calls += 1
+            self.send_error(502, "proxy must not receive loopback traffic")
+
+        def log_message(self, format: str, *args: object) -> None:
+            return None
+
+    target = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
+    proxy = ThreadingHTTPServer(("127.0.0.1", 0), ProxyHandler)
+    threads = [
+        threading.Thread(target=target.serve_forever, daemon=True),
+        threading.Thread(target=proxy.serve_forever, daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    try:
+        proxy_url = f"http://127.0.0.1:{proxy.server_port}"
+        monkeypatch.setenv("HTTP_PROXY", proxy_url)
+        monkeypatch.setenv("http_proxy", proxy_url)
+        monkeypatch.delenv("NO_PROXY", raising=False)
+        monkeypatch.delenv("no_proxy", raising=False)
+        policy = VLLMOpenAIPolicy(
+            base_urls=[f"http://127.0.0.1:{target.server_port}/v1"],
+            model="macorag",
+            api_key_env="",
+            system_prompt=None,
+            max_prompt_length=128,
+            max_completion_length=16,
+            temperature=0.0,
+            top_p=1.0,
+            timeout=2,
+            retries=1,
+            retry_sleep_seconds=0.0,
+        )
+        response = policy._post_chat_completion({"model": "macorag", "messages": []})
+        assert response["choices"][0]["message"]["content"] == "ok"
+        assert ProxyHandler.calls == 0
+    finally:
+        target.shutdown()
+        proxy.shutdown()
+        target.server_close()
+        proxy.server_close()
+        for thread in threads:
+            thread.join(timeout=2)
 
 
 def test_load_policy_rejects_vllm_without_base_urls() -> None:

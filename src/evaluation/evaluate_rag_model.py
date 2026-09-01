@@ -7,6 +7,7 @@ import os
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -239,6 +240,7 @@ class VLLMOpenAIPolicy:
         self.retries = max(1, int(retries))
         self.retry_sleep_seconds = retry_sleep_seconds
         self._thread_local = threading.local()
+        self._loopback_opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
     def reset_trace(self) -> None:
         return None
@@ -249,6 +251,12 @@ class VLLMOpenAIPolicy:
     def _endpoint(self) -> str:
         index = int(getattr(self._thread_local, "endpoint_index", 0))
         return self.base_urls[index % len(self.base_urls)] + "/chat/completions"
+
+    def _open(self, request: urllib.request.Request):
+        hostname = (urllib.parse.urlparse(request.full_url).hostname or "").lower()
+        if hostname in {"127.0.0.1", "localhost", "::1"}:
+            return self._loopback_opener.open(request, timeout=self.timeout)
+        return urllib.request.urlopen(request, timeout=self.timeout)
 
     def _prompt_for(
         self,
@@ -295,7 +303,7 @@ class VLLMOpenAIPolicy:
         last_error: Exception | None = None
         for attempt in range(self.retries):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                with self._open(request) as response:
                     return json.loads(response.read().decode("utf-8"))
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = exc
