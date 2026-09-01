@@ -489,11 +489,19 @@ def run_predictions(
                 unit="sample",
                 disable=bool(getattr(args, "disable_tqdm", False)),
             )
+            first_error: Exception | None = None
             for future in iterator:
-                index, prediction = future.result()
+                try:
+                    index, prediction = future.result()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    continue
                 predictions_by_index[index] = prediction
                 with progress_lock:
                     _append_jsonl(progress_path, prediction)
+            if first_error is not None:
+                raise first_error
     else:
         iterator = tqdm(
             pending,

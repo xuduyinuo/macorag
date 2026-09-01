@@ -1588,6 +1588,47 @@ def test_run_predictions_uses_threads_when_multiple_eval_workers_are_configured(
     assert not (tmp_path / "predictions.json").exists()
 
 
+def test_run_predictions_drains_successful_futures_before_raising_infrastructure_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    samples = [
+        EvalSample("fails", "musique", "Question 1?", "Answer 1", [], [], {}),
+        EvalSample("succeeds", "musique", "Question 2?", "Answer 2", [], [], {}),
+    ]
+    failure_released = threading.Event()
+
+    def fake_run_one_prediction(*, index: int, sample: EvalSample, **kwargs):
+        if sample.qid == "fails":
+            failure_released.set()
+            raise RuntimeError("vLLM chat completion failed after 3 attempt(s): connection refused")
+        assert failure_released.wait(timeout=2)
+        return index, {
+            "qid": sample.qid,
+            "dataset": sample.dataset,
+            "question": sample.question,
+            "pred_answer": sample.answer,
+            "gold_answer": sample.answer,
+            "answer_aliases": [],
+            "trajectory": [],
+            "parse_errors": [],
+            "retrieval_count": 0,
+        }
+
+    monkeypatch.setattr("evaluation.evaluate_rag_model._run_one_prediction", fake_run_one_prediction)
+    monkeypatch.setattr("evaluation.evaluate_rag_model.as_completed", lambda futures: iter(futures))
+    args = SimpleNamespace(eval_request_workers=2, disable_tqdm=True, resume=False)
+
+    with pytest.raises(RuntimeError, match="vLLM chat completion failed"):
+        run_predictions(args, samples, object(), object(), tmp_path)
+
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "predictions.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [row["qid"] for row in rows] == ["succeeds"]
+
+
 def test_main_validates_retrieval_assets_before_loading_model(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
