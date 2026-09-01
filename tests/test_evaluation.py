@@ -1213,7 +1213,6 @@ def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPat
         captured["timeout"] = timeout
         return _FakeHTTPResponse({"choices": [{"message": {"content": "<answer>{\"can_answer\": true}</answer>"}}]})
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     policy = VLLMOpenAIPolicy(
         base_urls=["http://127.0.0.1:8000/v1"],
         model="macorag-lora",
@@ -1227,6 +1226,7 @@ def test_vllm_policy_posts_chat_completion_request(monkeypatch: pytest.MonkeyPat
         retries=1,
         retry_sleep_seconds=0.0,
     )
+    monkeypatch.setattr(policy._loopback_opener, "open", fake_urlopen)
 
     response = policy.generate(
         role="answer_generator",
@@ -1253,7 +1253,6 @@ def test_vllm_policy_round_robins_base_urls(monkeypatch: pytest.MonkeyPatch) -> 
         urls.append(request.full_url)
         return _FakeHTTPResponse({"choices": [{"message": {"content": "ok"}}]})
 
-    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
     policy = VLLMOpenAIPolicy(
         base_urls=["http://127.0.0.1:8000/v1", "http://127.0.0.1:8001/v1"],
         model="macorag-lora",
@@ -1267,6 +1266,7 @@ def test_vllm_policy_round_robins_base_urls(monkeypatch: pytest.MonkeyPatch) -> 
         retries=1,
         retry_sleep_seconds=0.0,
     )
+    monkeypatch.setattr(policy._loopback_opener, "open", fake_urlopen)
 
     policy.set_endpoint_index(0)
     policy.generate(role="answer_generator", question="Question?", state=RAGState(question="Question?"))
