@@ -25,6 +25,7 @@ from rag import (
 )
 from prompt_config import load_prompt_contract, system_prompt_for
 from rag.protocol_metrics import compute_protocol_metrics
+from rag.prompt_budget import compact_tagged_json_prompt
 from rl_training.retrieval import create_retrieval_env
 from rl_training.retrieval import validate_retrieval_assets as validate_runtime_retrieval_assets
 
@@ -112,10 +113,19 @@ def _adapter_identity(args: Any) -> dict[str, Any]:
     missing = [path for path in required if not path.is_file()]
     if missing or len(weights) != 1:
         raise ValueError(f"Invalid adapter identity path: {root}")
+    adapter_config = _read_json(root / "adapter_config.json")
+    adapter_base_model = str(adapter_config.get("base_model_name_or_path") or "").strip()
+    configured_base_model = str(getattr(args, "model_path", "") or "").strip()
+    if adapter_base_model and configured_base_model and adapter_base_model != configured_base_model:
+        raise ValueError(
+            "Adapter base model mismatch: "
+            f"adapter declares {adapter_base_model!r}, evaluation config has {configured_base_model!r}."
+        )
     hashes = {path.name: _sha256_path(path) for path in [*required, weights[0]]}
     serialized = json.dumps(hashes, sort_keys=True, separators=(",", ":"))
     return {
         "path": str(root),
+        "base_model_path": adapter_base_model or None,
         "files": hashes,
         "fingerprint": hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
     }
@@ -150,6 +160,7 @@ def _build_evaluation_contract(
             "index_metadata_fingerprints": _retrieval_metadata_fingerprints(args, datasets),
         },
         "generation": {
+            "transport": getattr(args, "vllm_transport", "openai"),
             "model": getattr(args, "vllm_model", ""),
             "max_rounds": args.max_rounds,
             "max_prompt_length": args.max_prompt_length,
@@ -350,6 +361,109 @@ class VLLMOpenAIPolicy:
             raise RuntimeError(f"Invalid vLLM chat completion response: {response}") from exc
 
 
+class VLLMTrainingServerPolicy(VLLMOpenAIPolicy):
+    """Evaluation policy for the LoRA hot-sync server used during GRPO."""
+
+    def __init__(self, *, tokenizer: Any, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.tokenizer = tokenizer
+
+    def set_endpoint_index(self, index: int) -> None:
+        super().set_endpoint_index(index)
+        # Each validation sample owns a deterministic, thread-local seed range.
+        # This remains reproducible when eval_request_workers > 1.
+        self._thread_local.generation_counter = int(index) * 100
+
+    def _endpoint(self) -> str:
+        index = int(getattr(self._thread_local, "endpoint_index", 0))
+        return self.base_urls[index % len(self.base_urls)].removesuffix("/v1") + "/generate/"
+
+    def _post_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(
+            self._endpoint(),
+            data=data,
+            headers=self._headers(),
+            method="POST",
+        )
+        last_error: Exception | None = None
+        for attempt in range(self.retries):
+            try:
+                with self._open(request) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt + 1 < self.retries:
+                    time.sleep(self.retry_sleep_seconds)
+        raise RuntimeError(
+            f"vLLM training-server generation failed after {self.retries} attempt(s): {last_error}"
+        ) from last_error
+
+    def generate(
+        self,
+        *,
+        role: AgentRole,
+        question: str,
+        state: RAGState,
+        observation: dict[str, Any] | None = None,
+        answer_context: AnswerPromptContext | None = None,
+        force_final_answer: bool | None = None,
+    ) -> str:
+        role = AgentRole(role)
+        prompt = self._prompt_for(
+            role=role,
+            question=question,
+            state=state,
+            observation=observation,
+            answer_context=answer_context,
+            force_final_answer=force_final_answer,
+        )
+
+        def encode(text: str) -> list[int]:
+            messages = [
+                {
+                    "role": "system",
+                    "content": self.system_prompt
+                    if self.system_prompt is not None
+                    else system_prompt_for(role),
+                },
+                {"role": "user", "content": text},
+            ]
+            return list(
+                self.tokenizer.apply_chat_template(
+                    messages,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                )
+            )
+
+        compacted = compact_tagged_json_prompt(
+            prompt,
+            token_count=lambda text: len(encode(text)),
+            max_tokens=self.max_prompt_length,
+        )
+        encoded = encode(compacted.text)
+        decoded_prompt = self.tokenizer.decode(encoded, skip_special_tokens=False)
+        seed = int(getattr(self._thread_local, "generation_counter", 0))
+        self._thread_local.generation_counter = seed + 1
+        response = self._post_generate(
+            {
+                "prompts": [decoded_prompt],
+                "seeds": [seed],
+                "n": 1,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": -1,
+                "max_tokens": self.max_completion_length,
+            }
+        )
+        try:
+            completion_ids = [int(item) for item in response["completion_ids"][0]]
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid vLLM training-server response: {response}") from exc
+        return self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+
 def format_prediction(sample: EvalSample, result: Any, error: str | None = None) -> dict[str, Any]:
     prediction = {
         "qid": sample.qid,
@@ -537,6 +651,27 @@ def _configure_visible_gpus(args: Any) -> None:
 
 
 def _load_policy(args: Any) -> VLLMOpenAIPolicy:
+    transport = str(getattr(args, "vllm_transport", "openai"))
+    if transport == "training_server":
+        try:
+            from transformers import AutoTokenizer
+        except ModuleNotFoundError as exc:
+            raise SystemExit("transformers is required for training-server evaluation.") from exc
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
+        return VLLMTrainingServerPolicy(
+            tokenizer=tokenizer,
+            base_urls=list(getattr(args, "vllm_base_urls", []) or []),
+            model=getattr(args, "vllm_model", ""),
+            api_key_env=getattr(args, "vllm_api_key_env", ""),
+            system_prompt=getattr(args, "system_prompt", None),
+            max_prompt_length=getattr(args, "max_prompt_length", 4096),
+            max_completion_length=args.max_completion_length,
+            temperature=args.temperature,
+            top_p=args.top_p,
+            timeout=args.vllm_timeout,
+            retries=args.vllm_retries,
+            retry_sleep_seconds=args.vllm_retry_sleep_seconds,
+        )
     return VLLMOpenAIPolicy(
         base_urls=list(getattr(args, "vllm_base_urls", []) or []),
         model=getattr(args, "vllm_model", ""),
@@ -600,7 +735,7 @@ def _args_to_jsonable(args: Any) -> dict[str, Any]:
     return {
         key: value
         for key, value in vars(args).items()
-        if isinstance(value, (str, int, float, bool, list, tuple, type(None)))
+        if key != "config" and isinstance(value, (str, int, float, bool, list, tuple, type(None)))
     }
 
 

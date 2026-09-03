@@ -1,0 +1,17 @@
+# Qwen2.5-7B SFT adapter 的独立 vLLM 服务配置。
+vllm_bin: "/data/conda/envs/macorag/bin/vllm"
+model_path: "model/Qwen2.5-7B-Instruct"
+adapter_path: "outputs/sft_Qwen2.5-7B/2026-09-02_19-13-57/adapter"
+vllm_model: "macorag-qwen2.5-7b-sft"
+
+# 与默认 Llama 服务的 GPU 1、端口 8000 分离。
+gpu_indices: "1"
+vllm_base_urls:
+  - "http://127.0.0.1:8001/v1"
+
+dtype: "bfloat16"
+gpu_memory_utilization: 0.85
+max_model_len: 8192
+
+extra_args:
+  - "--disable-log-requests"

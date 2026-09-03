@@ -259,6 +259,45 @@ def test_parse_args_loads_train_grpo_yaml(tmp_path: Path) -> None:
     assert args.disable_tqdm is False
 
 
+def test_parse_args_loads_degenerate_bucket_fallback_weight(tmp_path: Path) -> None:
+    config = tmp_path / "train.yml"
+    config.write_text(
+        "\n".join(
+            ["degenerate_bucket_fallback_weight: 0.2"]
+        ),
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.degenerate_bucket_fallback_weight == pytest.approx(0.2)
+
+
+def test_parse_args_rejects_invalid_degenerate_bucket_fallback_weight(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = tmp_path / "train.yml"
+    config.write_text("degenerate_bucket_fallback_weight: 1.1", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        parse_args(["--config", str(config)])
+
+    assert "degenerate_bucket_fallback_weight" in capsys.readouterr().err
+
+
+def test_degenerate_bucket_fallback_weight_is_checkpoint_critical() -> None:
+    from rl_training import checkpointing
+
+    baseline = parse_args([])
+    baseline_hash = checkpointing.fingerprint_config(baseline)
+    changed = Namespace(**vars(baseline))
+    changed.degenerate_bucket_fallback_weight = 0.3
+    assert checkpointing.fingerprint_config(changed) != baseline_hash
+
+    assert checkpointing.CHECKPOINT_SCHEMA_VERSION == 3
+
+
 def test_active_config_exposes_manual_sft_adapter_path() -> None:
     from rl_training.config import parse_args
 
@@ -730,6 +769,7 @@ class _FakeDualAdapterModel(torch.nn.Module):
         self.policy_parameter = torch.nn.Parameter(torch.tensor([1.0]), requires_grad=True)
         self.reference_parameter = torch.nn.Parameter(torch.tensor([2.0]), requires_grad=False)
         self.active_adapter = "default"
+        self.dropout = torch.nn.Dropout(p=0.05)
         self.loaded_adapters: list[tuple[str, bool]] = []
         self.gradient_checkpointing_calls: list[dict[str, object]] = []
 
@@ -1267,8 +1307,18 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         },
     }
     rollouts = [
-        {"advantage": -1.0, "rewards": {"total": 1.0}, "actions": [Namespace(advantage=-0.5)]},
-        {"advantage": 1.0, "rewards": {"total": 3.0}, "actions": [Namespace(advantage=1.0)]},
+        {
+            "advantage": -1.0,
+            "terminal_reward": 1.0,
+            "rewards": {"total": 1.5},
+            "actions": [Namespace(advantage=-0.5)],
+        },
+        {
+            "advantage": 1.0,
+            "terminal_reward": 3.0,
+            "rewards": {"total": 3.5},
+            "actions": [Namespace(advantage=1.0)],
+        },
     ]
     metrics = {
         "loss": 0.2,
@@ -1305,6 +1355,12 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "retrieval_cache_hits": 3,
         "retrieval_cache_misses": 2,
         "time_reward_seconds": 0.3,
+        "effective_group_size": 4,
+        "reward_unique_count": 3,
+        "terminal_unique_count": 2,
+        "primary_nonzero_action_fraction": 0.5,
+        "fallback_nonzero_action_fraction": 0.125,
+        "final_nonzero_action_fraction": 0.625,
     }
 
     payload = _build_train_metrics_payload(
@@ -1333,6 +1389,7 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
         "mean": 2.0,
         "std": 1.0,
     }
+    assert payload["monitor_reward_total"] == 2.5
     assert payload["rollout_advantage_std"] == 1.0
     assert payload["action_advantage_std"] == 0.75
     assert payload["clip_fraction"] == 0.125
@@ -1349,6 +1406,12 @@ def test_build_train_metrics_payload_includes_gold_answer_and_nested_timing() ->
     assert payload["ratio_mean"] == 1.0
     assert payload["trainable_action_count"] == 2
     assert payload["valid_completion_token_count"] == 7
+    assert payload["effective_group_size"] == 4
+    assert payload["reward_unique_count"] == 3
+    assert payload["terminal_unique_count"] == 2
+    assert payload["primary_nonzero_action_fraction"] == pytest.approx(0.5)
+    assert payload["fallback_nonzero_action_fraction"] == pytest.approx(0.125)
+    assert payload["final_nonzero_action_fraction"] == pytest.approx(0.625)
     assert payload["timing"] == {
         "rollout_seconds": 10.0,
         "vllm_generate_seconds": 6.0,
@@ -1378,6 +1441,8 @@ def test_rollout_log_payload_keeps_best_and_optionally_logs_group() -> None:
             round_index=0,
             local_reward=0.5,
             terminal_reward=1.0,
+            primary_advantage=0.25,
+            fallback_advantage=0.0,
             advantage=0.25,
         )
     ]
@@ -1408,6 +1473,8 @@ def test_rollout_log_payload_keeps_best_and_optionally_logs_group() -> None:
     assert len(payload["group_rollouts"]) == 4
     assert payload["group_rollouts"][0]["group_index"] == 0
     assert payload["group_rollouts"][0]["final_answer"] == "answer-0"
+    assert payload["group_rollouts"][0]["action_credit"][0]["primary_advantage"] == 0.25
+    assert payload["group_rollouts"][0]["action_credit"][0]["fallback_advantage"] == 0.0
 
 
 def test_resolved_args_payload_makes_runtime_values_json_serializable(tmp_path: Path) -> None:
@@ -1423,6 +1490,17 @@ def test_resolved_args_payload_makes_runtime_values_json_serializable(tmp_path: 
         "flag": True,
         "nested": {"devices": ["0", "1"]},
         "output_path": str(tmp_path / "output"),
+    }
+
+
+def test_group_diversity_contract_records_training_semantics() -> None:
+    contract = train_grpo_module._group_diversity_contract(
+        Namespace(group_size=4, degenerate_bucket_fallback_weight=0.2)
+    )
+
+    assert contract == {
+        "group_size": 4,
+        "degenerate_bucket_fallback_weight": 0.2,
     }
 
 
@@ -3404,9 +3482,9 @@ def test_run_grpo_vllm_lora_server_script_removed_after_merging_into_main_launch
     assert not Path("scripts/run_grpo_vllm_lora_server.sh").exists()
 
 
-def test_compute_answer_f1_uses_normalized_token_overlap_and_aliases() -> None:
+def test_compute_answer_f1_uses_fixed_validation_gold_only_contract() -> None:
     assert compute_answer_f1("the david  arquette!", "David Arquette", []) == 1.0
-    assert compute_answer_f1("Arquette", "David Arquette", ["Arquette"]) == 1.0
+    assert compute_answer_f1("Arquette", "David Arquette", ["Arquette"]) == 2 / 3
     assert compute_answer_f1("David", "David Arquette", []) == 2 / 3
     assert compute_answer_f1("", "David Arquette", []) == 0.0
 
@@ -3584,6 +3662,49 @@ def test_compute_action_rewards_requires_all_labeled_support_facts() -> None:
     assert answer_reward["components"]["correct_wait"] == 0.25
     assert answer_reward["components"]["false_abstention"] == 0.0
     assert rewards["terminal_reward"] == 2 / 3
+
+
+def test_rewards_collapse_multiple_support_sentences_from_the_same_document() -> None:
+    supports = [
+        {"doc_id": "d1", "title": "Doc 1", "text": "First supporting sentence."},
+        {"doc_id": "d1", "title": "Doc 1", "text": "Second supporting sentence."},
+        {"doc_id": "d2", "title": "Doc 2", "text": "Third supporting sentence."},
+    ]
+    passages = [
+        {"passage_id": 0, **supports[0]},
+        {"passage_id": 1, **supports[2]},
+    ]
+    rollout = {
+        "trajectory": [
+            {
+                "round": 0,
+                "query_retriever": {
+                    "sub_goal": "collect facts",
+                    "query": "collect both supporting documents",
+                },
+                "observation": {"passages": passages},
+                "update_evidence": {"selected_passage_ids": [0, 1]},
+                "answer": {"can_answer": True, "answer": "result"},
+            }
+        ],
+        "parse_errors": [],
+        "final_answer": "result",
+    }
+    sample = {"answer": "result", "answer_aliases": [], "supporting_facts": supports}
+
+    action_rewards = reward_module.compute_action_rewards(rollout=rollout, sample=sample)
+    monitor_rewards = compute_rl_rewards(rollout=rollout, sample=sample)
+    answer_reward = next(
+        item
+        for item in action_rewards["action_rewards"]
+        if item["role"] == "answer_generator"
+    )
+
+    assert action_rewards["terminal_reward"] == 3.0
+    assert answer_reward["components"]["premature_answer"] == 0.0
+    assert monitor_rewards["support_facts_required"] == 2.0
+    assert monitor_rewards["support_facts_covered"] == 2.0
+    assert monitor_rewards["support_coverage"] == 1.0
 
 
 def test_compute_rl_rewards_scores_query_evidence_and_final_answer() -> None:
@@ -3852,6 +3973,27 @@ def test_compute_grpo_loss_uses_advantages_clipping_and_kl() -> None:
     assert metrics["ratio_p95"] >= metrics["ratio_mean"]
 
 
+def test_compute_grpo_loss_weights_actions_equally_despite_completion_length() -> None:
+    zeros = torch.zeros((2, 3), dtype=torch.float32)
+    mask = torch.tensor(
+        [[True, False, False], [True, True, True]],
+        dtype=torch.bool,
+    )
+
+    loss, metrics = compute_grpo_loss(
+        current_logprobs=zeros,
+        old_logprobs=zeros,
+        ref_logprobs=zeros,
+        action_mask=mask,
+        advantages=torch.tensor([1.0, -1.0]),
+        clip_epsilon=0.2,
+        kl_beta=0.02,
+    )
+
+    assert float(loss.item()) == pytest.approx(0.0)
+    assert metrics["policy_loss"] == pytest.approx(0.0)
+
+
 def test_assign_action_advantages_normalizes_combined_returns_by_role_across_rounds() -> None:
     class Action:
         def __init__(self, role: AgentRole, round_index: int) -> None:
@@ -3981,6 +4123,146 @@ def test_assign_action_advantages_can_normalize_by_role_and_round() -> None:
     assert q1_low.advantage == pytest.approx(-1.0)
     assert q1_high.advantage == pytest.approx(1.0)
     assert set(stats) == {"query_retriever@round=0", "query_retriever@round=1"}
+
+
+def test_assign_action_advantages_does_not_compare_tied_buckets_across_rounds() -> None:
+    class Action:
+        def __init__(self, round_index: int) -> None:
+            self.role = AgentRole.QUERY_RETRIEVER
+            self.round_index = round_index
+
+    rollouts = []
+    for _ in range(2):
+        actions = [Action(0), Action(1)]
+        action_rewards = [
+            {"role": "query_retriever", "round_index": 0, "local_reward": 0.0},
+            {"role": "query_retriever", "round_index": 1, "local_reward": 2.0},
+        ]
+        rollouts.append(
+            {
+                "actions": actions,
+                "terminal_reward": 0.0,
+                "action_rewards": action_rewards,
+            }
+        )
+
+    stats = trainer_module.assign_action_advantages(
+        rollouts,
+        global_weights={"query_retriever": 1.0},
+        granularity="role_round",
+        degenerate_bucket_fallback_weight=0.2,
+    )
+
+    for rollout in rollouts:
+        round_zero, round_one = rollout["actions"]
+        assert round_zero.primary_advantage == 0.0
+        assert round_zero.fallback_advantage == 0.0
+        assert round_zero.advantage == 0.0
+        assert round_one.primary_advantage == 0.0
+        assert round_one.fallback_advantage == 0.0
+        assert round_one.advantage == 0.0
+    assert stats["query_retriever@round=1"]["count"] == 2
+    assert stats["query_retriever@round=1"]["primary_advantage_std"] == 0.0
+    assert stats["query_retriever@round=1"]["fallback_advantage_std"] == 0.0
+
+
+def test_assign_action_advantages_uses_same_bucket_terminal_fallback() -> None:
+    actions = [
+        Namespace(role=AgentRole.QUERY_RETRIEVER, round_index=0)
+        for _ in range(2)
+    ]
+    rollouts = [
+        {
+            "actions": [actions[0]],
+            "terminal_reward": 0.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": 0.0}
+            ],
+        },
+        {
+            "actions": [actions[1]],
+            "terminal_reward": 2.0,
+            "action_rewards": [
+                {"role": "query_retriever", "round_index": 0, "local_reward": -2.0}
+            ],
+        },
+    ]
+
+    trainer_module.assign_action_advantages(
+        rollouts,
+        global_weights={"query_retriever": 1.0},
+        granularity="role_round",
+        degenerate_bucket_fallback_weight=0.2,
+    )
+
+    assert actions[0].primary_advantage == 0.0
+    assert actions[1].primary_advantage == 0.0
+    assert actions[0].fallback_advantage == pytest.approx(-0.2)
+    assert actions[1].fallback_advantage == pytest.approx(0.2)
+
+
+def test_assign_action_advantages_keeps_degenerate_role_zero_without_signal() -> None:
+    action = Namespace(role=AgentRole.QUERY_RETRIEVER, round_index=1)
+    rollout = {
+        "actions": [action],
+        "terminal_reward": 2.0,
+        "action_rewards": [
+            {"role": "query_retriever", "round_index": 1, "local_reward": 0.0}
+        ],
+    }
+
+    trainer_module.assign_action_advantages(
+        [rollout],
+        global_weights={"query_retriever": 1.0},
+        granularity="role_round",
+        degenerate_bucket_fallback_weight=0.2,
+    )
+
+    assert action.primary_advantage == 0.0
+    assert action.fallback_advantage == 0.0
+    assert action.advantage == 0.0
+
+
+@pytest.mark.parametrize("weight", [-0.1, 1.1, float("nan")])
+def test_assign_action_advantages_rejects_invalid_degenerate_fallback_weight(
+    weight: float,
+) -> None:
+    with pytest.raises(ValueError, match="fallback weight"):
+        trainer_module.assign_action_advantages(
+            [],
+            global_weights={"query_retriever": 1.0},
+            degenerate_bucket_fallback_weight=weight,
+        )
+
+
+def test_assign_action_advantages_zeroes_roundoff_only_buckets() -> None:
+    actions = [
+        Namespace(role=AgentRole.QUERY_RETRIEVER, round_index=0)
+        for _ in range(4)
+    ]
+    rollouts = [
+        {
+            "actions": [action],
+            "terminal_reward": 3.0,
+            "action_rewards": [
+                {
+                    "role": "query_retriever",
+                    "round_index": 0,
+                    "local_reward": 0.1,
+                }
+            ],
+        }
+        for action in actions
+    ]
+
+    trainer_module.assign_action_advantages(
+        rollouts,
+        global_weights={"query_retriever": 1.0 / 3.0},
+        granularity="role_round",
+        degenerate_bucket_fallback_weight=0.2,
+    )
+
+    assert [action.advantage for action in actions] == [0.0] * 4
 
 
 @pytest.mark.parametrize(
@@ -4268,7 +4550,7 @@ def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypat
 
     model = _FakeDualAdapterModel()
     model.train()
-    observations: list[tuple[str, bool, bool, bool]] = []
+    observations: list[tuple[str, bool, bool, bool, bool]] = []
 
     def fake_batched_sequence_logprobs(*, model, completion_id_batches, **kwargs):
         del kwargs
@@ -4276,6 +4558,7 @@ def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypat
             (
                 model.active_adapter,
                 model.training,
+                model.dropout.training,
                 model.policy_parameter.requires_grad,
                 model.reference_parameter.requires_grad,
             )
@@ -4304,12 +4587,32 @@ def test_train_on_rollouts_shared_model_switches_reference_then_policy(monkeypat
     )
 
     assert observations == [
-        ("default", False, True, False),
-        ("reference", False, False, False),
-        ("default", False, True, False),
+        ("default", False, False, True, False),
+        ("reference", False, False, False, False),
+        ("default", True, False, True, False),
     ]
     assert model.active_adapter == "default"
-    assert model.training is False
+    assert model.training is True
+    assert model.dropout.training is False
+
+
+def test_deterministic_policy_train_mode_enables_checkpoint_layers_but_not_dropout() -> None:
+    from rl_training.train_grpo_macorag import _set_deterministic_policy_train_mode
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.checkpoint_layer = torch.nn.Linear(2, 2)
+            self.dropout = torch.nn.Dropout(p=0.05)
+
+    model = Model()
+    model.eval()
+
+    _set_deterministic_policy_train_mode(model, torch=torch)
+
+    assert model.training is True
+    assert model.checkpoint_layer.training is True
+    assert model.dropout.training is False
 
 
 def test_save_checkpoint_saves_only_policy_adapter(tmp_path: Path) -> None:

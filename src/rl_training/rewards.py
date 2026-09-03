@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import re
 import string
-from collections import Counter
 from typing import Any
 
+from answer_metrics import calculate_f1
 from rag.parser import parse_can_answer
 
 
@@ -15,28 +15,13 @@ def _normalize_answer(value: Any) -> str:
     return " ".join(text.split())
 
 
-def _tokens(value: Any) -> list[str]:
-    normalized = _normalize_answer(value)
-    return normalized.split() if normalized else []
-
-
-def _f1(prediction: Any, ground_truth: Any) -> float:
-    prediction_tokens = _tokens(prediction)
-    ground_truth_tokens = _tokens(ground_truth)
-    if not prediction_tokens or not ground_truth_tokens:
-        return 1.0 if prediction_tokens == ground_truth_tokens else 0.0
-    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
-    num_same = sum(common.values())
-    if num_same == 0:
-        return 0.0
-    precision = num_same / len(prediction_tokens)
-    recall = num_same / len(ground_truth_tokens)
-    return 2 * precision * recall / (precision + recall)
-
-
 def compute_answer_f1(prediction: Any, gold_answer: Any, answer_aliases: list[str]) -> float:
-    candidates = [gold_answer, *(answer_aliases or [])]
-    return max((_f1(prediction, candidate) for candidate in candidates), default=0.0)
+    """Use the fixed evaluator's gold-only metric, including punctuation handling.
+
+    Keep the aliases argument for callers/data compatibility, but do not score
+    aliases: the fixed validation evaluator does not use them either.
+    """
+    return calculate_f1(prediction, gold_answer)
 
 
 def _supporting_fact_texts(sample: dict[str, Any]) -> list[str]:
@@ -52,25 +37,10 @@ def _supporting_fact_texts(sample: dict[str, Any]) -> list[str]:
     return texts
 
 
-def _supporting_fact_groups(sample: dict[str, Any]) -> list[list[str]]:
-    facts = sample.get("supporting_facts") or []
-    groups: list[list[str]] = []
-    for fact in facts:
-        if not isinstance(fact, dict):
-            continue
-        group = []
-        for key in ("doc_id", "title", "text"):
-            value = str(fact.get(key) or "").strip()
-            if value:
-                group.append(value)
-        if group:
-            groups.append(group)
-    return groups
-
-
 def _supporting_fact_items(sample: dict[str, Any]) -> list[dict[str, str]]:
     facts = sample.get("supporting_facts") or []
     items: list[dict[str, str]] = []
+    seen_units: set[tuple[str, str]] = set()
     for fact in facts:
         if not isinstance(fact, dict):
             continue
@@ -79,7 +49,19 @@ def _supporting_fact_items(sample: dict[str, Any]) -> list[dict[str, str]]:
             for key in ("doc_id", "title", "text")
             if str(fact.get(key) or "").strip()
         }
-        if item:
+        if not item:
+            continue
+        # Retrieval and evidence selection operate on passages/documents, not
+        # individual supporting-fact sentences.  Collapse multiple labeled
+        # sentences from the same document into one reachable reward unit.
+        if item.get("doc_id"):
+            unit = ("doc_id", _normalize_answer(item["doc_id"]))
+        elif item.get("title"):
+            unit = ("title", _normalize_answer(item["title"]))
+        else:
+            unit = ("text", _normalize_answer(item.get("text")))
+        if unit not in seen_units:
+            seen_units.add(unit)
             items.append(item)
     return items
 
@@ -241,15 +223,14 @@ def _matched_supporting_fact_index(
 
 
 def _support_facts_required(sample: dict[str, Any]) -> int:
-    return len(_supporting_fact_groups(sample))
+    return len(_supporting_fact_items(sample))
 
 
-def _legacy_support_facts_required(sample: dict[str, Any]) -> int:
-    support_count = _support_facts_required(sample)
-    return 2 if support_count >= 2 else support_count
-
-
-def compute_action_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> dict[str, Any]:
+def compute_action_rewards(
+    *, rollout: dict[str, Any], sample: dict[str, Any], answer_local_reward_weight: float = 1.0,
+) -> dict[str, Any]:
+    if not 0.0 <= answer_local_reward_weight <= 1.0:
+        raise ValueError("answer_local_reward_weight must be between 0 and 1")
     trajectory = rollout.get("trajectory") or []
     supporting_facts = _supporting_fact_items(sample)
     support_required = _support_facts_required(sample)
@@ -356,6 +337,10 @@ def compute_action_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -
         }
         if can_answer and has_support_supervision and not evidence_sufficient:
             answer_components["premature_answer"] = -0.25 if answer_f1 > 0.0 else -1.0
+        # Ablate the entire local answer/wait preference, not just the wait
+        # penalty. Keep format penalties and all terminal rewards unchanged.
+        for key in ("answer_correctness", "correct_wait", "false_abstention", "premature_answer"):
+            answer_components[key] *= answer_local_reward_weight
         if "answer_generator" in generated_roles:
             action_rewards.append(
                 {
@@ -410,7 +395,7 @@ def compute_rl_rewards(*, rollout: dict[str, Any], sample: dict[str, Any]) -> di
     evidence_reward = _evidence_reward(trajectory, sample)
     answer_reward = 2.0 * answer_f1
     format_reward = 0.0 if parse_errors else 0.25
-    support_facts_required = _legacy_support_facts_required(sample)
+    support_facts_required = _support_facts_required(sample)
     support_facts_covered = _covered_supporting_fact_count(trajectory, sample)
     support_coverage = (
         min(1.0, support_facts_covered / support_facts_required)

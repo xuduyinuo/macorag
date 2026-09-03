@@ -11,18 +11,21 @@ from pathlib import Path
 
 import pytest
 
-from rag import RAGState
+from rag import AgentRole, RAGState
 from evaluation.config import parse_args
 from evaluation.data import EvalSample, load_eval_samples
 from evaluation.output import make_run_dir
 from evaluation.vllm_servers import build_commands, parse_args as parse_vllm_server_args, run_commands
 from evaluation.evaluate_rag_model import (
+    _adapter_identity,
+    _args_to_jsonable,
     _prepare_resume_identity,
     _validate_fixed_manifest,
     _build_retrieval_env,
     _configure_visible_gpus,
     _load_policy,
     VLLMOpenAIPolicy,
+    VLLMTrainingServerPolicy,
     format_prediction,
     main,
     run_predictions,
@@ -161,6 +164,65 @@ def test_fixed_eval_config_supports_stable_resumable_output(tmp_path: Path) -> N
     assert args.adapter_identity_path == "outputs/sft/adapter"
 
 
+def test_fixed_eval_config_supports_training_server_and_four_workers(tmp_path: Path) -> None:
+    config = tmp_path / "eval.yml"
+    config.write_text(
+        "vllm_transport: training_server\neval_request_workers: 4\n",
+        encoding="utf-8",
+    )
+
+    args = parse_args(["--config", str(config)])
+
+    assert args.vllm_transport == "training_server"
+    assert args.eval_request_workers == 4
+
+
+def test_training_server_policy_uses_thread_local_deterministic_seeds() -> None:
+    class FakeTokenizer:
+        def apply_chat_template(self, messages, *, add_generation_prompt, tokenize):
+            assert add_generation_prompt is True
+            assert tokenize is True
+            return [1, 2, 3]
+
+        def decode(self, token_ids, *, skip_special_tokens):
+            if skip_special_tokens:
+                return "generated"
+            return "encoded-prompt"
+
+    policy = VLLMTrainingServerPolicy(
+        tokenizer=FakeTokenizer(),
+        base_urls=["http://127.0.0.1:8000/v1"],
+        model="macorag",
+        api_key_env="",
+        system_prompt=None,
+        max_prompt_length=2048,
+        max_completion_length=192,
+        temperature=0.0,
+        top_p=0.95,
+        timeout=10,
+        retries=1,
+        retry_sleep_seconds=0.0,
+    )
+    payloads = []
+    policy._post_generate = lambda payload: payloads.append(payload) or {"completion_ids": [[9]]}
+    policy.set_endpoint_index(3)
+
+    first = policy.generate(
+        role=AgentRole.QUERY_RETRIEVER,
+        question="question",
+        state=RAGState(question="question"),
+    )
+    policy.generate(
+        role=AgentRole.QUERY_RETRIEVER,
+        question="question",
+        state=RAGState(question="question"),
+    )
+
+    assert first == "generated"
+    assert policy._endpoint() == "http://127.0.0.1:8000/generate/"
+    assert [payload["seeds"] for payload in payloads] == [[300], [301]]
+
+
 def _run_eval_launcher_dry_run(*, config_path: Path, extra_args: list[str]) -> str:
     env = os.environ.copy()
     env["CONFIG_PATH"] = str(config_path)
@@ -231,7 +293,7 @@ def test_model_vllm_server_config_file_exists() -> None:
     text = config.read_text(encoding="utf-8")
 
     assert 'vllm_bin: "/data/conda/envs/macorag/bin/vllm"' in text
-    assert 'model_path: "model/Qwen2.5-7B-Instruct"' in text
+    assert 'model_path: "model/NousResearch-Meta-Llama-3-8B-Instruct"' in text
     assert 'adapter_path: "' in text
     assert "vllm_model:" in text
     assert "gpu_indices:" in text
@@ -248,15 +310,58 @@ def test_model_vllm_server_config_file_exists() -> None:
 def test_eval_macorag_config_is_vllm_client_only() -> None:
     text = Path("config/eval_macorag.yml").read_text(encoding="utf-8")
     eval_args = parse_args(["--config", "config/eval_macorag.yml"])
+    server_args = parse_vllm_server_args(["--config", "config/eval_vllm_server.yml"])
 
     assert eval_args.data_root == "data/eval_1000_stratified_v2"
     assert eval_args.retrieval_root == "data/eval_1000_stratified_v2_e5_faiss"
-    assert "model_path:" not in text
-    assert "adapter_path:" not in text
+    assert "model_path:" in text
+    assert "adapter_path:" in text
     assert "inference_backend:" not in text
-    assert not hasattr(eval_args, "model_path")
-    assert not hasattr(eval_args, "adapter_path")
+    assert eval_args.model_path == server_args.model_path
+    assert eval_args.adapter_path == server_args.adapter_path
+    assert eval_args.adapter_identity_path == server_args.adapter_path
     assert not hasattr(eval_args, "inference_backend")
+
+
+def test_run_config_snapshot_excludes_config_path_and_keeps_model_provenance() -> None:
+    args = SimpleNamespace(
+        config="/tmp/eval.yml",
+        data_root="data/eval",
+        max_rounds=4,
+        model_path="model/base",
+        adapter_path="outputs/sft/adapter",
+    )
+
+    snapshot = _args_to_jsonable(args)
+
+    assert "config" not in snapshot
+    assert snapshot == {
+        "data_root": "data/eval",
+        "max_rounds": 4,
+        "model_path": "model/base",
+        "adapter_path": "outputs/sft/adapter",
+    }
+
+
+def test_adapter_identity_records_and_validates_corresponding_base_model(tmp_path: Path) -> None:
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        json.dumps({"base_model_name_or_path": "model/base"}), encoding="utf-8"
+    )
+    (adapter / "prompt_contract.json").write_text("{}", encoding="utf-8")
+    (adapter / "adapter_model.safetensors").write_bytes(b"weights")
+
+    identity = _adapter_identity(
+        SimpleNamespace(adapter_identity_path=str(adapter), model_path="model/base")
+    )
+
+    assert identity["path"] == str(adapter)
+    assert identity["base_model_path"] == "model/base"
+    with pytest.raises(ValueError, match="base model mismatch"):
+        _adapter_identity(
+            SimpleNamespace(adapter_identity_path=str(adapter), model_path="model/other")
+        )
 
 
 def test_vllm_server_module_builds_commands_from_config_and_cli(tmp_path: Path) -> None:
@@ -1772,3 +1877,7 @@ def test_main_uses_timestamped_output_root_before_startup_failure(
     assert stale_parent_file.exists()
     assert (run_dir / "run_config.json").exists()
     assert (run_dir / "data_summary.json").exists()
+    recorded = json.loads((run_dir / "run_config.json").read_text(encoding="utf-8"))
+    assert "config" not in recorded
+    assert recorded["model_path"] == "model/base"
+    assert recorded["adapter_path"] == "outputs/grpo/adapter"

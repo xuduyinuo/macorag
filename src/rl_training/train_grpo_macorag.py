@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 
+from answer_metrics import ANSWER_F1_CONTRACT
 from rag import RAGLoopExecutor
 
 from .config import parse_args
@@ -215,6 +216,21 @@ def _activate_policy_adapter(model: Any) -> None:
         raise SystemExit(f"Shared-base GRPO found non-policy trainable parameters: {preview}")
     if not trainable_names:
         raise SystemExit("Shared-base GRPO policy adapter has no trainable parameters.")
+
+
+def _set_deterministic_policy_train_mode(model: Any, *, torch: Any) -> None:
+    """Enable gradient checkpointing's train path without stochastic dropout."""
+    train = getattr(model, "train", None)
+    if not callable(train):
+        return
+    train()
+    modules = getattr(model, "modules", None)
+    if not callable(modules):
+        return
+    dropout_base = torch.nn.modules.dropout._DropoutNd
+    for module in modules():
+        if isinstance(module, dropout_base):
+            module.eval()
 
 
 @contextmanager
@@ -581,18 +597,48 @@ def _flush_pending_gradients_if_finite(
     return True
 
 
-def _rollout_group(
+_ROLLOUT_TIMING_KEYS = (
+    "time_rollout_seconds",
+    "time_vllm_generate_seconds",
+    "time_behavior_rescore_seconds",
+    "time_reward_seconds",
+    "time_retrieval_seconds",
+    "retrieval_cache_hits",
+    "retrieval_cache_misses",
+)
+
+
+def _empty_rollout_timing() -> dict[str, Any]:
+    return {
+        "time_rollout_seconds": 0.0,
+        "time_vllm_generate_seconds": 0.0,
+        "time_behavior_rescore_seconds": 0.0,
+        "time_reward_seconds": 0.0,
+        "time_retrieval_seconds": 0.0,
+        "retrieval_cache_hits": 0,
+        "retrieval_cache_misses": 0,
+    }
+
+
+def _accumulate_rollout_timing(total: dict[str, Any], update: dict[str, Any]) -> None:
+    for key in _ROLLOUT_TIMING_KEYS:
+        total[key] = total.get(key, 0) + update.get(key, 0)
+
+
+def _generate_rollout_candidates(
     *,
     args: Any,
     sample: RLSample,
     policy: HFSharedPolicy,
     retrieval_env: CachedLinearRAGRetrievalEnv,
+    candidate_count: int,
+    group_index_offset: int = 0,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
-    rollouts: list[dict[str, Any]] = []
+    if candidate_count <= 0:
+        raise ValueError("candidate_count must be positive")
     time_rollout_seconds = 0.0
     time_vllm_generate_seconds = 0.0
     time_behavior_rescore_seconds = 0.0
-    time_reward_seconds = 0.0
     retrieval_stats = getattr(retrieval_env, "stats", None)
     retrieval_before = retrieval_stats() if callable(retrieval_stats) else {}
 
@@ -603,7 +649,7 @@ def _rollout_group(
         batch_results = run_batched_rollouts(
             question=sample.question,
             dataset=sample.dataset,
-            group_size=args.group_size,
+            group_size=candidate_count,
             max_rounds=args.max_rounds,
             policy=policy,
             retrieval_env=retrieval_env,
@@ -616,12 +662,12 @@ def _rollout_group(
             getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
         )
         group_results = [
-            (group_index, item.result, item.trace)
+            (group_index_offset + group_index, item.result, item.trace)
             for group_index, item in enumerate(batch_results)
         ]
     else:
         group_results = []
-        for group_index in range(args.group_size):
+        for group_index in range(candidate_count):
             policy.reset_trace()
             executor = RAGLoopExecutor(policy=policy, retrieval_env=retrieval_env, max_rounds=args.max_rounds)
             rollout_start = time.perf_counter()
@@ -633,27 +679,67 @@ def _rollout_group(
             time_behavior_rescore_seconds += float(
                 getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
             )
-            group_results.append((group_index, result, policy.trace))
+            group_results.append(
+                (group_index_offset + group_index, result, policy.trace)
+            )
 
+    rollouts: list[dict[str, Any]] = []
     for group_index, result, trace in group_results:
-        rollout = {
-            "group_index": group_index,
-            "result": result,
-            "trajectory": result.trajectory,
-            "parse_errors": result.parse_errors,
-            "final_answer": result.final_answer,
-            "actions": list(trace.actions),
-        }
-        reward_start = time.perf_counter()
-        rewards = compute_rl_rewards(rollout=rollout, sample=sample.to_reward_sample())
-        action_credit = compute_action_rewards(rollout=rollout, sample=sample.to_reward_sample())
-        time_reward_seconds += time.perf_counter() - reward_start
+        rollouts.append(
+            {
+                "group_index": group_index,
+                "result": result,
+                "trajectory": result.trajectory,
+                "parse_errors": result.parse_errors,
+                "final_answer": result.final_answer,
+                "actions": list(trace.actions),
+            }
+        )
+    retrieval_after = retrieval_stats() if callable(retrieval_stats) else {}
+    return rollouts, {
+        "time_rollout_seconds": time_rollout_seconds,
+        "time_vllm_generate_seconds": time_vllm_generate_seconds,
+        "time_behavior_rescore_seconds": time_behavior_rescore_seconds,
+        "time_reward_seconds": 0.0,
+        "time_retrieval_seconds": float(
+            retrieval_after.get("time_retrieval_seconds", 0.0)
+            - retrieval_before.get("time_retrieval_seconds", 0.0)
+        ),
+        "retrieval_cache_hits": int(
+            retrieval_after.get("cache_hits", 0) - retrieval_before.get("cache_hits", 0)
+        ),
+        "retrieval_cache_misses": int(
+            retrieval_after.get("cache_misses", 0)
+            - retrieval_before.get("cache_misses", 0)
+        ),
+    }
+
+
+def _score_rollout_candidates(
+    *,
+    args: Any,
+    sample: RLSample,
+    rollouts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    reward_start = time.perf_counter()
+    reward_sample = sample.to_reward_sample()
+    for rollout in rollouts:
+        rewards = compute_rl_rewards(rollout=rollout, sample=reward_sample)
+        action_credit = compute_action_rewards(
+            rollout=rollout,
+            sample=reward_sample,
+            answer_local_reward_weight=float(getattr(args, "answer_local_reward_weight", 1.0)),
+        )
         rollout["rewards"] = rewards
         rollout["action_rewards"] = action_credit["action_rewards"]
         rollout["terminal_reward"] = action_credit["terminal_reward"]
-        rollouts.append(rollout)
-    reward_start = time.perf_counter()
-    advantages = normalize_group_advantages([item["rewards"]["total"] for item in rollouts])
+        if not math.isfinite(float(rewards["total"])):
+            raise RuntimeError("Rollout aggregate reward must be finite.")
+        if not math.isfinite(float(action_credit["terminal_reward"])):
+            raise RuntimeError("Rollout terminal reward must be finite.")
+    advantages = normalize_group_advantages(
+        [float(item["terminal_reward"]) for item in rollouts]
+    )
     for rollout, advantage in zip(rollouts, advantages):
         rollout["advantage"] = advantage
     agent_credit_stats = assign_action_advantages(
@@ -665,26 +751,107 @@ def _rollout_group(
         },
         epsilon=float(args.advantage_epsilon),
         granularity=str(getattr(args, "advantage_granularity", "role_only")),
+        degenerate_bucket_fallback_weight=float(
+            getattr(args, "degenerate_bucket_fallback_weight", 0.0)
+        ),
     )
-    time_reward_seconds += time.perf_counter() - reward_start
-    retrieval_after = retrieval_stats() if callable(retrieval_stats) else {}
-    return rollouts, {
-        "time_rollout_seconds": time_rollout_seconds,
-        "time_vllm_generate_seconds": time_vllm_generate_seconds,
-        "time_behavior_rescore_seconds": time_behavior_rescore_seconds,
-        "time_reward_seconds": time_reward_seconds,
-        "time_retrieval_seconds": float(
-            retrieval_after.get("time_retrieval_seconds", 0.0)
-            - retrieval_before.get("time_retrieval_seconds", 0.0)
-        ),
-        "retrieval_cache_hits": int(
-            retrieval_after.get("cache_hits", 0) - retrieval_before.get("cache_hits", 0)
-        ),
-        "retrieval_cache_misses": int(
-            retrieval_after.get("cache_misses", 0) - retrieval_before.get("cache_misses", 0)
-        ),
+    for rollout in rollouts:
+        for action in rollout.get("actions", []):
+            if not math.isfinite(float(action.advantage)):
+                raise RuntimeError("Assigned action advantage must be finite.")
+    return {
+        "time_reward_seconds": time.perf_counter() - reward_start,
         "agent_credit_stats": agent_credit_stats,
     }
+
+
+def _completion_actions(rollouts: list[dict[str, Any]]) -> list[Any]:
+    return [
+        action
+        for rollout in rollouts
+        for action in rollout.get("actions", [])
+        if action.completion_ids
+    ]
+
+
+def _nonzero_action_fraction(
+    rollouts: list[dict[str, Any]],
+    *,
+    field: str,
+    tolerance: float = 1.0e-12,
+) -> float:
+    actions = _completion_actions(rollouts)
+    if not actions:
+        return 0.0
+    return sum(
+        abs(float(getattr(action, field, 0.0))) > tolerance for action in actions
+    ) / len(actions)
+
+
+def _group_diversity_snapshot(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "reward_unique_count": len(
+            {float(rollout["rewards"]["total"]) for rollout in rollouts}
+        ),
+        "terminal_unique_count": len(
+            {float(rollout["terminal_reward"]) for rollout in rollouts}
+        ),
+        "primary_nonzero_action_fraction": _nonzero_action_fraction(
+            rollouts,
+            field="primary_advantage",
+        ),
+        "fallback_nonzero_action_fraction": _nonzero_action_fraction(
+            rollouts,
+            field="fallback_advantage",
+        ),
+        "final_nonzero_action_fraction": _nonzero_action_fraction(
+            rollouts,
+            field="advantage",
+        ),
+    }
+
+
+def _rollout_group(
+    *,
+    args: Any,
+    sample: RLSample,
+    policy: HFSharedPolicy,
+    retrieval_env: CachedLinearRAGRetrievalEnv,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    rollouts, initial_timing = _generate_rollout_candidates(
+        args=args,
+        sample=sample,
+        policy=policy,
+        retrieval_env=retrieval_env,
+        candidate_count=int(args.group_size),
+    )
+    total_timing = _empty_rollout_timing()
+    _accumulate_rollout_timing(total_timing, initial_timing)
+    score_timing = _score_rollout_candidates(
+        args=args,
+        sample=sample,
+        rollouts=rollouts,
+    )
+    _accumulate_rollout_timing(total_timing, score_timing)
+    total_timing["agent_credit_stats"] = score_timing["agent_credit_stats"]
+    snapshot = _group_diversity_snapshot(rollouts)
+    total_timing.update(
+        {
+            "effective_group_size": len(rollouts),
+            "reward_unique_count": snapshot["reward_unique_count"],
+            "terminal_unique_count": snapshot["terminal_unique_count"],
+            "primary_nonzero_action_fraction": snapshot[
+                "primary_nonzero_action_fraction"
+            ],
+            "fallback_nonzero_action_fraction": snapshot[
+                "fallback_nonzero_action_fraction"
+            ],
+            "final_nonzero_action_fraction": snapshot[
+                "final_nonzero_action_fraction"
+            ],
+        }
+    )
+    return rollouts, total_timing
 
 
 def _rescore_behavior_logprobs(
@@ -824,10 +991,6 @@ def _train_on_rollouts(
         pad_token_id=pad_token_id,
         batch_size=microbatch_size,
     )
-    if callable(getattr(raw_policy_model, "eval", None)):
-        raw_policy_model.eval()
-    if train_model is not raw_policy_model and callable(getattr(train_model, "eval", None)):
-        train_model.eval()
     loss_total = 0.0
     policy_loss_total = 0.0
     kl_total = 0.0
@@ -866,6 +1029,13 @@ def _train_on_rollouts(
                         raise RuntimeError("Reference completion mask is missing valid tokens.")
                     reference_by_action.append(reference_batch[row, :completion_length].detach())
     time_reference_forward_seconds += time.perf_counter() - reference_forward_start
+
+    policy_mode_target = (
+        train_model
+        if callable(getattr(train_model, "train", None))
+        else raw_policy_model
+    )
+    _set_deterministic_policy_train_mode(policy_mode_target, torch=torch)
 
     policy_forward_batch_count = 0
     for offset in range(0, len(trainable_actions), microbatch_size):
@@ -908,21 +1078,20 @@ def _train_on_rollouts(
             clip_epsilon=args.clip_epsilon,
             kl_beta=args.kl_beta,
         )
-        microbatch_token_count = int(mask.sum().item())
-        token_weight = microbatch_token_count / total_token_count
-        loss_total += metrics["loss"] * token_weight
-        policy_loss_total += metrics["policy_loss"] * token_weight
-        kl_total += metrics["kl"] * token_weight
-        clip_fraction_total += metrics["clip_fraction"] * token_weight
-        preupdate_logratio_mean_total += metrics.get("preupdate_logratio_mean", 0.0) * token_weight
+        action_weight = len(actions) / action_count
+        loss_total += metrics["loss"] * action_weight
+        policy_loss_total += metrics["policy_loss"] * action_weight
+        kl_total += metrics["kl"] * action_weight
+        clip_fraction_total += metrics["clip_fraction"] * action_weight
+        preupdate_logratio_mean_total += metrics.get("preupdate_logratio_mean", 0.0) * action_weight
         preupdate_logratio_max_abs = max(
             preupdate_logratio_max_abs,
             metrics.get("preupdate_logratio_max_abs", 0.0),
         )
-        ratio_mean_total += metrics.get("ratio_mean", 1.0) * token_weight
-        ratio_p95_total += metrics.get("ratio_p95", 1.0) * token_weight
+        ratio_mean_total += metrics.get("ratio_mean", 1.0) * action_weight
+        ratio_p95_total += metrics.get("ratio_p95", 1.0) * action_weight
         backward_start = time.perf_counter()
-        (loss * token_weight / gradient_accumulation_steps).backward()
+        (loss * action_weight / gradient_accumulation_steps).backward()
         time_backward_seconds += time.perf_counter() - backward_start
     gradient_norm, gradients_finite = _gradient_health(raw_policy_model, torch=torch)
     gradient_norm_after_clip = gradient_norm
@@ -1070,6 +1239,15 @@ def _resolved_args_payload(args: Any) -> dict[str, Any]:
     }
 
 
+def _group_diversity_contract(args: Any) -> dict[str, Any]:
+    return {
+        "group_size": int(args.group_size),
+        "degenerate_bucket_fallback_weight": float(
+            args.degenerate_bucket_fallback_weight
+        ),
+    }
+
+
 def _build_train_metrics_payload(
     *,
     epoch: int,
@@ -1087,7 +1265,8 @@ def _build_train_metrics_payload(
     time_total_seconds: float,
     successful_optimizer_updates: int = 0,
 ) -> dict[str, Any]:
-    reward_totals = [item["rewards"]["total"] for item in rollouts]
+    reward_totals = [float(item["terminal_reward"]) for item in rollouts]
+    monitor_reward_totals = [float(item["rewards"]["total"]) for item in rollouts]
     action_advantages = [
         float(action.advantage)
         for rollout in rollouts
@@ -1131,6 +1310,17 @@ def _build_train_metrics_payload(
             "mean": reward_mean,
             "std": statistics.pstdev(reward_totals) if len(reward_totals) > 1 else 0.0,
         },
+        "monitor_reward_total": sum(monitor_reward_totals) / len(monitor_reward_totals),
+        "monitor_reward_group": {
+            "min": min(monitor_reward_totals),
+            "max": max(monitor_reward_totals),
+            "mean": sum(monitor_reward_totals) / len(monitor_reward_totals),
+            "std": (
+                statistics.pstdev(monitor_reward_totals)
+                if len(monitor_reward_totals) > 1
+                else 0.0
+            ),
+        },
         "reward_query": best_rollout["rewards"]["query_reward"],
         "reward_evidence": best_rollout["rewards"]["evidence_reward"],
         "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
@@ -1147,6 +1337,27 @@ def _build_train_metrics_payload(
             statistics.pstdev(action_advantages) if len(action_advantages) > 1 else 0.0
         ),
         "agent_credit_stats": rollout_timing.get("agent_credit_stats", {}),
+        "effective_group_size": rollout_timing.get("effective_group_size", len(rollouts)),
+        "reward_unique_count": rollout_timing.get(
+            "reward_unique_count",
+            len(set(reward_totals)),
+        ),
+        "terminal_unique_count": rollout_timing.get(
+            "terminal_unique_count",
+            len({float(item.get("terminal_reward", 0.0)) for item in rollouts}),
+        ),
+        "primary_nonzero_action_fraction": rollout_timing.get(
+            "primary_nonzero_action_fraction",
+            0.0,
+        ),
+        "fallback_nonzero_action_fraction": rollout_timing.get(
+            "fallback_nonzero_action_fraction",
+            0.0,
+        ),
+        "final_nonzero_action_fraction": rollout_timing.get(
+            "final_nonzero_action_fraction",
+            0.0,
+        ),
         "gold_answer": sample.answer,
         "generated_answer": best_rollout["final_answer"],
         "retrieval_count": len(best_rollout["trajectory"]),
@@ -1185,6 +1396,10 @@ def _action_credit_payload(action: Any) -> dict[str, Any]:
         "local_reward": action.local_reward,
         "terminal_reward": action.terminal_reward,
         "decision_return": getattr(action, "decision_return", 0.0),
+        "primary_advantage": float(
+            getattr(action, "primary_advantage", action.advantage)
+        ),
+        "fallback_advantage": float(getattr(action, "fallback_advantage", 0.0)),
         "advantage": action.advantage,
     }
 
@@ -1370,6 +1585,8 @@ def main() -> None:
     scheduler_warmup_updates = int(math.ceil(scheduler_total_updates * float(args.warmup_ratio)))
     successful_optimizer_updates = 0
     optimization_contract = {
+        "answer_f1_contract": ANSWER_F1_CONTRACT,
+        "answer_local_reward_weight": args.answer_local_reward_weight,
         "max_grad_norm": float(args.max_grad_norm),
         "logprob_source": "hf_rescore_v1",
         "load_4bit": bool(args.load_4bit),
@@ -1377,6 +1594,7 @@ def main() -> None:
         "vllm_dtype": str(args.vllm_dtype),
         "vllm_sync_mode": str(args.vllm_sync_mode),
         "vllm_sync_every_steps": int(args.vllm_sync_every_steps),
+        "group_diversity": _group_diversity_contract(args),
     }
     retrieval_env = _build_retrieval_env(args)
     retrieval_env.prewarm(sorted({sample.dataset for sample in samples}))
@@ -1527,8 +1745,14 @@ def main() -> None:
                 global_step += 1
                 last_epoch = epoch
                 last_samples_consumed = consumed_before_epoch + consumed_offset
-                reward_totals = [item["rewards"]["total"] for item in rollouts]
-                best_rollout = max(rollouts, key=lambda item: item["rewards"]["total"])
+                reward_totals = [float(item["terminal_reward"]) for item in rollouts]
+                best_rollout = max(
+                    rollouts,
+                    key=lambda item: (
+                        float(item["terminal_reward"]),
+                        float(item["rewards"]["total"]),
+                    ),
+                )
                 if progress_bar is not None:
                     progress_bar.set_postfix(
                         {
@@ -1680,12 +1904,15 @@ def main() -> None:
                 "retrieval_root": args.retrieval_root,
                 "num_rl_samples": len(samples),
                 "group_size": args.group_size,
+                "group_diversity": _group_diversity_contract(args),
                 "max_rounds": args.max_rounds,
                 "kl_beta": args.kl_beta,
                 "clip_epsilon": args.clip_epsilon,
                 "query_global_reward_weight": args.query_global_reward_weight,
                 "evidence_global_reward_weight": args.evidence_global_reward_weight,
                 "answer_global_reward_weight": args.answer_global_reward_weight,
+                "answer_local_reward_weight": args.answer_local_reward_weight,
+                "answer_f1_contract": ANSWER_F1_CONTRACT,
                 "advantage_epsilon": args.advantage_epsilon,
                 "world_size": _world_size(),
                 "global_step": global_step,

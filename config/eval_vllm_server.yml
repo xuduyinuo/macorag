@@ -1,12 +1,12 @@
 # vLLM 可执行文件和模型路径。
 # 请手动填写本次要评估的 adapter；启动器不会自动扫描最近模型。
 vllm_bin: "/data/conda/envs/macorag/bin/vllm"
-model_path: "model/Qwen2.5-7B-Instruct"
-adapter_path: "outputs/grpo_qwen2.5-7b-v2/2026-08-30_01-46-26/adapter"
+model_path: "model/NousResearch-Meta-Llama-3-8B-Instruct"
+adapter_path: "outputs/sft_Meta-Llama-3-8B/2026-09-02_16-33-54/adapter"
 vllm_model: "macorag"
 
 # 每个 base_url 的端口会启动一个服务，GPU 按顺序轮询分配。
-gpu_indices: "1"
+gpu_indices: "0"
 vllm_base_urls:
   - "http://127.0.0.1:8000/v1"
 

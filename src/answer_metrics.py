@@ -5,6 +5,8 @@ import re
 import string
 from typing import Any
 
+ANSWER_F1_CONTRACT = "normalized_token_f1_gold_only_v1"
+
 
 def normalize_answer(text: str) -> str:
     def remove_articles(value: str) -> str:

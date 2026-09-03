@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,8 @@ DATA_DEFAULTS: dict[str, Any] = {
     "system_prompt": DEFAULT_SYSTEM_PROMPT,
     "max_length": 4096,
     "max_samples": None,
+    "max_samples_by_dataset": {},
+    "data_sampling_seed": 42,
     "seed": 42,
     "max_rounds": 4,
     "retrieval_top_k": 5,
@@ -56,10 +59,12 @@ EVAL_DEFAULTS: dict[str, Any] = {
     "eval_steps": 100,
     "eval_split_ratio": 0.05,
     "validation_split": True,
+    "early_stopping_enabled": False,
     "early_stopping_patience": 3,
     "early_stopping_threshold": 0.0,
     "metric_for_best_model": "eval_loss",
     "greater_is_better": False,
+    "restore_callback_states_from_checkpoint": True,
 }
 
 # 运行环境：launcher 只读取 gpu_indices；check_only 用于数据快速检查。
@@ -87,6 +92,84 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
 
 
 BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
+CANONICAL_DATASETS = ("2wiki", "hotpotqa", "musique")
+
+
+def _parse_sample_limits(value: Any) -> dict[str, int]:
+    if value in (None, ""):
+        return {}
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise argparse.ArgumentTypeError(
+                f"max_samples_by_dataset must be a JSON mapping: {exc.msg}"
+            ) from exc
+    if not isinstance(value, dict):
+        raise argparse.ArgumentTypeError("max_samples_by_dataset must be a mapping.")
+
+    normalized: dict[str, int] = {}
+    for raw_dataset, raw_limit in value.items():
+        dataset = str(raw_dataset).strip().lower()
+        if dataset not in CANONICAL_DATASETS:
+            raise argparse.ArgumentTypeError(
+                f"max_samples_by_dataset contains unknown dataset {raw_dataset!r}; "
+                f"expected one of {', '.join(CANONICAL_DATASETS)}."
+            )
+        if isinstance(raw_limit, bool) or not isinstance(raw_limit, int) or raw_limit <= 0:
+            raise argparse.ArgumentTypeError(
+                f"max_samples_by_dataset[{dataset!r}] must be a positive integer; got {raw_limit!r}."
+            )
+        normalized[dataset] = raw_limit
+    return normalized
+
+
+def _validate_args(args: argparse.Namespace) -> None:
+    try:
+        args.max_samples_by_dataset = _parse_sample_limits(args.max_samples_by_dataset)
+    except argparse.ArgumentTypeError as exc:
+        raise SystemExit(str(exc)) from exc
+    if args.max_samples is not None and args.max_samples_by_dataset:
+        raise SystemExit("max_samples and max_samples_by_dataset cannot both be active.")
+    if args.max_samples is not None and args.max_samples <= 0:
+        raise SystemExit(f"max_samples must be positive; got {args.max_samples}.")
+    if not args.early_stopping_enabled:
+        return
+    if not args.validation_split:
+        raise SystemExit("early_stopping_enabled requires validation_split=true.")
+    if args.eval_strategy != "steps":
+        raise SystemExit(
+            f"early_stopping_enabled requires eval_strategy='steps'; got {args.eval_strategy!r}."
+        )
+    if args.eval_steps <= 0:
+        raise SystemExit(f"early_stopping_enabled requires eval_steps > 0; got {args.eval_steps}.")
+    if args.save_steps <= 0:
+        raise SystemExit(f"early_stopping_enabled requires save_steps > 0; got {args.save_steps}.")
+    if args.save_steps % args.eval_steps != 0:
+        raise SystemExit(
+            "early_stopping_enabled requires save_steps to be divisible by eval_steps; "
+            f"got save_steps={args.save_steps}, eval_steps={args.eval_steps}."
+        )
+    if args.early_stopping_patience <= 0:
+        raise SystemExit(
+            "early_stopping_patience must be positive when early stopping is enabled; "
+            f"got {args.early_stopping_patience}."
+        )
+    if args.early_stopping_threshold < 0:
+        raise SystemExit(
+            f"early_stopping_threshold must be non-negative; got {args.early_stopping_threshold}."
+        )
+    if args.metric_for_best_model != "eval_loss":
+        raise SystemExit(
+            "early stopping requires metric_for_best_model='eval_loss'; "
+            f"got {args.metric_for_best_model!r}."
+        )
+    if args.greater_is_better:
+        raise SystemExit("early stopping on eval_loss requires greater_is_better=false.")
+    if not args.restore_callback_states_from_checkpoint:
+        raise SystemExit(
+            "early_stopping_enabled requires restore_callback_states_from_checkpoint=true."
+        )
 
 
 def _load_yaml_config(path: Path) -> dict[str, Any]:
@@ -129,6 +212,13 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--system-prompt", default=defaults["system_prompt"], help="System prompt for training examples.")
     parser.add_argument("--max-length", type=int, default=defaults["max_length"], help="Max input length after prompt+target tokenization.")
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"], help="Optional original-sample cap for smoke tests.")
+    parser.add_argument(
+        "--max-samples-by-dataset",
+        type=_parse_sample_limits,
+        default=defaults["max_samples_by_dataset"],
+        help="JSON mapping of canonical dataset names to pre-split trajectory quotas.",
+    )
+    parser.add_argument("--data-sampling-seed", type=int, default=defaults["data_sampling_seed"])
     parser.add_argument("--seed", type=int, default=defaults["seed"], help="Random seed.")
     parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     parser.add_argument("--retrieval-top-k", type=int, default=defaults["retrieval_top_k"])
@@ -174,10 +264,22 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     )
     parser.add_argument("--eval-split-ratio", type=float, default=defaults["eval_split_ratio"], help="Validation split ratio by original samples.")
     parser.add_argument("--validation-split", action=BooleanOptionalAction, default=defaults["validation_split"], help="Enable train/validation split.")
-    parser.add_argument("--early-stopping-patience", type=int, default=defaults["early_stopping_patience"], help="Stop after this many evals without improvement. 0 disables early stopping.")
+    parser.add_argument(
+        "--early-stopping-enabled",
+        action=BooleanOptionalAction,
+        default=defaults["early_stopping_enabled"],
+        help="Enable eval-loss early stopping and best-checkpoint restoration.",
+    )
+    parser.add_argument("--early-stopping-patience", type=int, default=defaults["early_stopping_patience"], help="Stop after this many evaluations without a meaningful improvement.")
     parser.add_argument("--early-stopping-threshold", type=float, default=defaults["early_stopping_threshold"], help="Minimum metric improvement for early stopping.")
     parser.add_argument("--metric-for-best-model", default=defaults["metric_for_best_model"], help="Metric used for best checkpoint and early stopping.")
     parser.add_argument("--greater-is-better", action=BooleanOptionalAction, default=defaults["greater_is_better"], help="Whether the best-model metric should increase.")
+    parser.add_argument(
+        "--restore-callback-states-from-checkpoint",
+        action=BooleanOptionalAction,
+        default=defaults["restore_callback_states_from_checkpoint"],
+        help="Restore stateful Trainer callbacks during full checkpoint resume.",
+    )
     parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"], help="Use fp16.")
     parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"], help="Use bf16.")
     parser.add_argument(
@@ -202,4 +304,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     explicit_config = "--config" in raw_args
     defaults = _defaults_from_config(config_args.config, explicit_config=explicit_config)
     parser = _build_parser(defaults)
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    _validate_args(args)
+    return args

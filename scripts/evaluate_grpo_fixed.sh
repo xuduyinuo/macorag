@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
-: "${ADAPTER_LABEL:?Set ADAPTER_LABEL to sft, rl-step-300, rl-step-500, rl-step-700, or rl-step-1000}"
+: "${ADAPTER_LABEL:?Set ADAPTER_LABEL to sft or the exact staged label, for example rl-step-200}"
 : "${ADAPTER_PATH:?Set ADAPTER_PATH to the exact SFT adapter or RL checkpoint being served}"
 : "${OUTPUT_DIR:?Set OUTPUT_DIR to a stable evaluation directory}"
 

@@ -10,9 +10,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from answer_metrics import ANSWER_F1_CONTRACT
 
 
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 CHECKPOINT_COMPLETE_FILE = "COMPLETE"
 CHECKPOINT_MANIFEST_FILE = "checkpoint_manifest.json"
 OPTIMIZER_STATE_FILE = "optimizer.pt"
@@ -25,6 +26,7 @@ _CRITICAL_CONFIG_FIELDS = (
     "system_prompt",
     "seed",
     "group_size",
+    "degenerate_bucket_fallback_weight",
     "max_rounds",
     "num_train_epochs",
     "max_steps",
@@ -53,6 +55,7 @@ _CRITICAL_CONFIG_FIELDS = (
     "query_global_reward_weight",
     "evidence_global_reward_weight",
     "answer_global_reward_weight",
+    "answer_local_reward_weight",
     "advantage_epsilon",
     "advantage_granularity",
     "use_vllm_generation",
@@ -145,7 +148,10 @@ def fingerprint_dataset(samples: list[Any]) -> str:
 
 def fingerprint_config(args: Any) -> str:
     return _fingerprint(
-        {name: getattr(args, name, None) for name in _CRITICAL_CONFIG_FIELDS}
+        {
+            **{name: getattr(args, name, None) for name in _CRITICAL_CONFIG_FIELDS},
+            "answer_f1_contract": ANSWER_F1_CONTRACT,
+        }
     )
 
 

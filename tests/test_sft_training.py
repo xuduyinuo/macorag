@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import sft_training.data as sft_data
+import sft_training.train_sft_lora_macorag as sft_train
 
 from sft_training.train_sft_lora_macorag import (
     TrajectoryRecord,
@@ -37,6 +39,7 @@ from rag import (
     build_query_retriever_prompt,
 )
 from sft_training.data import (
+    TrainingData,
     TrainingSample,
     flatten_training_samples,
     split_training_samples,
@@ -275,7 +278,16 @@ def test_teacher_dataset_contract_rejects_prompt_mismatch(tmp_path: Path) -> Non
 
 
 def test_sft_default_system_prompt_comes_from_shared_prompt_file() -> None:
-    args = parse_args(["--config", "config/train_sft.yml", "--max-samples", "1"])
+    args = parse_args(
+        [
+            "--config",
+            "config/train_sft.yml",
+            "--max-samples-by-dataset",
+            "{}",
+            "--max-samples",
+            "1",
+        ]
+    )
 
     assert args.system_prompt == load_system_prompt()
 
@@ -718,7 +730,7 @@ def test_run_dir_uses_output_root_child_timestamp() -> None:
     )
 
 
-def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -> None:
+def test_train_sft_yaml_keeps_formal_sampling_and_early_stopping_contract() -> None:
     import yaml
 
     config = yaml.safe_load(Path("config/train_sft.yml").read_text(encoding="utf-8"))
@@ -729,6 +741,8 @@ def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -
         "output_root",
         "max_length",
         "max_samples",
+        "max_samples_by_dataset",
+        "data_sampling_seed",
         "lora_r",
         "lora_alpha",
         "lora_dropout",
@@ -741,10 +755,18 @@ def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -
         "logging_steps",
         "save_steps",
         "eval_strategy",
+        "eval_steps",
         "resume_from_checkpoint",
         "validation_split",
         "eval_split_ratio",
+        "train_test_seed",
+        "early_stopping_enabled",
         "early_stopping_patience",
+        "early_stopping_threshold",
+        "metric_for_best_model",
+        "greater_is_better",
+        "restore_callback_states_from_checkpoint",
+        "save_total_limit",
         "fp16",
         "bf16",
         "attn_implementation",
@@ -760,26 +782,86 @@ def test_train_sft_yaml_keeps_tuning_keys_and_removes_low_frequency_defaults() -
         "lr_scheduler_type",
         "warmup_ratio",
         "weight_decay",
-        "save_total_limit",
-        "early_stopping_threshold",
-        "metric_for_best_model",
-        "greater_is_better",
         "disable_tqdm",
         "log_jsonl_path",
         "gpu_index",
         "check_only",
         "check_only_max_samples",
-        "train_test_seed",
     ]:
         assert key not in config
 
-    assert config["eval_strategy"] == "epoch"
+    assert config["max_samples"] is None
+    assert config["max_samples_by_dataset"] == {
+        "2wiki": 400,
+        "hotpotqa": 400,
+        "musique": 300,
+    }
+    assert config["eval_strategy"] == "steps"
 
 
-def test_active_sft_config_evaluates_once_per_epoch() -> None:
+def test_active_sft_config_uses_confirmed_sampling_and_step_early_stopping() -> None:
     args = parse_args(["--config", "config/train_sft.yml"])
 
-    assert args.eval_strategy == "epoch"
+    assert args.max_samples is None
+    assert args.max_samples_by_dataset == {"2wiki": 400, "hotpotqa": 400, "musique": 300}
+    assert args.data_sampling_seed == 42
+    assert args.num_train_epochs == 3.0
+    assert args.eval_strategy == "steps"
+    assert args.eval_steps == 200
+    assert args.save_steps == 200
+    assert args.early_stopping_enabled is True
+    assert args.early_stopping_patience == 3
+    assert args.early_stopping_threshold == pytest.approx(0.001)
+    assert args.metric_for_best_model == "eval_loss"
+    assert args.greater_is_better is False
+    assert args.restore_callback_states_from_checkpoint is True
+
+
+@pytest.mark.parametrize(
+    ("extra_args", "message"),
+    [
+        (
+            ["--max-samples", "10", "--max-samples-by-dataset", '{"2wiki": 4}'],
+            "max_samples",
+        ),
+        (["--max-samples-by-dataset", '{"2wiki": 0}'], "2wiki"),
+        (["--early-stopping-enabled", "--no-validation-split"], "validation_split"),
+        (["--early-stopping-enabled", "--eval-strategy", "epoch"], "eval_strategy"),
+        (["--early-stopping-enabled", "--eval-steps", "0"], "eval_steps"),
+        (
+            ["--early-stopping-enabled", "--eval-steps", "200", "--save-steps", "300"],
+            "save_steps",
+        ),
+        (["--early-stopping-enabled", "--early-stopping-patience", "0"], "patience"),
+        (["--early-stopping-enabled", "--metric-for-best-model", "accuracy"], "eval_loss"),
+        (["--early-stopping-enabled", "--greater-is-better"], "greater_is_better"),
+    ],
+)
+def test_early_stopping_config_rejects_invalid_combinations(
+    extra_args: list[str], message: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    valid_step_args = ["--eval-strategy", "steps", "--eval-steps", "200", "--save-steps", "200"]
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args([*valid_step_args, *extra_args])
+    error_text = f"{exc_info.value}\n{capsys.readouterr().err}"
+    assert message in error_text
+
+
+def test_sample_limit_config_rejects_unknown_dataset(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        parse_args(["--max-samples-by-dataset", '{"unknown": 10}'])
+    assert "unknown" in f"{exc_info.value}\n{capsys.readouterr().err}"
+
+
+def test_yaml_sample_limit_config_reports_invalid_quota_as_config_error(tmp_path: Path) -> None:
+    config_path = tmp_path / "invalid-sft.yml"
+    config_path.write_text(
+        "max_samples_by_dataset:\n  2wiki: 1.5\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit, match="2wiki.*positive integer"):
+        parse_args(["--config", str(config_path)])
 
 
 def test_active_sft_config_enables_bf16_flash_attention() -> None:
@@ -989,7 +1071,7 @@ def test_write_json_atomic_replaces_complete_payload(tmp_path: Path) -> None:
     assert not list(tmp_path.glob("*.tmp"))
 
 
-def test_training_arguments_use_epoch_evaluation_without_eval_steps(tmp_path: Path) -> None:
+def test_training_arguments_use_step_evaluation_and_restore_callback_state(tmp_path: Path) -> None:
     class DummyTrainingArguments:
         def __init__(self, *, eval_strategy=None, **kwargs):
             self.kwargs = {"eval_strategy": eval_strategy, **kwargs}
@@ -997,9 +1079,132 @@ def test_training_arguments_use_epoch_evaluation_without_eval_steps(tmp_path: Pa
     args = parse_args(["--config", "config/train_sft.yml"])
     train_args = _training_arguments(args, tmp_path, True, DummyTrainingArguments)
 
-    assert train_args.kwargs["eval_strategy"] == "epoch"
-    assert train_args.kwargs["eval_steps"] is None
+    assert train_args.kwargs["eval_strategy"] == "steps"
+    assert train_args.kwargs["eval_steps"] == 200
     assert train_args.kwargs["save_strategy"] == "steps"
+    assert train_args.kwargs["save_steps"] == 200
+    assert train_args.kwargs["load_best_model_at_end"] is True
+    assert train_args.kwargs["metric_for_best_model"] == "eval_loss"
+    assert train_args.kwargs["greater_is_better"] is False
+    assert train_args.kwargs["restore_callback_states_from_checkpoint"] is True
+
+
+def test_explicit_early_stopping_switch_controls_callback_and_best_loading(tmp_path: Path) -> None:
+    class DummyTrainingArguments:
+        def __init__(self, *, eval_strategy=None, **kwargs):
+            self.kwargs = {"eval_strategy": eval_strategy, **kwargs}
+
+    class DummyEarlyStoppingCallback:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    args = parse_args(["--config", "config/train_sft.yml"])
+    callback = sft_train._build_early_stopping_callback(
+        args, has_eval=True, callback_cls=DummyEarlyStoppingCallback
+    )
+    assert callback.kwargs == {
+        "early_stopping_patience": 3,
+        "early_stopping_threshold": pytest.approx(0.001),
+    }
+
+    args.early_stopping_enabled = False
+    assert sft_train._build_early_stopping_callback(
+        args, has_eval=True, callback_cls=DummyEarlyStoppingCallback
+    ) is None
+    train_args = _training_arguments(args, tmp_path, True, DummyTrainingArguments)
+    assert train_args.kwargs["load_best_model_at_end"] is False
+
+
+def test_transformers_early_stopping_threshold_does_not_control_numeric_best() -> None:
+    transformers = pytest.importorskip("transformers")
+    callback = transformers.EarlyStoppingCallback(
+        early_stopping_patience=3, early_stopping_threshold=0.001
+    )
+    args = SimpleNamespace(metric_for_best_model="eval_loss", greater_is_better=False)
+    state = transformers.TrainerState()
+    control = transformers.TrainerControl()
+    counters: list[int] = []
+    numeric_best: tuple[float, int] | None = None
+
+    for step, loss in zip((200, 400, 600, 800, 1000), (0.0800, 0.0750, 0.0746, 0.0748, 0.0751)):
+        callback.on_evaluate(args, state, control, {"eval_loss": loss})
+        counters.append(callback.early_stopping_patience_counter)
+        if numeric_best is None or loss < numeric_best[0]:
+            numeric_best = (loss, step)
+            state.best_metric = loss
+
+    assert counters == [0, 0, 1, 2, 3]
+    assert control.should_training_stop is True
+    assert numeric_best == (0.0746, 600)
+
+
+def test_trainer_completion_metadata_distinguishes_early_stop_from_epoch_cap() -> None:
+    early_trainer = SimpleNamespace(
+        state=SimpleNamespace(
+            global_step=1000,
+            epoch=2.5,
+            best_metric=0.0746,
+            best_model_checkpoint="run/checkpoint-600",
+        ),
+        control=SimpleNamespace(should_training_stop=True),
+    )
+    completed_trainer = SimpleNamespace(
+        state=SimpleNamespace(
+            global_step=1200,
+            epoch=3.0,
+            best_metric=0.0746,
+            best_model_checkpoint="run/checkpoint-600",
+        ),
+        control=SimpleNamespace(should_training_stop=True),
+    )
+
+    assert sft_train._trainer_completion_metadata(early_trainer, 1200)["stopped_early"] is True
+    assert sft_train._trainer_completion_metadata(completed_trainer, 1200)["stopped_early"] is False
+
+
+def test_transformers_restores_early_stopping_callback_counter() -> None:
+    transformers = pytest.importorskip("transformers")
+
+    class CallbackHandler:
+        def __init__(self, callback):
+            self.callbacks = [callback]
+
+        def remove_callback(self, callback_type):
+            self.callbacks = [item for item in self.callbacks if not isinstance(item, callback_type)]
+
+        def add_callback(self, callback):
+            self.callbacks.append(callback)
+
+    original = transformers.EarlyStoppingCallback(3, 0.001)
+    trainer = object.__new__(transformers.Trainer)
+    trainer.args = SimpleNamespace(restore_callback_states_from_checkpoint=True)
+    trainer.control = transformers.TrainerControl()
+    trainer.callback_handler = CallbackHandler(original)
+    trainer.state = transformers.TrainerState(
+        stateful_callbacks={
+            "EarlyStoppingCallback": {
+                "args": {"early_stopping_patience": 3, "early_stopping_threshold": 0.001},
+                "attributes": {"early_stopping_patience_counter": 2},
+            }
+        }
+    )
+
+    transformers.Trainer._load_callback_state(trainer)
+
+    restored = next(
+        item for item in trainer.callback_handler.callbacks
+        if isinstance(item, transformers.EarlyStoppingCallback)
+    )
+    assert restored is not original
+    assert restored.early_stopping_patience_counter == 2
+
+    untouched = transformers.EarlyStoppingCallback(3, 0.001)
+    untouched.early_stopping_patience_counter = 1
+    trainer.args.restore_callback_states_from_checkpoint = False
+    trainer.callback_handler = CallbackHandler(untouched)
+    transformers.Trainer._load_callback_state(trainer)
+    assert trainer.callback_handler.callbacks == [untouched]
+    assert untouched.early_stopping_patience_counter == 1
 
 
 def _record(qid: str, action_type: str) -> TrajectoryRecord:
@@ -1030,6 +1235,134 @@ def test_split_training_samples_uses_original_samples_without_qid_overlap() -> N
     assert len(val_samples) == 2
     assert [sample.qid for sample in train_samples] == ["s1", "s3"]
     assert [sample.qid for sample in val_samples] == ["s2", "s4"]
+
+
+def _samples(dataset: str, count: int) -> list[TrainingSample]:
+    return [
+        TrainingSample(qid=f"{dataset}-{index:04d}", dataset=dataset, records=[])
+        for index in range(count)
+    ]
+
+
+def test_per_dataset_quota_selection_is_exact_deterministic_and_source_ordered() -> None:
+    samples = [*_samples("hotpotqa", 450), *_samples("2wiki", 450), *_samples("musique", 350)]
+    quotas = {"2wiki": 400, "hotpotqa": 400, "musique": 300}
+
+    selected = sft_data.select_training_samples_by_dataset(samples, quotas, seed=42)
+    repeated = sft_data.select_training_samples_by_dataset(samples, quotas, seed=42)
+    changed = sft_data.select_training_samples_by_dataset(samples, quotas, seed=43)
+
+    def qids(items: list[TrainingSample]) -> list[tuple[str, str]]:
+        return [(item.dataset, item.qid) for item in items]
+
+    assert sft_data.sample_counts_by_dataset(selected) == quotas
+    assert qids(selected) == qids(repeated)
+    assert qids(selected) != qids(changed)
+    source_positions = {key: index for index, key in enumerate(qids(samples))}
+    assert [source_positions[key] for key in qids(selected)] == sorted(
+        source_positions[key] for key in qids(selected)
+    )
+
+
+def test_per_dataset_quota_selection_rejects_duplicate_qids() -> None:
+    samples = [*_samples("2wiki", 3), TrainingSample(qid="2wiki-0001", dataset="2wiki", records=[])]
+
+    with pytest.raises(ValueError, match="duplicate.*2wiki.*2wiki-0001"):
+        sft_data.select_training_samples_by_dataset(samples, {"2wiki": 2}, seed=42)
+
+
+def test_per_dataset_quota_selection_rejects_insufficient_usable_samples() -> None:
+    with pytest.raises(ValueError, match="2wiki.*requested=4.*available=3"):
+        sft_data.select_training_samples_by_dataset(_samples("2wiki", 3), {"2wiki": 4}, seed=42)
+
+
+def test_stratified_split_has_exact_counts_and_is_deterministic() -> None:
+    samples = [*_samples("hotpotqa", 400), *_samples("2wiki", 400), *_samples("musique", 300)]
+
+    train_samples, val_samples = sft_data.split_training_samples_by_dataset(
+        samples, ratio=0.05, seed=777
+    )
+    repeated_train, repeated_val = sft_data.split_training_samples_by_dataset(
+        samples, ratio=0.05, seed=777
+    )
+    _, changed_val = sft_data.split_training_samples_by_dataset(samples, ratio=0.05, seed=778)
+
+    assert sft_data.sample_counts_by_dataset(train_samples) == {
+        "hotpotqa": 380,
+        "2wiki": 380,
+        "musique": 285,
+    }
+    assert sft_data.sample_counts_by_dataset(val_samples) == {
+        "hotpotqa": 20,
+        "2wiki": 20,
+        "musique": 15,
+    }
+    train_keys = [(sample.dataset, sample.qid) for sample in train_samples]
+    val_keys = [(sample.dataset, sample.qid) for sample in val_samples]
+    assert set(train_keys).isdisjoint(val_keys)
+    assert train_keys == [(sample.dataset, sample.qid) for sample in repeated_train]
+    assert val_keys == [(sample.dataset, sample.qid) for sample in repeated_val]
+    assert val_keys != [(sample.dataset, sample.qid) for sample in changed_val]
+    source_positions = {
+        (sample.dataset, sample.qid): index for index, sample in enumerate(samples)
+    }
+    assert [source_positions[key] for key in train_keys] == sorted(
+        source_positions[key] for key in train_keys
+    )
+    assert [source_positions[key] for key in val_keys] == sorted(
+        source_positions[key] for key in val_keys
+    )
+
+
+def test_stratified_split_rejects_empty_dataset_partition() -> None:
+    with pytest.raises(ValueError, match="2wiki.*validation"):
+        sft_data.split_training_samples_by_dataset(_samples("2wiki", 10), ratio=0.05, seed=777)
+
+
+def test_check_only_reports_selected_split_and_early_stopping_contract(capsys) -> None:
+    samples = [*_samples("hotpotqa", 400), *_samples("2wiki", 400), *_samples("musique", 300)]
+    training_data = TrainingData(
+        samples=samples,
+        records=[],
+        source_sample_count=3000,
+        source_sample_counts_by_dataset={"hotpotqa": 1000, "2wiki": 1000, "musique": 1000},
+        selected_sample_counts_by_dataset={"hotpotqa": 400, "2wiki": 400, "musique": 300},
+    )
+    args = parse_args(["--config", "config/train_sft.yml", "--check-only-max-samples", "0"])
+
+    sft_train._print_check_only(args, training_data)
+
+    output = capsys.readouterr().out
+    contract_line = next(
+        line for line in output.splitlines() if line.startswith("SFT check contract: ")
+    )
+    contract = json.loads(contract_line.removeprefix("SFT check contract: "))
+    assert contract["selected_sample_counts_by_dataset"] == {
+        "2wiki": 400,
+        "hotpotqa": 400,
+        "musique": 300,
+    }
+    assert contract["train_sample_counts_by_dataset"] == {
+        "2wiki": 380,
+        "hotpotqa": 380,
+        "musique": 285,
+    }
+    assert contract["eval_sample_counts_by_dataset"] == {
+        "2wiki": 20,
+        "hotpotqa": 20,
+        "musique": 15,
+    }
+    assert contract["early_stopping"] == {
+        "enabled": True,
+        "eval_steps": 200,
+        "eval_strategy": "steps",
+        "greater_is_better": False,
+        "metric": "eval_loss",
+        "patience": 3,
+        "restore_callback_states_from_checkpoint": True,
+        "save_steps": 200,
+        "threshold": pytest.approx(0.001),
+    }
 
 
 def test_flatten_training_samples_preserves_sample_then_action_order() -> None:

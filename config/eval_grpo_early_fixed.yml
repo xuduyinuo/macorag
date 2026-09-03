@@ -1,10 +1,10 @@
-data_root: "data/eval_300_grpo_fixed"
+data_root: "data/eval_90_grpo_fixed"
 data_files: ["manifest.jsonl"]
 retrieval_root: "data/eval_1000_stratified_v2_e5_faiss"
 output_root: "outputs/eval_grpo_fixed"
 output_dir: ""
 resume: true
-manifest_meta_path: "data/eval_300_grpo_fixed/manifest_meta.json"
+manifest_meta_path: "data/eval_90_grpo_fixed/manifest_meta.json"
 adapter_label: ""
 adapter_identity_path: ""
 prompt_config_path: "config/prompts.yml"

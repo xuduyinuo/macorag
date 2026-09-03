@@ -30,6 +30,8 @@ class GeneratedAction:
     local_reward: float = 0.0
     terminal_reward: float = 0.0
     decision_return: float = 0.0
+    primary_advantage: float = 0.0
+    fallback_advantage: float = 0.0
     advantage: float = 0.0
 
 

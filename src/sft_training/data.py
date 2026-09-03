@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import random
@@ -44,6 +45,7 @@ class TrainingData:
     records: list[TrajectoryRecord]
     source_sample_count: int
     source_sample_counts_by_dataset: dict[str, int]
+    selected_sample_counts_by_dataset: dict[str, int]
 
 
 def validate_teacher_dataset_contract(
@@ -280,11 +282,63 @@ def flatten_training_samples(samples: list[TrainingSample]) -> list[TrajectoryRe
     return [record for sample in samples for record in sample.records]
 
 
+def _dataset_seed(seed: int, dataset: str, namespace: str) -> int:
+    payload = f"{namespace}\0{seed}\0{dataset}".encode("utf-8")
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big")
+
+
+def sample_counts_by_dataset(samples: list[TrainingSample]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for sample in samples:
+        counts[sample.dataset] = counts.get(sample.dataset, 0) + 1
+    return counts
+
+
+def select_training_samples_by_dataset(
+    samples: list[TrainingSample],
+    quotas: dict[str, int],
+    seed: int,
+) -> list[TrainingSample]:
+    indices_by_dataset: dict[str, list[int]] = {}
+    qids_by_dataset: dict[str, set[str]] = {}
+    for index, sample in enumerate(samples):
+        seen_qids = qids_by_dataset.setdefault(sample.dataset, set())
+        if sample.qid in seen_qids:
+            raise ValueError(f"duplicate qid in dataset {sample.dataset}: {sample.qid}")
+        seen_qids.add(sample.qid)
+        indices_by_dataset.setdefault(sample.dataset, []).append(index)
+
+    missing_quotas = sorted(set(indices_by_dataset) - set(quotas))
+    if missing_quotas:
+        raise ValueError(f"missing max_samples_by_dataset quota for: {', '.join(missing_quotas)}")
+    missing_datasets = sorted(set(quotas) - set(indices_by_dataset))
+    if missing_datasets:
+        raise ValueError(f"no usable samples for requested datasets: {', '.join(missing_datasets)}")
+
+    selected_indices: set[int] = set()
+    for dataset, limit in quotas.items():
+        available_indices = indices_by_dataset[dataset]
+        if limit > len(available_indices):
+            raise ValueError(
+                f"insufficient usable samples for {dataset}: requested={limit}, "
+                f"available={len(available_indices)}"
+            )
+        shuffled_indices = list(available_indices)
+        random.Random(_dataset_seed(seed, dataset, "selection")).shuffle(shuffled_indices)
+        selected_indices.update(shuffled_indices[:limit])
+    return [sample for index, sample in enumerate(samples) if index in selected_indices]
+
+
 def build_train_records(data_root: Path, max_samples: int | None = None) -> list[TrajectoryRecord]:
     return build_training_data(data_root, max_samples=max_samples).records
 
 
-def build_training_data(data_root: Path, max_samples: int | None = None) -> TrainingData:
+def build_training_data(
+    data_root: Path,
+    max_samples: int | None = None,
+    max_samples_by_dataset: dict[str, int] | None = None,
+    data_sampling_seed: int = 42,
+) -> TrainingData:
     dataset_files = _resolve_dataset_paths(str(data_root))
     samples: list[TrainingSample] = []
     source_sample_counts_by_dataset: dict[str, int] = {}
@@ -303,12 +357,21 @@ def build_training_data(data_root: Path, max_samples: int | None = None) -> Trai
                 break
         if max_samples is not None and len(samples) >= max_samples:
             break
+    source_sample_count = len(samples)
+    if max_samples_by_dataset:
+        samples = select_training_samples_by_dataset(
+            samples,
+            max_samples_by_dataset,
+            seed=data_sampling_seed,
+        )
+    selected_sample_counts_by_dataset = sample_counts_by_dataset(samples)
     records = flatten_training_samples(samples)
     return TrainingData(
         samples=samples,
         records=records,
-        source_sample_count=len(samples),
+        source_sample_count=source_sample_count,
         source_sample_counts_by_dataset=source_sample_counts_by_dataset,
+        selected_sample_counts_by_dataset=selected_sample_counts_by_dataset,
     )
 
 
@@ -332,6 +395,42 @@ def split_training_samples(
     val_idx = set(indices[:split])
     val_samples = [samples[i] for i in range(len(samples)) if i in val_idx]
     train_samples = [samples[i] for i in range(len(samples)) if i not in val_idx]
+    return train_samples, val_samples
+
+
+def split_training_samples_by_dataset(
+    samples: list[TrainingSample],
+    ratio: float,
+    seed: int,
+) -> tuple[list[TrainingSample], list[TrainingSample]]:
+    indices_by_dataset: dict[str, list[int]] = {}
+    for index, sample in enumerate(samples):
+        indices_by_dataset.setdefault(sample.dataset, []).append(index)
+
+    validation_indices: set[int] = set()
+    for dataset, dataset_indices in indices_by_dataset.items():
+        validation_count = int(math.floor(len(dataset_indices) * ratio))
+        training_count = len(dataset_indices) - validation_count
+        if validation_count <= 0:
+            raise ValueError(
+                f"dataset {dataset} would have an empty validation split: "
+                f"samples={len(dataset_indices)}, ratio={ratio}"
+            )
+        if training_count <= 0:
+            raise ValueError(
+                f"dataset {dataset} would have an empty training split: "
+                f"samples={len(dataset_indices)}, ratio={ratio}"
+            )
+        shuffled_indices = list(dataset_indices)
+        random.Random(_dataset_seed(seed, dataset, "split")).shuffle(shuffled_indices)
+        validation_indices.update(shuffled_indices[:validation_count])
+
+    train_samples = [
+        sample for index, sample in enumerate(samples) if index not in validation_indices
+    ]
+    val_samples = [
+        sample for index, sample in enumerate(samples) if index in validation_indices
+    ]
     return train_samples, val_samples
 
 

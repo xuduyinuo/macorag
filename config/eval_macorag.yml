@@ -5,6 +5,10 @@ retrieval_root: "data/eval_1000_stratified_v2_e5_faiss"
 output_root: "outputs/eval"
 prompt_config_path: "config/prompts.yml"
 
+# 模型溯源：仅用于评估记录，必须与当前 vLLM 服务配置一致。
+model_path: "model/NousResearch-Meta-Llama-3-8B-Instruct"
+adapter_path: "outputs/sft_Meta-Llama-3-8B/2026-09-02_16-33-54/adapter"
+
 # 样本与 RAG 轮次。
 max_samples: null
 max_rounds: 4

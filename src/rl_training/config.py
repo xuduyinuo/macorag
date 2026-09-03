@@ -33,6 +33,7 @@ ROLLOUT_DEFAULTS: dict[str, Any] = {
     "seed": 42,
     "max_rounds": 3,
     "group_size": 4,
+    "degenerate_bucket_fallback_weight": 0.2,
     "num_train_epochs": 1.0,
     "max_steps": 0,
     "run_until_step": 0,
@@ -65,6 +66,7 @@ OPTIMIZATION_DEFAULTS: dict[str, Any] = {
     "query_global_reward_weight": 1.0 / 3.0,
     "evidence_global_reward_weight": 3.0 / 7.0,
     "answer_global_reward_weight": 7.0 / 3.0,
+    "answer_local_reward_weight": 1.0,
     "advantage_epsilon": 1.0e-8,
     "advantage_granularity": "role_round",
 }
@@ -212,6 +214,11 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     rollout.add_argument("--seed", type=int, default=defaults["seed"])
     rollout.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     rollout.add_argument("--group-size", type=int, default=defaults["group_size"])
+    rollout.add_argument(
+        "--degenerate-bucket-fallback-weight",
+        type=float,
+        default=defaults["degenerate_bucket_fallback_weight"],
+    )
     rollout.add_argument("--num-train-epochs", type=float, default=defaults["num_train_epochs"])
     rollout.add_argument("--max-steps", type=int, default=defaults["max_steps"])
     rollout.add_argument("--run-until-step", type=int, default=defaults["run_until_step"])
@@ -273,6 +280,12 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         "--answer-global-reward-weight",
         type=float,
         default=defaults["answer_global_reward_weight"],
+    )
+    optimization.add_argument(
+        "--answer-local-reward-weight",
+        type=float,
+        default=defaults["answer_local_reward_weight"],
+        help="Scale Answer local correctness/wait shaping only; retain terminal and format rewards.",
     )
     optimization.add_argument(
         "--advantage-epsilon",
@@ -384,6 +397,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("run_until_step must be non-negative")
     if args.max_steps > 0 and args.run_until_step > args.max_steps:
         parser.error("run_until_step must not exceed max_steps")
+    if not 0.0 <= args.degenerate_bucket_fallback_weight <= 1.0:
+        parser.error("degenerate_bucket_fallback_weight must satisfy 0 <= value <= 1")
+    if not 0.0 <= args.answer_local_reward_weight <= 1.0:
+        parser.error("answer_local_reward_weight must satisfy 0 <= value <= 1")
     if args.max_grad_norm <= 0.0:
         parser.error("max_grad_norm must be positive")
     if not 0.0 <= args.warmup_ratio < 1.0:

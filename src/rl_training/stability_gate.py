@@ -14,14 +14,22 @@ def _percentile(values: list[float], quantile: float) -> float:
     return ordered[index]
 
 
-def evaluate_training_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
+def evaluate_training_stability(
+    rows: list[dict[str, Any]],
+    *,
+    window_size: int = 300,
+) -> dict[str, Any]:
+    if window_size < 100:
+        raise ValueError("Training stability window must be at least 100 steps")
     all_steps = sorted(
         [row for row in rows if isinstance(row.get("step"), int) and "kl" in row],
         key=lambda row: int(row["step"]),
     )
-    if len(all_steps) < 300:
-        raise ValueError(f"Training stability requires 300 metric rows, got {len(all_steps)}")
-    steps = all_steps[-300:]
+    if len(all_steps) < window_size:
+        raise ValueError(
+            f"Training stability requires {window_size} metric rows, got {len(all_steps)}"
+        )
+    steps = all_steps[-window_size:]
     step_numbers = [int(row["step"]) for row in steps]
     invalid_rows = []
     for row in steps:
@@ -94,7 +102,9 @@ def evaluate_training_stability(rows: list[dict[str, Any]]) -> dict[str, Any]:
         failures.append("missing_or_invalid_training_metric")
     if len(set(step_numbers)) != len(step_numbers):
         failures.append("duplicate_training_steps")
-    if step_numbers != list(range(step_numbers[-1] - 299, step_numbers[-1] + 1)):
+    if step_numbers != list(
+        range(step_numbers[-1] - window_size + 1, step_numbers[-1] + 1)
+    ):
         failures.append("nonconsecutive_training_steps")
     if not all(
         math.isfinite(float(metrics[key]))

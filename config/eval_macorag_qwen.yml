@@ -1,0 +1,41 @@
+# Qwen2.5-7B SFT 模型专用评估配置。
+# 与默认 Llama 评估使用不同的输出目录、vLLM 服务名、端口和 GPU。
+data_root: "data/eval_1000_stratified_v2"
+data_files: []
+retrieval_root: "data/eval_1000_stratified_v2_e5_faiss"
+output_root: "outputs/eval_Qwen2.5-7B"
+prompt_config_path: "config/prompts.yml"
+
+# 必须与 config/eval_vllm_server_qwen.yml 保持一致。
+model_path: "model/Qwen2.5-7B-Instruct"
+adapter_path: "outputs/sft_Qwen2.5-7B/2026-09-02_19-13-57/adapter"
+
+# 样本与 RAG 轮次
+max_samples: null
+max_rounds: 4
+
+# 生成采样参数
+max_prompt_length: 4096
+max_completion_length: 256
+temperature: 0.2
+top_p: 0.95
+
+# 检索参数
+retrieval_backend: "e5_faiss"
+retrieval_embedding_model: "intfloat/e5-base-v2"
+retrieval_device: "cpu"
+retrieval_max_length: 512
+retrieval_spacy_model: en_core_web_trf
+retrieval_top_k: 5
+retrieval_max_workers: 4
+retrieval_batch_size: 32
+use_vectorized_retrieval: true
+
+# Qwen vLLM 服务使用独立端口，避免与默认 Llama 服务的 8000 冲突。
+vllm_base_urls:
+  - "http://127.0.0.1:8001/v1"
+vllm_model: "macorag-qwen2.5-7b-sft"
+eval_request_workers: 4
+
+# 与默认 Llama 评估的 GPU 1 分离。
+gpu_indices: "1"

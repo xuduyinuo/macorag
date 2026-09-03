@@ -355,8 +355,8 @@ def test_train_grpo_config_enables_proportional_stratified_sampling() -> None:
     config = yaml.safe_load(Path("config/train_grpo.yml").read_text(encoding="utf-8"))
 
     assert config["max_samples"] == 1000
-    assert config["max_total_samples"] == 1000
-    assert config["max_steps"] == 1000
-    assert config["run_until_step"] == 300
+    assert config["max_total_samples"] == 3000
+    assert config["max_steps"] == 3000
+    assert config["run_until_step"] == 200
     assert config["data_sampling_strategy"] == "proportional_stratified"
     assert config["data_sampling_seed"] == 20260826

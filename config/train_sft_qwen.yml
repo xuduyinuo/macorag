@@ -1,8 +1,8 @@
-# 基础路径
-# output_root 是保存根目录；每次 SFT 训练会自动写入 output_root/YYYY-MM-DD_HH-MM-SS/。
-model_path: "model/NousResearch-Meta-Llama-3-8B-Instruct"
+# Qwen2.5-7B 专用 SFT 配置。
+# 每次训练会保存到 output_root/YYYY-MM-DD_HH-MM-SS/。
+model_path: "model/Qwen2.5-7B-Instruct"
 data_root: "data/sft/teacher_qwen_plus_trajectory_train_v2"
-output_root: "outputs/sft_Meta-Llama-3-8B"
+output_root: "outputs/sft_Qwen2.5-7B"
 
 # 数据与长度
 max_length: 6400
@@ -17,7 +17,7 @@ retrieval_top_k: 5
 prompt_config_path: "config/prompts.yml"
 require_teacher_provenance: true
 
-# LoRA 结构
+# LoRA 结构（适用于本地 Qwen2.5 模型）
 lora_r: 16
 lora_alpha: 32
 lora_dropout: 0.05
@@ -38,7 +38,8 @@ learning_rate: 0.00002
 max_steps: 0
 resume_from_checkpoint: null
 
-# 日志、保存与验证
+# 每 200 step 验证；连续 3 次 eval_loss 无明显下降则早停，
+# 并在训练结束时恢复验证集表现最好的 checkpoint。
 logging_steps: 1
 save_steps: 200
 save_total_limit: 3
@@ -54,9 +55,9 @@ metric_for_best_model: "eval_loss"
 greater_is_better: false
 restore_callback_states_from_checkpoint: true
 
-# 运行环境
+# 与默认 Llama SFT 的 GPU 0 分离；启动前仍需用 nvidia-smi 确认 GPU 1 空闲。
 bf16: true
 fp16: false
 attn_implementation: "flash_attention_2"
 load_4bit: true
-gpu_indices: "0"
+gpu_indices: "1"

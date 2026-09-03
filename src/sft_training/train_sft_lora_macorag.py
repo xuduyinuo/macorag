@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import hashlib
 import importlib
 import importlib.util
 import inspect
@@ -28,8 +29,10 @@ from .data import (
     build_train_records,
     build_training_data,
     flatten_training_samples,
+    sample_counts_by_dataset,
     split_records as _split_records,
     split_training_samples,
+    split_training_samples_by_dataset,
     trajectory_to_sft_records,
     validate_teacher_dataset_contract,
 )
@@ -202,7 +205,64 @@ def _run_trainer(trainer: Any, resume_checkpoint: Path | None) -> Any:
     return trainer.train(resume_from_checkpoint=str(resume_checkpoint))
 
 
+def _build_early_stopping_callback(
+    args: Any,
+    *,
+    has_eval: bool,
+    callback_cls: Any,
+) -> Any | None:
+    if not has_eval or not args.early_stopping_enabled:
+        return None
+    return callback_cls(
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_threshold=args.early_stopping_threshold,
+    )
+
+
+def _trainer_completion_metadata(trainer: Any, total_optimizer_steps: int) -> dict[str, Any]:
+    state = trainer.state
+    stopped_early = bool(
+        trainer.control.should_training_stop and state.global_step < total_optimizer_steps
+    )
+    return {
+        "stopped_early": stopped_early,
+        "best_metric": state.best_metric,
+        "best_model_checkpoint": state.best_model_checkpoint,
+        "stopped_epoch": state.epoch,
+        "global_step": state.global_step,
+    }
+
+
+def _sample_qid_fingerprint(samples: list[TrainingSample]) -> str:
+    digest = hashlib.sha256()
+    for sample in samples:
+        digest.update(sample.dataset.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(sample.qid.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
 def _print_check_only(args: Any, training_data: TrainingData) -> None:
+    train_samples, val_samples = _split_train_eval_samples(args, training_data.samples)
+    check_contract = {
+        "source_sample_counts_by_dataset": training_data.source_sample_counts_by_dataset,
+        "selected_sample_counts_by_dataset": training_data.selected_sample_counts_by_dataset,
+        "train_sample_counts_by_dataset": sample_counts_by_dataset(train_samples),
+        "eval_sample_counts_by_dataset": sample_counts_by_dataset(val_samples),
+        "early_stopping": {
+            "enabled": args.early_stopping_enabled,
+            "eval_strategy": args.eval_strategy,
+            "eval_steps": args.eval_steps,
+            "save_steps": args.save_steps,
+            "patience": args.early_stopping_patience,
+            "threshold": args.early_stopping_threshold,
+            "metric": args.metric_for_best_model,
+            "greater_is_better": args.greater_is_better,
+            "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
+        },
+    }
+    print("SFT check contract:", json.dumps(check_contract, ensure_ascii=False, sort_keys=True))
     records = list(training_data.records)
     random.seed(args.seed)
     random.shuffle(records)
@@ -278,6 +338,8 @@ def _validate_acceleration_runtime(
     if args.bf16 and args.fp16:
         raise SystemExit("bf16 and fp16 cannot both be enabled.")
     if args.attn_implementation == "flash_attention_2":
+        if not torch.cuda.is_available():
+            raise SystemExit("FlashAttention 2 requested but CUDA is unavailable.")
         if find_spec("flash_attn") is None:
             raise SystemExit(
                 "FlashAttention 2 requested but flash_attn is not installed in the active environment."
@@ -292,8 +354,6 @@ def _validate_acceleration_runtime(
                 "FlashAttention 2 requested but flash_attn could not be imported: "
                 f"{type(exc).__name__}: {exc}"
             ) from exc
-        if not torch.cuda.is_available():
-            raise SystemExit("FlashAttention 2 requested but CUDA is unavailable.")
     if args.bf16 and _world_size() > 1 and torch.cuda.is_available():
         torch.cuda.set_device(_local_rank())
     if args.bf16 and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
@@ -331,7 +391,12 @@ def _split_train_eval_samples(
         return samples, []
     if args.eval_split_ratio <= 0.0:
         raise SystemExit("validation_split requires eval_split_ratio > 0.")
-    train_samples, val_samples = split_training_samples(samples, args.eval_split_ratio, args.train_test_seed)
+    try:
+        train_samples, val_samples = split_training_samples_by_dataset(
+            samples, args.eval_split_ratio, args.train_test_seed
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     if not train_samples:
         raise SystemExit("Validation split left no training samples. Lower eval_split_ratio.")
     if not val_samples:
@@ -345,11 +410,11 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         raise SystemExit("step-based validation requires eval_steps > 0.")
     if (
         eval_strategy == "steps"
-        and args.early_stopping_patience > 0
+        and args.early_stopping_enabled
         and args.save_steps % args.eval_steps != 0
     ):
         raise SystemExit("early stopping requires save_steps to be a multiple of eval_steps.")
-    load_best_model = has_eval and args.early_stopping_patience > 0
+    load_best_model = bool(has_eval and args.early_stopping_enabled)
     save_strategy = eval_strategy if load_best_model else "steps"
 
     training_kwargs: dict[str, Any] = {
@@ -378,6 +443,7 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         "load_best_model_at_end": load_best_model,
         "metric_for_best_model": args.metric_for_best_model if has_eval else None,
         "greater_is_better": args.greater_is_better if has_eval else None,
+        "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
     }
     if _world_size() > 1:
         training_kwargs["ddp_find_unused_parameters"] = False
@@ -411,7 +477,15 @@ def main() -> None:
             retrieval_top_k=args.retrieval_top_k,
         )
 
-    training_data = build_training_data(data_root, max_samples=args.max_samples)
+    try:
+        training_data = build_training_data(
+            data_root,
+            max_samples=args.max_samples,
+            max_samples_by_dataset=args.max_samples_by_dataset,
+            data_sampling_seed=args.data_sampling_seed,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
     records = training_data.records
     source_sample_count = training_data.source_sample_count
     print(f"Loaded {len(records)} SFT action records from {data_root}")
@@ -534,7 +608,7 @@ def main() -> None:
         progress_epochs = min(args.num_train_epochs, args.max_steps / optimizer_steps_per_epoch)
     total_source_sample_visits = int(math.ceil(train_source_sample_count * progress_epochs))
     run_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "model_path": args.model_path,
         "data_root": args.data_root,
         "prompt_contract_fingerprint": prompt_contract.fingerprint,
@@ -545,8 +619,26 @@ def main() -> None:
         "train_dataset_fingerprint": _dataset_fingerprint(train_dataset),
         "eval_dataset_fingerprint": _dataset_fingerprint(eval_dataset) if eval_dataset is not None else None,
         "max_samples": args.max_samples,
+        "max_samples_by_dataset": args.max_samples_by_dataset,
+        "data_sampling_seed": args.data_sampling_seed,
+        "source_sample_counts_by_dataset": training_data.source_sample_counts_by_dataset,
+        "selected_sample_counts_by_dataset": training_data.selected_sample_counts_by_dataset,
+        "selected_qid_fingerprint": _sample_qid_fingerprint(training_data.samples),
+        "train_sample_counts_by_dataset": sample_counts_by_dataset(train_samples),
+        "eval_sample_counts_by_dataset": sample_counts_by_dataset(val_samples),
+        "train_qid_fingerprint": _sample_qid_fingerprint(train_samples),
+        "eval_qid_fingerprint": _sample_qid_fingerprint(val_samples),
         "train_test_seed": args.train_test_seed,
         "eval_split_ratio": args.eval_split_ratio,
+        "eval_strategy": args.eval_strategy,
+        "eval_steps": args.eval_steps,
+        "save_steps": args.save_steps,
+        "early_stopping_enabled": args.early_stopping_enabled,
+        "early_stopping_patience": args.early_stopping_patience,
+        "early_stopping_threshold": args.early_stopping_threshold,
+        "metric_for_best_model": args.metric_for_best_model,
+        "greater_is_better": args.greater_is_better,
+        "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
         "per_device_train_batch_size": args.per_device_train_batch_size,
         "gradient_accumulation_steps": args.gradient_accumulation_steps,
         "num_train_epochs": args.num_train_epochs,
@@ -610,13 +702,13 @@ def main() -> None:
             resume_segment=resume_segment,
         ),
     ]
-    if eval_dataset is not None and args.early_stopping_patience > 0:
-        callbacks.append(
-            EarlyStoppingCallback(
-                early_stopping_patience=args.early_stopping_patience,
-                early_stopping_threshold=args.early_stopping_threshold,
-            )
-        )
+    early_stopping_callback = _build_early_stopping_callback(
+        args,
+        has_eval=eval_dataset is not None,
+        callback_cls=EarlyStoppingCallback,
+    )
+    if early_stopping_callback is not None:
+        callbacks.append(early_stopping_callback)
     if not args.disable_tqdm:
         callbacks.append(_make_sample_progress_callback(TrainerCallback, train_source_sample_count, args.num_train_epochs))
 
@@ -647,7 +739,10 @@ def main() -> None:
             "num_skipped_eval_overlength_records": len(skipped_eval_records),
             "validation_split": bool(eval_dataset is not None),
             "eval_split_ratio": args.eval_split_ratio,
+            "early_stopping_enabled": args.early_stopping_enabled,
             "early_stopping_patience": args.early_stopping_patience,
+            "early_stopping_threshold": args.early_stopping_threshold,
+            "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
             "metric_for_best_model": args.metric_for_best_model,
             "gpu_indices": args.gpu_indices,
             "world_size": _world_size(),
@@ -667,6 +762,7 @@ def main() -> None:
             "max_rounds": args.max_rounds,
             "retrieval_top_k": args.retrieval_top_k,
             "teacher_run_config": teacher_metadata,
+            **_trainer_completion_metadata(trainer, total_optimizer_steps),
         }
         with (output_dir / "train_meta.json").open("w", encoding="utf-8") as file:
             json.dump(train_args_dict, file, ensure_ascii=False, indent=2)
