@@ -281,14 +281,14 @@ def test_vllm_server_helper_script_exists() -> None:
 
     text = script.read_text(encoding="utf-8")
 
-    assert "config/eval_vllm_server.yml" in text
+    assert "config/eval_macorag.yml" in text
     assert "-m evaluation.vllm_servers" in text
     assert "vllm serve" not in text
     assert "argparse" not in text
 
 
-def test_model_vllm_server_config_file_exists() -> None:
-    config = Path("config/eval_vllm_server.yml")
+def test_model_evaluation_config_contains_client_and_server_settings() -> None:
+    config = Path("config/eval_macorag.yml")
 
     text = config.read_text(encoding="utf-8")
 
@@ -296,21 +296,22 @@ def test_model_vllm_server_config_file_exists() -> None:
     assert 'model_path: "model/NousResearch-Meta-Llama-3-8B-Instruct"' in text
     assert 'adapter_path: "' in text
     assert "vllm_model:" in text
-    assert "gpu_indices:" in text
+    assert 'gpu_indices: "1"' in text
+    assert 'vllm_gpu_indices: "0"' in text
     assert "vllm_base_urls:" in text
-    assert "max_model_len:" in text
-    assert "max_model_len: null" not in text
-    assert "gpu_memory_utilization: 0.85" in text
+    assert "vllm_max_model_len:" in text
+    assert "vllm_max_model_len: null" not in text
+    assert "vllm_gpu_memory_utilization: 0.85" in text
     assert '--disable-log-requests' in text
-    assert "host:" not in text
-    assert "trust_remote_code:" not in text
-    assert "environment:" not in text
+    assert "vllm_host:" not in text
+    assert "vllm_trust_remote_code:" not in text
+    assert "vllm_environment:" not in text
 
 
-def test_eval_macorag_config_is_vllm_client_only() -> None:
+def test_eval_macorag_config_is_shared_by_client_and_server() -> None:
     text = Path("config/eval_macorag.yml").read_text(encoding="utf-8")
     eval_args = parse_args(["--config", "config/eval_macorag.yml"])
-    server_args = parse_vllm_server_args(["--config", "config/eval_vllm_server.yml"])
+    server_args = parse_vllm_server_args(["--config", "config/eval_macorag.yml"])
 
     assert eval_args.data_root == "data/eval_1000_stratified_v2"
     assert eval_args.retrieval_root == "data/eval_1000_stratified_v2_e5_faiss"
@@ -320,6 +321,10 @@ def test_eval_macorag_config_is_vllm_client_only() -> None:
     assert eval_args.model_path == server_args.model_path
     assert eval_args.adapter_path == server_args.adapter_path
     assert eval_args.adapter_identity_path == server_args.adapter_path
+    assert eval_args.gpu_indices == "1"
+    assert server_args.gpu_indices == "0"
+    assert server_args.dtype == "bfloat16"
+    assert server_args.max_model_len == 8192
     assert not hasattr(eval_args, "inference_backend")
 
 

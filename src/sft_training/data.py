@@ -4,11 +4,12 @@ import hashlib
 import json
 import math
 import random
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from prompt_config import load_prompt_contract
+from prompt_config import DEFAULT_PROMPT_CONTRACT, load_prompt_contract, system_prompt_for
 from rag import (
     AnswerPromptContext,
     RAGState,
@@ -17,9 +18,18 @@ from rag import (
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
 )
+from .trajectory_parser import (
+    TeacherValidationStats,
+    validate_answer_decision,
+    validate_evidence_decision,
+    validate_query_decision,
+    validate_round_order,
+)
 
 @dataclass
-class TrajectoryRecord:
+class SFTDecisionSample:
+    """One paper-level ``(x_n, rho_n, y_n*)`` decision instance."""
+
     qid: str
     question: str
     dataset: str
@@ -30,6 +40,28 @@ class TrajectoryRecord:
     round_index: int = 0
     max_rounds: int = 4
     prompt_contract_fingerprint: str = ""
+    sample_id: str = ""
+    trajectory_id: str = ""
+    agent_type: str = ""
+    role_instruction: str = ""
+    input_context: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.trajectory_id = self.trajectory_id or self.qid
+        self.sample_id = self.sample_id or f"{self.dataset}:{self.qid}:r{self.round_index}:{self.action_type}"
+        if not self.agent_type:
+            self.agent_type = {
+                "query_retriever": "query",
+                "query": "query",
+                "evidence_update": "evidence",
+                "evidence_updater": "evidence",
+                "answer": "answer",
+                "answer_generator": "answer",
+            }.get(self.action_type, self.action_type)
+
+
+# Backward-compatible public name used by existing launchers/tests.
+TrajectoryRecord = SFTDecisionSample
 
 
 @dataclass
@@ -46,6 +78,7 @@ class TrainingData:
     source_sample_count: int
     source_sample_counts_by_dataset: dict[str, int]
     selected_sample_counts_by_dataset: dict[str, int]
+    validation_stats: TeacherValidationStats = field(default_factory=TeacherValidationStats)
 
 
 def validate_teacher_dataset_contract(
@@ -162,7 +195,11 @@ def _state_with_update_evidence(state: dict[str, Any], update_evidence: dict[str
     return merged
 
 
-def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
+def trajectory_to_sft_records(
+    row: dict[str, Any],
+    *,
+    validation_stats: TeacherValidationStats | None = None,
+) -> list[TrajectoryRecord]:
     question = str(row.get("question", "")).strip()
     if not question:
         return []
@@ -180,7 +217,13 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
         or load_prompt_contract().fingerprint
     )
     records: list[TrajectoryRecord] = []
+    stats = validation_stats or TeacherValidationStats()
+    for error in validate_round_order(trajectory):
+        stats.reject(qid, -1, "answer", error)
+    stopped = False
     for turn_offset, turn in enumerate(trajectory):
+        if stopped:
+            break
         if not isinstance(turn, dict):
             continue
         state = turn.get("state") if isinstance(turn.get("state"), dict) else {}
@@ -191,9 +234,12 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
         answer = turn.get("answer") if isinstance(turn.get("answer"), dict) else None
         round_index = int(turn.get("round", turn_offset))
         state_before = _rag_state_from_dict(question, state)
-        query_target = _build_query_retriever_target(plan, retrieval or {})
+        authored_query = turn.get("query_retriever")
+        authored_query = authored_query if isinstance(authored_query, dict) else plan
+        query_target = _build_query_retriever_target(authored_query, retrieval or {})
 
-        if retrieval:
+        query_error = validate_query_decision(query_target) if retrieval else "retrieval decision is missing"
+        if query_error is None:
             records.append(
                 TrajectoryRecord(
                     qid=qid,
@@ -203,17 +249,22 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
                     prompt_text=build_query_retriever_prompt(question=question, state=state_before),
                     target_text=_tagged_json("query-retriever", query_target),
                     agent_role="query_retriever",
+                    role_instruction=system_prompt_for("query_retriever", DEFAULT_PROMPT_CONTRACT),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,
+                    input_context={"state": state_before.to_dict()},
                 )
             )
+        else:
+            stats.reject(qid, round_index, "query", query_error)
 
         if update_evidence:
             masked_update_evidence = _mask_update_evidence(update_evidence)
         else:
             masked_update_evidence = None
-        if retrieval and observation and masked_update_evidence:
+        evidence_error = validate_evidence_decision(masked_update_evidence, observation)
+        if retrieval and observation and evidence_error is None:
             updater_state = RAGState(
                 question=state_before.question,
                 current_sub_goal=query_target.get("sub_goal"),
@@ -234,12 +285,21 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
                     ),
                     target_text=_tagged_json("update-evidence", masked_update_evidence),
                     agent_role="evidence_updater",
+                    role_instruction=system_prompt_for("evidence_updater", DEFAULT_PROMPT_CONTRACT),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,
+                    input_context={
+                        "state": updater_state.to_dict(),
+                        "observation": observation,
+                    },
                 )
             )
-        if retrieval and observation and masked_update_evidence and answer:
+        else:
+            stats.reject(qid, round_index, "evidence", evidence_error or "evidence context is missing")
+
+        answer_error = validate_answer_decision(answer)
+        if retrieval and observation and masked_update_evidence is not None and answer_error is None:
             answer_state = advance_rag_state(
                 state_before,
                 query_action=query_target,
@@ -259,11 +319,16 @@ def trajectory_to_sft_records(row: dict[str, Any]) -> list[TrajectoryRecord]:
                     ),
                     target_text=_tagged_json("answer", answer),
                     agent_role="answer_generator",
+                    role_instruction=system_prompt_for("answer_generator", DEFAULT_PROMPT_CONTRACT),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,
+                    input_context={"state": answer_state.to_dict()},
                 )
             )
+            stopped = bool(answer.get("can_answer"))
+        else:
+            stats.reject(qid, round_index, "answer", answer_error or "answer context is missing")
     return records
 
 
@@ -341,6 +406,7 @@ def build_training_data(
 ) -> TrainingData:
     dataset_files = _resolve_dataset_paths(str(data_root))
     samples: list[TrainingSample] = []
+    validation_stats = TeacherValidationStats()
     source_sample_counts_by_dataset: dict[str, int] = {}
     for path in dataset_files:
         if not path.exists():
@@ -348,7 +414,7 @@ def build_training_data(
         dataset = path.stem.replace("_sft", "")
         for row in _load_jsonl_records(path):
             row.setdefault("dataset", dataset)
-            row_records = trajectory_to_sft_records(row)
+            row_records = trajectory_to_sft_records(row, validation_stats=validation_stats)
             if row_records:
                 qid = row_records[0].qid
                 samples.append(TrainingSample(qid=qid, dataset=dataset, records=row_records))
@@ -366,12 +432,20 @@ def build_training_data(
         )
     selected_sample_counts_by_dataset = sample_counts_by_dataset(samples)
     records = flatten_training_samples(samples)
+    if validation_stats.invalid_sample_count:
+        warnings.warn(
+            "Skipped invalid teacher decisions: "
+            f"{validation_stats.to_dict()}",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return TrainingData(
         samples=samples,
         records=records,
         source_sample_count=source_sample_count,
         source_sample_counts_by_dataset=source_sample_counts_by_dataset,
         selected_sample_counts_by_dataset=selected_sample_counts_by_dataset,
+        validation_stats=validation_stats,
     )
 
 

@@ -86,7 +86,7 @@ def parse_action_text(text: str, role: AgentRole | str) -> ParsedAction:
             query_retriever,
             "query",
             field="query_retriever.query",
-            allow_empty=True,
+            allow_empty=False,
         )
         return ParsedAction(role=role, query_retriever=query_retriever)
 
@@ -117,7 +117,7 @@ def parse_action_text(text: str, role: AgentRole | str) -> ParsedAction:
         raise ValueError("Missing required field: answer.answer")
     answer["can_answer"] = parse_can_answer(answer["can_answer"])
     if answer["can_answer"] is True:
-        _require_string(answer, "answer", field="answer.answer", allow_empty=True)
+        _require_string(answer, "answer", field="answer.answer", allow_empty=False)
     elif answer["answer"] is not None and not isinstance(answer["answer"], str):
         raise ValueError("answer.answer must be null or a string when can_answer is false.")
     _validate_optional_string(answer, "rationale", field="answer.rationale")

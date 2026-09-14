@@ -33,6 +33,26 @@ class GeneratedAction:
     primary_advantage: float = 0.0
     fallback_advantage: float = 0.0
     advantage: float = 0.0
+    attention_mask: list[int] = field(default_factory=list)
+    # The mask is completion-aligned. Prompt/retrieval/padding tokens are never
+    # part of this array and are therefore never optimized.
+    decision_token_mask: list[int] = field(default_factory=list)
+    is_valid: bool = True
+    local_reward_valid: bool = True
+    forced_termination: bool = False
+    parse_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.attention_mask:
+            self.attention_mask = [1] * (len(self.prompt_ids) + len(self.completion_ids))
+        if len(self.attention_mask) != len(self.prompt_ids) + len(self.completion_ids):
+            raise ValueError("attention_mask must align with prompt + completion ids")
+        if not self.decision_token_mask:
+            self.decision_token_mask = [1] * len(self.completion_ids)
+        if len(self.decision_token_mask) != len(self.completion_ids):
+            raise ValueError("decision_token_mask must align with completion_ids")
+        if any(value not in (0, 1, False, True) for value in self.decision_token_mask):
+            raise ValueError("decision_token_mask must be binary")
 
 
 @dataclass
@@ -66,6 +86,9 @@ class HFSharedPolicy:
         temperature: float,
         top_p: float,
         top_k: int,
+        prompt_contract: Any | None = None,
+        score_completions: bool = True,
+        generation_use_cache: bool = False,
     ) -> None:
         self.model = model
         self.tokenizer = tokenizer
@@ -75,6 +98,9 @@ class HFSharedPolicy:
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
+        self.prompt_contract = prompt_contract
+        self.score_completions = bool(score_completions)
+        self.generation_use_cache = bool(generation_use_cache)
         self.trace = RolloutTrace()
 
     def reset_trace(self) -> None:
@@ -111,7 +137,7 @@ class HFSharedPolicy:
     def _encode_prompt(self, prompt: str, *, role: AgentRole) -> list[int]:
         def encode(text: str) -> list[int]:
             messages = [
-                {"role": "system", "content": system_prompt_for(role)},
+                {"role": "system", "content": system_prompt_for(role, self.prompt_contract)},
                 {"role": "user", "content": text},
             ]
             return list(
@@ -154,29 +180,45 @@ class HFSharedPolicy:
         input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         attention_mask = torch.ones_like(input_ids)
         do_sample = self.temperature > 0.0
-        with torch.no_grad():
-            generated = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.max_completion_length,
-                do_sample=do_sample,
-                temperature=self.temperature if do_sample else None,
-                top_p=self.top_p if do_sample else None,
-                top_k=self.top_k if do_sample else None,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-                use_cache=False,
-            )
+        was_training = bool(getattr(self.model, "training", False))
+        if callable(getattr(self.model, "eval", None)):
+            self.model.eval()
+        try:
+            with torch.no_grad():
+                generated = self.model.generate(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    max_new_tokens=self.max_completion_length,
+                    do_sample=do_sample,
+                    temperature=self.temperature if do_sample else None,
+                    top_p=self.top_p if do_sample else None,
+                    top_k=self.top_k if do_sample else None,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    use_cache=self.generation_use_cache,
+                )
+        finally:
+            if callable(getattr(self.model, "train", None)):
+                self.model.train(was_training)
         completion = generated[0, input_ids.shape[1] :].tolist()
         if self.tokenizer.eos_token_id in completion:
             completion = completion[: completion.index(self.tokenizer.eos_token_id) + 1]
         response = self.tokenizer.decode(completion, skip_special_tokens=True)
-        old_logprobs = sequence_logprobs(
-            model=self.model,
-            prompt_ids=prompt_ids,
-            completion_ids=completion,
-            device=device,
-        ).detach().cpu()
+        old_logprobs = None
+        if self.score_completions:
+            if callable(getattr(self.model, "eval", None)):
+                self.model.eval()
+            try:
+                with torch.no_grad():
+                    old_logprobs = sequence_logprobs(
+                        model=self.model,
+                        prompt_ids=prompt_ids,
+                        completion_ids=completion,
+                        device=device,
+                    ).cpu()
+            finally:
+                if callable(getattr(self.model, "train", None)):
+                    self.model.train(was_training)
         self.trace.actions.append(
             GeneratedAction(
                 role=role,

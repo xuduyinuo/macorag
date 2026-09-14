@@ -20,6 +20,7 @@ from answer_metrics import ANSWER_F1_CONTRACT
 from rag import RAGLoopExecutor
 
 from .config import parse_args
+from .credit_assignment import compute_decision_returns, group_relative_normalization
 from prompt_config import load_prompt_contract
 from rag.protocol_metrics import ProtocolWindowMonitor, compute_protocol_metrics
 from .batched_rollout import run_batched_rollouts
@@ -46,7 +47,7 @@ from .runtime import extract_vllm_server_model_paths as _extract_vllm_server_mod
 from .runtime import parse_gpu_indices as _parse_gpu_indices
 from .runtime import validate_local_vllm_server_model as _validate_local_vllm_server_model
 from .runtime import validate_vllm_gpu_placement as _validate_vllm_gpu_placement
-from .trainer import assign_action_advantages, compute_grpo_loss, normalize_group_advantages
+from .trainer import compute_grpo_loss, normalize_group_advantages
 from .vllm_client import VLLMGenerationClient
 
 
@@ -285,7 +286,7 @@ def _load_policy_and_reference(args: Any, deps: dict[str, Any], device: Any) -> 
     if not callable(load_adapter):
         raise SystemExit("Shared-base GRPO requires PEFT load_adapter() support.")
     load_adapter(
-        args.sft_adapter_path,
+        getattr(args, "reference_model_path", "") or args.sft_adapter_path,
         adapter_name=_REFERENCE_ADAPTER_NAME,
         is_trainable=False,
     )
@@ -314,6 +315,29 @@ def _validate_sft_prompt_contract(args: Any) -> dict[str, Any]:
     if int(metadata.get("retrieval_top_k", -1)) != int(args.retrieval_top_k):
         raise SystemExit("SFT adapter retrieval_top_k mismatch")
     return metadata
+
+
+def _validate_online_policy_sync(args: Any) -> None:
+    if getattr(args, "use_vllm_generation", False) and (
+        not getattr(args, "vllm_sync_after_step", True)
+        or int(getattr(args, "vllm_sync_every_steps", 1)) != 1
+    ):
+        raise SystemExit(
+            "Paper-faithful online GRPO requires vllm_sync_after_step=true and "
+            "vllm_sync_every_steps=1 to prevent off-policy rollout weights."
+        )
+
+
+def _validate_paper_credit_config(args: Any) -> None:
+    if str(getattr(args, "advantage_granularity", "role_only")) != "role_only":
+        raise SystemExit(
+            "Section 3.3 requires same-question, same-agent normalization across all rounds; "
+            "advantage_granularity must be role_only."
+        )
+    if float(getattr(args, "degenerate_bucket_fallback_weight", 0.0)) != 0.0:
+        raise SystemExit(
+            "Section 3.3 keeps tied groups at zero; degenerate_bucket_fallback_weight must be 0."
+        )
 
 
 def _wrap_ddp(model: Any, torch: Any) -> Any:
@@ -644,27 +668,37 @@ def _generate_rollout_candidates(
 
     supports_batch = callable(getattr(policy, "generate_batch", None))
     if supports_batch:
-        policy.reset_trace()
-        rollout_start = time.perf_counter()
-        batch_results = run_batched_rollouts(
-            question=sample.question,
-            dataset=sample.dataset,
-            group_size=candidate_count,
-            max_rounds=args.max_rounds,
-            policy=policy,
-            retrieval_env=retrieval_env,
+        group_results = []
+        rollout_batch_size = max(
+            1, int(getattr(args, "rollout_batch_size", candidate_count))
         )
-        time_rollout_seconds = time.perf_counter() - rollout_start
-        time_vllm_generate_seconds += float(
-            getattr(policy, "timing", {}).get("time_vllm_generate_seconds", 0.0)
-        )
-        time_behavior_rescore_seconds += float(
-            getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
-        )
-        group_results = [
-            (group_index_offset + group_index, item.result, item.trace)
-            for group_index, item in enumerate(batch_results)
-        ]
+        for batch_offset in range(0, candidate_count, rollout_batch_size):
+            batch_count = min(rollout_batch_size, candidate_count - batch_offset)
+            policy.reset_trace()
+            rollout_start = time.perf_counter()
+            batch_results = run_batched_rollouts(
+                question=sample.question,
+                dataset=sample.dataset,
+                group_size=batch_count,
+                max_rounds=args.max_rounds,
+                policy=policy,
+                retrieval_env=retrieval_env,
+            )
+            time_rollout_seconds += time.perf_counter() - rollout_start
+            time_vllm_generate_seconds += float(
+                getattr(policy, "timing", {}).get("time_vllm_generate_seconds", 0.0)
+            )
+            time_behavior_rescore_seconds += float(
+                getattr(policy, "timing", {}).get("time_behavior_rescore_seconds", 0.0)
+            )
+            group_results.extend(
+                (
+                    group_index_offset + batch_offset + group_index,
+                    item.result,
+                    item.trace,
+                )
+                for group_index, item in enumerate(batch_results)
+            )
     else:
         group_results = []
         for group_index in range(candidate_count):
@@ -688,6 +722,7 @@ def _generate_rollout_candidates(
         rollouts.append(
             {
                 "group_index": group_index,
+                "question_id": sample.qid,
                 "result": result,
                 "trajectory": result.trajectory,
                 "parse_errors": result.parse_errors,
@@ -724,10 +759,21 @@ def _score_rollout_candidates(
     reward_start = time.perf_counter()
     reward_sample = sample.to_reward_sample()
     for rollout in rollouts:
-        rewards = compute_rl_rewards(rollout=rollout, sample=reward_sample)
+        rewards = compute_rl_rewards(
+            rollout=rollout,
+            sample=reward_sample,
+            eta_query=float(getattr(args, "eta_query", 0.2)),
+            eta_evidence=float(getattr(args, "eta_evidence", 0.2)),
+            omega_answer=float(getattr(args, "omega_answer", 1.0)),
+            omega_evidence=float(getattr(args, "omega_evidence", 1.0)),
+        )
         action_credit = compute_action_rewards(
             rollout=rollout,
             sample=reward_sample,
+            eta_query=float(getattr(args, "eta_query", 0.2)),
+            eta_evidence=float(getattr(args, "eta_evidence", 0.2)),
+            omega_answer=float(getattr(args, "omega_answer", 1.0)),
+            omega_evidence=float(getattr(args, "omega_evidence", 1.0)),
             answer_local_reward_weight=float(getattr(args, "answer_local_reward_weight", 1.0)),
         )
         rollout["rewards"] = rewards
@@ -742,17 +788,40 @@ def _score_rollout_candidates(
     )
     for rollout, advantage in zip(rollouts, advantages):
         rollout["advantage"] = advantage
-    agent_credit_stats = assign_action_advantages(
+    lambda_by_agent = {
+        "query_retriever": float(
+            getattr(args, "lambda_query", getattr(args, "query_global_reward_weight", 1.0 / 3.0))
+        ),
+        "evidence_updater": float(
+            getattr(args, "lambda_evidence", getattr(args, "evidence_global_reward_weight", 3.0 / 7.0))
+        ),
+        "answer_generator": float(
+            getattr(args, "lambda_answer", getattr(args, "answer_global_reward_weight", 7.0 / 3.0))
+        ),
+    }
+    for rollout in rollouts:
+        reward_by_key = {
+            (str(item["role"]), int(item["round_index"])): item
+            for item in rollout["action_rewards"]
+        }
+        for action in rollout.get("actions", []):
+            role_name = getattr(action.role, "value", str(action.role))
+            credit = reward_by_key.get((role_name, int(action.round_index)))
+            if credit is None:
+                continue
+            action.local_reward = credit["local_reward"]
+            action.is_valid = bool(credit.get("is_valid", True))
+            action.local_reward_valid = bool(credit.get("local_reward_valid", True))
+            action.forced_termination = bool(credit.get("forced_termination", False))
+        compute_decision_returns(
+            rollout.get("actions", []),
+            global_reward=float(rollout["terminal_reward"]),
+            lambda_by_agent=lambda_by_agent,
+        )
+    agent_credit_stats = group_relative_normalization(
         rollouts,
-        global_weights={
-            "query_retriever": float(args.query_global_reward_weight),
-            "evidence_updater": float(args.evidence_global_reward_weight),
-            "answer_generator": float(args.answer_global_reward_weight),
-        },
-        epsilon=float(args.advantage_epsilon),
-        granularity=str(getattr(args, "advantage_granularity", "role_only")),
-        degenerate_bucket_fallback_weight=float(
-            getattr(args, "degenerate_bucket_fallback_weight", 0.0)
+        advantage_eps=float(
+            getattr(args, "advantage_eps", getattr(args, "advantage_epsilon", 1.0e-8))
         ),
     )
     for rollout in rollouts:
@@ -935,7 +1004,12 @@ def _train_on_rollouts(
         if action.completion_ids
     ]
     action_count = len(trainable_actions)
-    total_token_count = sum(len(action.completion_ids) for _, action in trainable_actions)
+    total_token_count = sum(
+        sum(int(value) for value in getattr(
+            action, "decision_token_mask", [1] * len(action.completion_ids)
+        ))
+        for _, action in trainable_actions
+    )
     base_metrics = {
         "loss": 0.0,
         "policy_loss": 0.0,
@@ -965,7 +1039,7 @@ def _train_on_rollouts(
         "time_backward_seconds": 0.0,
         "time_optimizer_step_seconds": 0.0,
     }
-    if not trainable_actions:
+    if not trainable_actions or total_token_count == 0:
         base_metrics["skipped_update_reason"] = "no_trainable_actions"
         return base_metrics
 
@@ -1056,6 +1130,19 @@ def _train_on_rollouts(
             device=device,
             pad_token_id=pad_token_id,
         )
+        # ``batched_sequence_logprobs`` already excludes prompts. Intersect its
+        # padding mask with the persisted per-decision output-token mask.
+        for row, action in enumerate(actions):
+            decision_mask = torch.tensor(
+                getattr(action, "decision_token_mask", [1] * len(action.completion_ids)),
+                dtype=torch.bool,
+                device=device,
+            )
+            if decision_mask.numel() != len(action.completion_ids):
+                raise ValueError("Decision token mask must align with completion tokens.")
+            mask[row, : decision_mask.numel()] &= decision_mask
+        if not bool(mask.any().item()):
+            continue
         policy_forward_batch_count += 1
         time_policy_forward_seconds += time.perf_counter() - policy_forward_start
         reference = torch.zeros_like(current)
@@ -1078,7 +1165,9 @@ def _train_on_rollouts(
             clip_epsilon=args.clip_epsilon,
             kl_beta=args.kl_beta,
         )
-        action_weight = len(actions) / action_count
+        # Aggregate microbatches as one masked token mean, independent of
+        # variable decision lengths and padding.
+        action_weight = int(mask.sum().item()) / total_token_count
         loss_total += metrics["loss"] * action_weight
         policy_loss_total += metrics["policy_loss"] * action_weight
         kl_total += metrics["kl"] * action_weight
@@ -1274,6 +1363,71 @@ def _build_train_metrics_payload(
     ]
     rollout_advantages = [float(item["advantage"]) for item in rollouts]
     reward_mean = sum(reward_totals) / len(reward_totals)
+    actions_by_role = {
+        role: [
+            action for rollout in rollouts for action in rollout.get("actions", [])
+            if getattr(
+                getattr(action, "role", None),
+                "value",
+                str(getattr(action, "role", "")),
+            ) == role
+        ]
+        for role in ("query_retriever", "evidence_updater", "answer_generator")
+    }
+
+    def role_local_mean(role: str) -> float:
+        values = [
+            float(action.local_reward) for action in actions_by_role[role]
+            if getattr(action, "local_reward", None) is not None
+        ]
+        return sum(values) / len(values) if values else 0.0
+
+    def role_advantage_stats(role: str) -> tuple[float, float]:
+        values = [float(action.advantage) for action in actions_by_role[role]]
+        return (
+            sum(values) / len(values) if values else 0.0,
+            statistics.pstdev(values) if len(values) > 1 else 0.0,
+        )
+
+    behavior = {}
+    for role in actions_by_role:
+        actions = actions_by_role[role]
+        behavior[role] = {
+            "invalid_rate": (
+                sum(not bool(getattr(action, "is_valid", True)) for action in actions) / len(actions)
+                if actions else 0.0
+            )
+        }
+    query_adv = role_advantage_stats("query_retriever")
+    evidence_adv = role_advantage_stats("evidence_updater")
+    answer_adv = role_advantage_stats("answer_generator")
+    avg_rounds = sum(len(item.get("trajectory", [])) for item in rollouts) / len(rollouts)
+    policy_stops = sum(
+        any(
+            bool((turn.get("answer") or {}).get("can_answer"))
+            and not bool(turn.get("force_final_answer", False))
+            for turn in rollout.get("trajectory", [])
+        )
+        for rollout in rollouts
+    )
+    forced_stops = sum(
+        bool(
+            rollout.get("trajectory")
+            and rollout["trajectory"][-1].get("force_final_answer", False)
+        )
+        for rollout in rollouts
+    )
+    selection_counts = [
+        len((turn.get("update_evidence") or {}).get("selected_passage_ids") or [])
+        for rollout in rollouts for turn in rollout.get("trajectory", [])
+    ]
+    mean_answer_f1 = sum(
+        float(item["rewards"].get("answer_f1", 0.0)) for item in rollouts
+    ) / len(rollouts)
+    mean_coverage = sum(
+        float(item["rewards"].get("evidence_coverage", item["rewards"].get("support_coverage", 0.0)))
+        for item in rollouts
+    ) / len(rollouts)
     return {
         "epoch": epoch,
         "sample": sample_index + 1,
@@ -1303,6 +1457,10 @@ def _build_train_metrics_payload(
         "preupdate_logratio_max_abs": metrics.get("preupdate_logratio_max_abs", 0.0),
         "ratio_mean": metrics.get("ratio_mean", 1.0),
         "ratio_p95": metrics.get("ratio_p95", 1.0),
+        "total_loss": metrics.get("total_loss", metrics["loss"]),
+        "kl_loss": metrics.get("kl_loss", metrics["kl"]),
+        "mean_ratio": metrics.get("mean_ratio", metrics.get("ratio_mean", 1.0)),
+        "approx_kl": metrics.get("approx_kl", 0.0),
         "reward_total": reward_mean,
         "reward_group": {
             "min": min(reward_totals),
@@ -1324,6 +1482,29 @@ def _build_train_metrics_payload(
         "reward_query": best_rollout["rewards"]["query_reward"],
         "reward_evidence": best_rollout["rewards"]["evidence_reward"],
         "reward_answer_f1": best_rollout["rewards"]["answer_f1"],
+        "reward/query": role_local_mean("query_retriever"),
+        "reward/evidence": role_local_mean("evidence_updater"),
+        "reward/answer": role_local_mean("answer_generator"),
+        "reward/global": reward_mean,
+        "reward/answer_f1": mean_answer_f1,
+        "reward/evidence_coverage": mean_coverage,
+        "advantage/query_mean": query_adv[0],
+        "advantage/query_std": query_adv[1],
+        "advantage/evidence_mean": evidence_adv[0],
+        "advantage/evidence_std": evidence_adv[1],
+        "advantage/answer_mean": answer_adv[0],
+        "advantage/answer_std": answer_adv[1],
+        "behavior/avg_rounds": avg_rounds,
+        "behavior/stop_rate": policy_stops / len(rollouts),
+        "behavior/forced_stop_rate": forced_stops / len(rollouts),
+        "behavior/invalid_query_rate": behavior["query_retriever"]["invalid_rate"],
+        "behavior/invalid_evidence_rate": behavior["evidence_updater"]["invalid_rate"],
+        "behavior/invalid_answer_rate": behavior["answer_generator"]["invalid_rate"],
+        "behavior/avg_selected_passages": (
+            sum(selection_counts) / len(selection_counts) if selection_counts else 0.0
+        ),
+        "performance/final_answer_f1": mean_answer_f1,
+        "performance/evidence_coverage": mean_coverage,
         "advantage_mean": sum(item["advantage"] for item in rollouts) / len(rollouts),
         "action_advantage_mean": (
             sum(action_advantages) / len(action_advantages)
@@ -1446,6 +1627,47 @@ def _rollout_log_payload(
     return payload
 
 
+def _print_debug_rollout(sample: RLSample, rollout: dict[str, Any]) -> None:
+    """Human-readable Section 3.3 audit trace; enabled only by config."""
+
+    credit = {
+        (item["role"], int(item["round_index"])): item
+        for item in rollout.get("action_rewards", [])
+    }
+    actions = {
+        (getattr(action.role, "value", str(action.role)), int(action.round_index)): action
+        for action in rollout.get("actions", [])
+    }
+    print(f"\n[debug_rollout] Question: {sample.question}")
+    for fallback_round, turn in enumerate(rollout.get("trajectory", [])):
+        round_index = int(turn.get("round", fallback_round))
+        print(f"Round {round_index + 1}")
+        for role, label in (
+            ("query_retriever", "Query"),
+            ("evidence_updater", "Evidence Selection"),
+            ("answer_generator", "Answer Decision"),
+        ):
+            action = actions.get((role, round_index))
+            reward = credit.get((role, round_index), {})
+            if action is not None:
+                print(f"  {label}: {action.response}")
+                print(
+                    "  local_reward="
+                    f"{reward.get('local_reward')} return={action.decision_return:.6f} "
+                    f"advantage={action.advantage:.6f} valid={getattr(action, 'is_valid', True)}"
+                )
+        passages = (turn.get("observation") or {}).get("passages") or []
+        selected = (turn.get("update_evidence") or {}).get("selected_passage_ids") or []
+        print(f"  retrieved={len(passages)} selected={selected}")
+    rewards = rollout.get("rewards", {})
+    print(f"Final Answer: {rollout.get('final_answer')}")
+    print(
+        f"Answer F1={rewards.get('answer_f1', 0.0):.6f} "
+        f"Evidence Coverage={rewards.get('evidence_coverage', 0.0):.6f} "
+        f"Global Reward={rollout.get('terminal_reward', 0.0):.6f}\n"
+    )
+
+
 def _protocol_warning_event(
     *,
     step: int,
@@ -1478,6 +1700,8 @@ def _make_progress_bar(args: Any, total: int) -> Any:
 
 def main() -> None:
     args = parse_args()
+    _validate_online_policy_sync(args)
+    _validate_paper_credit_config(args)
     sft_prompt_metadata = _validate_sft_prompt_contract(args)
     active_prompt_contract = load_prompt_contract(args.prompt_config_path)
     checkpoint_prompt_metadata = {
@@ -1702,6 +1926,12 @@ def main() -> None:
                     policy=policy,
                     retrieval_env=retrieval_env,
                 )
+                if (
+                    _is_main_process()
+                    and bool(getattr(args, "debug_rollout", False))
+                    and global_step < int(getattr(args, "debug_rollout_samples", 2))
+                ):
+                    _print_debug_rollout(sample, random.choice(rollouts))
                 rollout_timing["protocol_metrics"] = compute_protocol_metrics(rollouts)
                 latest_protocol_status = protocol_monitor.add(rollouts)
                 protocol_warning = _protocol_warning_event(

@@ -8,7 +8,7 @@ export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 cd "${REPO_ROOT}"
 
-CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/eval_vllm_server.yml}"
+CONFIG_PATH="${CONFIG_PATH:-${REPO_ROOT}/config/eval_macorag.yml}"
 previous_arg=""
 for arg in "$@"; do
   if [[ "${previous_arg}" == "--config" ]]; then

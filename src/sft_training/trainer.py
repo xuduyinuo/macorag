@@ -54,6 +54,24 @@ def _make_length_grouped_eval_sampler(
 
 def _make_target_only_trainer_cls(trainer_cls: Any, *, train_shuffle: bool = True) -> Any:
     class OrderedTargetOnlyTrainer(trainer_cls):
+        def _accumulate_sft_metrics(self, values: dict[str, tuple[float, int]]) -> None:
+            totals = getattr(self, "_macorag_sft_metric_totals", {})
+            for key, (value_sum, count) in values.items():
+                old_sum, old_count = totals.get(key, (0.0, 0))
+                totals[key] = (old_sum + value_sum, old_count + count)
+            self._macorag_sft_metric_totals = totals
+
+        def log(self, logs: dict[str, float], *args: Any, **kwargs: Any) -> Any:
+            # Flush microbatch statistics only with Trainer's normal optimizer-step
+            # log, avoiding one log-history entry per long-context microbatch.
+            if "loss" in logs:
+                totals = getattr(self, "_macorag_sft_metric_totals", {})
+                for key, (value_sum, count) in totals.items():
+                    if count > 0:
+                        logs[key] = value_sum / count
+                self._macorag_sft_metric_totals = {}
+            return super().log(logs, *args, **kwargs)
+
         def _get_train_sampler(self, train_dataset: Any | None = None) -> Any:
             dataset = train_dataset if train_dataset is not None else self.train_dataset
             if dataset is None:
@@ -90,6 +108,8 @@ def _make_target_only_trainer_cls(trainer_cls: Any, *, train_shuffle: bool = Tru
             return_outputs: bool = False,
             num_items_in_batch: Any = None,
         ) -> Any:
+            inputs = dict(inputs)
+            agent_type_ids = inputs.pop("agent_type_id", None)
             labels = inputs.get("labels")
             if labels is None:
                 return super().compute_loss(
@@ -116,6 +136,33 @@ def _make_target_only_trainer_cls(trainer_cls: Any, *, train_shuffle: bool = Tru
 
             outputs = model(**model_inputs)
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+            if bool(getattr(model, "training", True)):
+                logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
+                with __import__("torch").no_grad():
+                    aligned_logits = logits[:, -shift_labels.shape[1] :, :].float()
+                    valid = shift_labels.ne(-100)
+                    predictions = aligned_logits.argmax(dim=-1)
+                    metric_totals: dict[str, tuple[float, int]] = {
+                        "train/token_accuracy": (
+                            float(((predictions == shift_labels) & valid).sum().item()),
+                            int(valid.sum().item()),
+                        )
+                    }
+                    if agent_type_ids is not None:
+                        token_loss = functional.cross_entropy(
+                            aligned_logits.reshape(-1, aligned_logits.shape[-1]),
+                            shift_labels.reshape(-1),
+                            ignore_index=-100,
+                            reduction="none",
+                        ).reshape(shift_labels.shape)
+                        for role_id, role in enumerate(("query", "evidence", "answer")):
+                            role_mask = valid & agent_type_ids.eq(role_id).unsqueeze(1)
+                            if bool(role_mask.any()):
+                                metric_totals[f"train/{role}_loss"] = (
+                                    float(token_loss[role_mask].sum().item()),
+                                    int(role_mask.sum().item()),
+                                )
+                    self._accumulate_sft_metrics(metric_totals)
             if not bool(getattr(model, "training", True)):
                 logits = outputs["logits"] if isinstance(outputs, dict) else outputs.logits
                 loss = _mean_per_example_target_loss(logits, shift_labels)

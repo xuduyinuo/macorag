@@ -110,9 +110,9 @@ def test_grpo_training_launcher_uses_selected_python_for_distributed_run() -> No
 
 
 def test_eval_vllm_launcher_requires_and_uses_configured_adapter_path(tmp_path: Path) -> None:
-    config = _yaml("eval_vllm_server.yml")
+    config = _yaml("eval_macorag.yml")
     config["adapter_path"] = ""
-    config_path = tmp_path / "eval_vllm_server.yml"
+    config_path = tmp_path / "eval_macorag.yml"
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
     env = os.environ.copy()
     env.pop("ADAPTER_PATH", None)

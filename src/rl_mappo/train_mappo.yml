@@ -1,0 +1,147 @@
+# This config is intentionally colocated with all MAPPO implementation code.
+model_path: model/Qwen2.5-7B-Instruct
+sft_adapter_path: outputs/sft_Qwen2.5-7B/2026-09-10_15-06-27/adapter
+rl_data_root: data/rl_train_2000_stratified_v2
+retrieval_root: data/rl_train_2000_stratified_v2_e5_faiss
+output_root: outputs/mappo_Qwen2.5-7B-Instruct
+
+max_samples: 500
+max_total_samples: 1500
+# Keep exactly 50 fixed validation questions per dataset. The split is
+# deterministic and stratified by question type/hop inside each dataset.
+validation_ratio: 0.1
+validation_samples_per_dataset: 50
+# Keep rare MuSiQue 4hop2/4hop3 coverage without overwhelming 4hop1 or the
+# natural distribution. Rare-hop results should still be reported separately.
+musique_rare_hop_oversample_factor: 1.5
+validation_steps: 50
+validation_temperature: 0.0
+# Checkpoint selection uses macro answer F1. These legacy weights remain zeroed
+# for config compatibility; evidence is diagnostic and protocol is a hard gate.
+validation_score_answer_weight: 1.0
+validation_score_evidence_weight: 0.0
+validation_score_parse_penalty: 0.0
+validation_min_delta: 0.001
+# Allow a 150-200 step controlled run; the checkpoint selector can stop at 150
+# only after three consecutive macro-F1 validations fail to improve.
+early_stopping_patience: 3
+early_stopping_min_steps: 150
+# GRPO-style protocol monitoring and checkpoint eligibility thresholds.
+protocol_window_size: 100
+max_protocol_parse_failure_rate: 0.01
+max_validation_missing_answer_tag_rate: 0.005
+min_validation_final_compliance_rate: 0.99
+seed: 42
+max_rounds: 4
+rollout_batch_size: 4
+num_train_epochs: 1.0
+# Limit cumulative policy drift; 200 updates consume at most 800 episodes.
+max_steps: 200
+# The optimizer-side 7B QLoRA forward still exceeds 24 GiB at 2048+192.
+# These limits apply identically to vLLM behavior generation and PPO scoring,
+# preserving the old/new log-probability conditioning contract.
+max_prompt_length: 1024
+max_completion_length: 128
+# Compact prompt payloads before tokenization. Passage IDs/titles, aggregate
+# counts, and both early/recent multi-hop context are retained.
+prompt_max_evidence_items: 6
+prompt_max_history_items: 3
+prompt_evidence_text_chars: 160
+prompt_observation_text_chars: 200
+temperature: 0.8
+top_p: 0.95
+top_k: 5
+
+# vLLM trajectory generation. Start launch_vllm.py on GPU 1 before training;
+# actor/critic optimization remains on GPU 0. The LoRA is reloaded after every
+# MAPPO update so the next rollout batch uses the latest policy.
+use_vllm_generation: true
+vllm_host: 127.0.0.1
+vllm_port: 8002
+vllm_gpu_indices: "1"
+vllm_served_model_name: mappo_base
+vllm_lora_name: mappo_policy
+vllm_tensor_parallel_size: 1
+vllm_gpu_memory_utilization: 0.85
+vllm_max_model_len: 4096
+vllm_max_num_seqs: 8
+vllm_dtype: bfloat16
+vllm_max_lora_rank: 64
+vllm_timeout_seconds: 180.0
+vllm_generate_attempts: 3
+vllm_retry_backoff_seconds: 1.0
+vllm_sync_after_update: true
+vllm_sync_snapshots_to_keep: 2
+# vLLM still generates token IDs, but PPO re-scores those fixed actions with
+# the local 4-bit actor before updating. This keeps old/new log-probabilities
+# on one numerical path; vLLM-vs-local drift is logged for diagnosis.
+ppo_old_logprob_source: local_actor
+
+retrieval_backend: e5_faiss
+retrieval_embedding_model: intfloat/e5-base-v2
+retrieval_device: cpu
+retrieval_max_length: 512
+retrieval_batch_size: 32
+retrieval_top_k: 5
+
+actor_learning_rate: 0.000001
+critic_learning_rate: 0.0003
+weight_decay: 0.0
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_clip_epsilon: 0.2
+value_loss_coef: 0.5
+entropy_coef: 0.002
+entropy_final_coef: 0.0
+entropy_anneal_start_step: 100
+entropy_anneal_end_step: 150
+# Keep the learned policy close to the immutable initialization SFT adapter.
+reference_kl_beta: 0.01
+max_grad_norm: 1.0
+ppo_epochs: 1
+# A 7B actor emits full-vocabulary logits; 1 is the safe default. Increase only
+# after measuring free GPU memory.
+minibatch_size: 1
+target_kl: 0.02
+normalize_advantages: true
+advantage_normalization_scope: role
+terminal_reward_weight: 1.0
+
+eta_query: 0.2
+eta_evidence: 0.2
+omega_answer: 1.5
+omega_evidence: 1.0
+answer_local_reward_weight: 1.0
+format_reward_weight: 0.1
+invalid_action_penalty: -1.0
+# Waiting is mildly positive before the final round, but final refusal/malformed
+# output is strongly negative and cannot receive positive evidence reward.
+non_final_wait_reward: 0.2
+final_answer_bonus: 1.0
+final_answer_invalid_penalty: -3.0
+gate_terminal_evidence_on_valid_answer: true
+# vLLM 0.8.5 guided regex fixes final can_answer=true and a non-empty answer.
+force_final_answer_decoding: true
+
+critic_hash_buckets: 32768
+critic_embedding_dim: 128
+critic_hidden_dim: 256
+critic_text_max_tokens: 512
+lora_rank: 64
+lora_alpha: 128
+lora_dropout: 0.0
+lora_target_modules: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+
+bf16: true
+fp16: false
+# A full BF16 Qwen2.5-7B actor leaves almost no activation headroom on a
+# 24 GiB GPU during PPO re-scoring. QLoRA keeps the frozen base in 4-bit while
+# preserving BF16 LoRA computation and vLLM rollout generation.
+load_4bit: true
+gradient_checkpointing: true
+attn_implementation: flash_attention_2
+save_steps: 50
+save_total_limit: 8
+logging_steps: 1
+device: cuda:0

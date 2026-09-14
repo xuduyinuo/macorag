@@ -33,6 +33,7 @@ from .config import parse_args
 from .data import EvalSample, load_eval_samples
 from .local_evaluator import evaluate_predictions
 from .output import make_run_dir
+from .request_batcher import GenerateBatcher
 
 
 try:
@@ -364,9 +365,15 @@ class VLLMOpenAIPolicy:
 class VLLMTrainingServerPolicy(VLLMOpenAIPolicy):
     """Evaluation policy for the LoRA hot-sync server used during GRPO."""
 
-    def __init__(self, *, tokenizer: Any, **kwargs: Any) -> None:
+    def __init__(self, *, tokenizer: Any, generate_batch_size: int = 1,
+                 generate_batch_wait_ms: float = 20, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.tokenizer = tokenizer
+        self.generate_batcher = GenerateBatcher(
+            self._send_generate, max_size=generate_batch_size, wait_ms=generate_batch_wait_ms,
+        ) if generate_batch_size > 1 else None
+        if generate_batch_size < 1:
+            raise ValueError("generate_batch_size must be positive")
 
     def set_endpoint_index(self, index: int) -> None:
         super().set_endpoint_index(index)
@@ -379,9 +386,14 @@ class VLLMTrainingServerPolicy(VLLMOpenAIPolicy):
         return self.base_urls[index % len(self.base_urls)].removesuffix("/v1") + "/generate/"
 
     def _post_generate(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.generate_batcher is not None:
+            return self.generate_batcher.submit(self._endpoint(), payload)
+        return self._send_generate(self._endpoint(), payload)
+
+    def _send_generate(self, endpoint: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         request = urllib.request.Request(
-            self._endpoint(),
+            endpoint,
             data=data,
             headers=self._headers(),
             method="POST",
@@ -660,6 +672,8 @@ def _load_policy(args: Any) -> VLLMOpenAIPolicy:
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
         return VLLMTrainingServerPolicy(
             tokenizer=tokenizer,
+            generate_batch_size=getattr(args, "eval_generate_batch_size", 1),
+            generate_batch_wait_ms=getattr(args, "eval_generate_batch_wait_ms", 20),
             base_urls=list(getattr(args, "vllm_base_urls", []) or []),
             model=getattr(args, "vllm_model", ""),
             api_key_env=getattr(args, "vllm_api_key_env", ""),
@@ -793,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
     policy = _load_policy(args)
     retrieval_env = _build_retrieval_env(args)
 
+    prediction_started = time.monotonic()
     dataset_metrics: dict[str, dict[str, Any]] = {}
     all_predictions: list[dict[str, Any]] = []
     for dataset, dataset_samples in _group_samples_by_dataset(samples):
@@ -833,6 +848,12 @@ def main(argv: list[str] | None = None) -> int:
     _write_json(output_dir / "aggregate_metrics.json", aggregate_metrics)
     _write_json(output_dir / "aggregate_protocol_metrics.json", aggregate_protocol)
     _write_json(output_dir / "evaluation_contract.json", contract_payload)
+    timing = {"prediction_seconds": time.monotonic() - prediction_started,
+              "workers": getattr(args, "eval_request_workers", 1)}
+    batcher = getattr(policy, "generate_batcher", None)
+    if batcher is not None:
+        timing.update(batcher.statistics())
+    _write_json(output_dir / "throughput.json", timing)
 
     print(f"Evaluation artifacts written to {output_dir}")
     return 0

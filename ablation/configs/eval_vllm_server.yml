@@ -1,0 +1,16 @@
+vllm_bin: "/data/conda/envs/macorag/bin/vllm"
+model_path: "model/Qwen2.5-7B-Instruct"
+adapter_path: null
+vllm_model: "macorag-ablation"
+gpu_indices: "1"
+vllm_base_urls: ["http://127.0.0.1:8100/v1"]
+host: "127.0.0.1"
+dtype: "bfloat16"
+gpu_memory_utilization: 0.85
+max_model_len: 8192
+trust_remote_code: true
+environment:
+  VLLM_USE_FLASHINFER_SAMPLER: "0"
+  VLLM_ATTENTION_BACKEND: "FLASH_ATTN"
+extra_args:
+  - "--disable-log-requests"

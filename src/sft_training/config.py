@@ -46,6 +46,7 @@ OPTIM_DEFAULTS: dict[str, Any] = {
     "lr_scheduler_type": "cosine",
     "warmup_ratio": 0.03,
     "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
     "logging_steps": 20,
     "save_steps": 100,
     "max_steps": 0,
@@ -65,6 +66,25 @@ EVAL_DEFAULTS: dict[str, Any] = {
     "metric_for_best_model": "eval_loss",
     "greater_is_better": False,
     "restore_callback_states_from_checkpoint": True,
+    "protocol_validation_enabled": False,
+    "protocol_validation_size": 100,
+    "protocol_validation_seed": 20260910,
+    "protocol_smoke_size": 20,
+    "protocol_smoke_steps": 400,
+    "protocol_candidate_count": 3,
+    "protocol_validation_retrieval_backend": "e5_faiss",
+    "protocol_validation_retrieval_root": "data/trajectory_train_e5_faiss",
+    "protocol_validation_embedding_model": "intfloat/e5-base-v2",
+    "protocol_validation_retrieval_device": "cpu",
+    "protocol_validation_retrieval_max_length": 512,
+    "protocol_validation_retrieval_batch_size": 32,
+    "protocol_validation_max_prompt_length": 4096,
+    "protocol_validation_max_completion_length": 256,
+    "protocol_validation_temperature": 0.0,
+    "protocol_validation_top_p": 1.0,
+    "protocol_max_parse_failure_rate": 0.01,
+    "protocol_max_missing_answer_tag_rate": 0.002,
+    "protocol_min_final_compliance_rate": 0.99,
 }
 
 # 运行环境：launcher 只读取 gpu_indices；check_only 用于数据快速检查。
@@ -73,6 +93,10 @@ RUNTIME_DEFAULTS: dict[str, Any] = {
     "bf16": False,
     "attn_implementation": "sdpa",
     "load_4bit": False,
+    "gradient_checkpointing": True,
+    "packing": False,
+    "debug_sft": False,
+    "debug_sft_num_samples": 10,
     "disable_tqdm": False,
     "gpu_indices": "0,1",
     "check_only": False,
@@ -133,6 +157,48 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("max_samples and max_samples_by_dataset cannot both be active.")
     if args.max_samples is not None and args.max_samples <= 0:
         raise SystemExit(f"max_samples must be positive; got {args.max_samples}.")
+    if args.max_grad_norm <= 0:
+        raise SystemExit("max_grad_norm must be positive.")
+    if args.debug_sft_num_samples <= 0:
+        raise SystemExit("debug_sft_num_samples must be positive.")
+    if args.packing:
+        raise SystemExit("packing=true is not implemented: decision boundaries must remain explicit.")
+    if args.protocol_validation_enabled:
+        if not args.validation_split:
+            raise SystemExit("protocol_validation_enabled requires validation_split=true.")
+        if args.eval_strategy != "steps":
+            raise SystemExit("protocol_validation_enabled requires eval_strategy='steps'.")
+        if args.eval_steps <= 0 or args.save_steps <= 0 or args.save_steps % args.eval_steps != 0:
+            raise SystemExit(
+                "protocol validation requires positive save_steps divisible by positive eval_steps."
+            )
+        if not 50 <= args.protocol_validation_size <= 100:
+            raise SystemExit("protocol_validation_size must be between 50 and 100.")
+        if args.protocol_validation_max_prompt_length <= 0 or args.protocol_validation_max_completion_length <= 0:
+            raise SystemExit("protocol validation prompt/completion lengths must be positive.")
+        if args.protocol_validation_temperature < 0.0:
+            raise SystemExit("protocol_validation_temperature must be non-negative.")
+        if not 0.0 < args.protocol_validation_top_p <= 1.0:
+            raise SystemExit("protocol_validation_top_p must satisfy 0 < top_p <= 1.")
+        for name in (
+            "protocol_max_parse_failure_rate",
+            "protocol_max_missing_answer_tag_rate",
+            "protocol_min_final_compliance_rate",
+        ):
+            if not 0.0 <= float(getattr(args, name)) <= 1.0:
+                raise SystemExit(f"{name} must be between 0 and 1.")
+        if not 1 <= args.protocol_smoke_size <= args.protocol_validation_size:
+            raise SystemExit(
+                "protocol_smoke_size must be positive and no larger than protocol_validation_size."
+            )
+        if args.protocol_smoke_steps <= 0 or args.protocol_smoke_steps % args.eval_steps != 0:
+            raise SystemExit("protocol_smoke_steps must be a positive multiple of eval_steps.")
+        if not 3 <= args.protocol_candidate_count <= 5:
+            raise SystemExit("protocol_candidate_count must be between 3 and 5.")
+        if args.metric_for_best_model != "eval_loss":
+            raise SystemExit("protocol validation requires metric_for_best_model='eval_loss'.")
+        if args.greater_is_better:
+            raise SystemExit("protocol validation on eval_loss requires greater_is_better=false.")
     if not args.early_stopping_enabled:
         return
     if not args.validation_split:
@@ -159,9 +225,10 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit(
             f"early_stopping_threshold must be non-negative; got {args.early_stopping_threshold}."
         )
-    if args.metric_for_best_model != "eval_loss":
+    expected_metric = "eval_loss"
+    if args.metric_for_best_model != expected_metric:
         raise SystemExit(
-            "early stopping requires metric_for_best_model='eval_loss'; "
+            f"early stopping requires metric_for_best_model={expected_metric!r}; "
             f"got {args.metric_for_best_model!r}."
         )
     if args.greater_is_better:
@@ -241,6 +308,7 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--lr-scheduler-type", default=defaults["lr_scheduler_type"], help="Learning rate scheduler.")
     parser.add_argument("--warmup-ratio", type=float, default=defaults["warmup_ratio"], help="Warmup ratio.")
     parser.add_argument("--weight-decay", type=float, default=defaults["weight_decay"], help="Weight decay.")
+    parser.add_argument("--max-grad-norm", type=float, default=defaults["max_grad_norm"])
     parser.add_argument("--logging-steps", type=int, default=defaults["logging_steps"], help="Logging interval.")
     parser.add_argument("--save-steps", type=int, default=defaults["save_steps"], help="Save interval.")
     parser.add_argument(
@@ -280,6 +348,30 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default=defaults["restore_callback_states_from_checkpoint"],
         help="Restore stateful Trainer callbacks during full checkpoint resume.",
     )
+    parser.add_argument(
+        "--protocol-validation-enabled",
+        action=BooleanOptionalAction,
+        default=defaults["protocol_validation_enabled"],
+        help="Run fixed, teacher-free multi-round generation on held-out validation questions.",
+    )
+    parser.add_argument("--protocol-validation-size", type=int, default=defaults["protocol_validation_size"])
+    parser.add_argument("--protocol-validation-seed", type=int, default=defaults["protocol_validation_seed"])
+    parser.add_argument("--protocol-smoke-size", type=int, default=defaults["protocol_smoke_size"])
+    parser.add_argument("--protocol-smoke-steps", type=int, default=defaults["protocol_smoke_steps"])
+    parser.add_argument("--protocol-candidate-count", type=int, default=defaults["protocol_candidate_count"])
+    parser.add_argument("--protocol-validation-retrieval-backend", default=defaults["protocol_validation_retrieval_backend"])
+    parser.add_argument("--protocol-validation-retrieval-root", default=defaults["protocol_validation_retrieval_root"])
+    parser.add_argument("--protocol-validation-embedding-model", default=defaults["protocol_validation_embedding_model"])
+    parser.add_argument("--protocol-validation-retrieval-device", default=defaults["protocol_validation_retrieval_device"])
+    parser.add_argument("--protocol-validation-retrieval-max-length", type=int, default=defaults["protocol_validation_retrieval_max_length"])
+    parser.add_argument("--protocol-validation-retrieval-batch-size", type=int, default=defaults["protocol_validation_retrieval_batch_size"])
+    parser.add_argument("--protocol-validation-max-prompt-length", type=int, default=defaults["protocol_validation_max_prompt_length"])
+    parser.add_argument("--protocol-validation-max-completion-length", type=int, default=defaults["protocol_validation_max_completion_length"])
+    parser.add_argument("--protocol-validation-temperature", type=float, default=defaults["protocol_validation_temperature"])
+    parser.add_argument("--protocol-validation-top-p", type=float, default=defaults["protocol_validation_top_p"])
+    parser.add_argument("--protocol-max-parse-failure-rate", type=float, default=defaults["protocol_max_parse_failure_rate"])
+    parser.add_argument("--protocol-max-missing-answer-tag-rate", type=float, default=defaults["protocol_max_missing_answer_tag_rate"])
+    parser.add_argument("--protocol-min-final-compliance-rate", type=float, default=defaults["protocol_min_final_compliance_rate"])
     parser.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"], help="Use fp16.")
     parser.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"], help="Use bf16.")
     parser.add_argument(
@@ -288,6 +380,14 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default=defaults["attn_implementation"],
     )
     parser.add_argument("--load-4bit", action=BooleanOptionalAction, default=defaults["load_4bit"], help="Enable 4-bit quantized loading (requires bitsandbytes).")
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action=BooleanOptionalAction,
+        default=defaults["gradient_checkpointing"],
+    )
+    parser.add_argument("--packing", action=BooleanOptionalAction, default=defaults["packing"])
+    parser.add_argument("--debug-sft", action=BooleanOptionalAction, default=defaults["debug_sft"])
+    parser.add_argument("--debug-sft-num-samples", type=int, default=defaults["debug_sft_num_samples"])
     parser.add_argument("--disable-tqdm", action=BooleanOptionalAction, default=defaults["disable_tqdm"], help="Disable tqdm progress bars.")
     parser.add_argument("--gpu-indices", default=defaults["gpu_indices"], help="Comma-separated GPU indices exposed to the training process.")
     parser.add_argument("--check-only", action=BooleanOptionalAction, default=defaults["check_only"], help="Only validate data and print stats.")

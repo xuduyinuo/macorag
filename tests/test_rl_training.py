@@ -319,7 +319,7 @@ def test_active_grpo_config_enables_bf16_flash_attention() -> None:
     assert args.vllm_gpu_memory_utilization == pytest.approx(0.85)
     assert args.vllm_max_num_seqs == 8
     assert args.attn_implementation == "flash_attention_2"
-    assert args.advantage_granularity == "role_round"
+    assert args.advantage_granularity == "role_only"
 
 
 def test_vllm_generation_defaults_reserve_bf16_kv_cache(tmp_path: Path) -> None:
@@ -2440,6 +2440,39 @@ def test_vllm_generation_client_validate_lora_server_rejects_identity_mismatch()
         raise AssertionError("expected LoRA server identity validation to fail")
 
 
+def test_vllm_generation_client_accepts_absolute_server_paths(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from rl_training.vllm_client import VLLMGenerationClient
+
+    monkeypatch.chdir(tmp_path)
+    backend = _FakeTRLClient()
+    backend.session = _FakeSession(
+        health_payload={
+            "status": "ok",
+            "sync_mode": "lora",
+            "dtype": "bfloat16",
+            "lora_name": "macorag_train",
+            "lora_int_id": 1,
+            "model": str(tmp_path / "model/Qwen2.5-7B-Instruct"),
+            "lora_adapter_path": str(tmp_path / "outputs/adapter"),
+            "supports_lora_param_update": True,
+            "supports_prompt_seeds": True,
+        }
+    )
+    backend.base_url = "http://127.0.0.1:8002"
+    client = VLLMGenerationClient(host="127.0.0.1", port=8002, timeout_seconds=5, backend=backend)
+    args = Namespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        vllm_dtype="bfloat16",
+        vllm_lora_name="macorag_train",
+        vllm_lora_int_id=1,
+        vllm_lora_adapter_path="outputs/adapter",
+    )
+
+    client.validate_lora_server(args)
+
+
 def test_vllm_generation_client_rejects_wrong_server_dtype() -> None:
     from rl_training.vllm_client import VLLMGenerationClient
 
@@ -3543,9 +3576,10 @@ def test_compute_action_rewards_assigns_distinct_role_round_credit() -> None:
         ("answer_generator", 1),
     }
     assert by_key[("query_retriever", 0)] > by_key[("query_retriever", 1)]
-    assert by_key[("evidence_updater", 0)] > by_key[("evidence_updater", 1)]
+    # Evidence reward is relative to gold evidence retrievable in that round.
+    assert by_key[("evidence_updater", 0)] < by_key[("evidence_updater", 1)]
     assert by_key[("answer_generator", 0)] != by_key[("answer_generator", 1)]
-    assert rewards["terminal_reward"] == 2.25
+    assert rewards["terminal_reward"] == 1.5
 
 
 def test_compute_action_rewards_does_not_infer_sufficiency_without_support_labels() -> None:
@@ -3571,7 +3605,7 @@ def test_compute_action_rewards_does_not_infer_sufficiency_without_support_label
         if item["role"] == "answer_generator"
     )
 
-    assert answer_reward == 0.0
+    assert answer_reward == 1.0
 
 
 def test_compute_action_rewards_assigns_parse_failure_to_failed_role() -> None:
@@ -3603,7 +3637,7 @@ def test_compute_action_rewards_assigns_parse_failure_to_failed_role() -> None:
 
     assert set(by_role) == {"query_retriever", "evidence_updater"}
     assert by_role["query_retriever"] > 0.0
-    assert by_role["evidence_updater"] < -1.0
+    assert by_role["evidence_updater"] == -1.0
 
 
 def test_compute_action_rewards_ignores_answer_text_when_can_answer_is_false() -> None:
@@ -3659,8 +3693,7 @@ def test_compute_action_rewards_requires_all_labeled_support_facts() -> None:
         item for item in rewards["action_rewards"] if item["role"] == "answer_generator"
     )
 
-    assert answer_reward["components"]["correct_wait"] == 0.25
-    assert answer_reward["components"]["false_abstention"] == 0.0
+    assert answer_reward["components"]["answer_decision_reward"] == 1.0
     assert rewards["terminal_reward"] == 2 / 3
 
 
@@ -3700,8 +3733,8 @@ def test_rewards_collapse_multiple_support_sentences_from_the_same_document() ->
         if item["role"] == "answer_generator"
     )
 
-    assert action_rewards["terminal_reward"] == 3.0
-    assert answer_reward["components"]["premature_answer"] == 0.0
+    assert action_rewards["terminal_reward"] == 2.0
+    assert answer_reward["components"]["answer_decision_reward"] == 1.0
     assert monitor_rewards["support_facts_required"] == 2.0
     assert monitor_rewards["support_facts_covered"] == 2.0
     assert monitor_rewards["support_coverage"] == 1.0
@@ -3750,10 +3783,10 @@ def test_compute_rl_rewards_scores_query_evidence_and_final_answer() -> None:
     assert rewards["query_reward"] > 0.0
     assert rewards["evidence_reward"] > 0.0
     assert rewards["answer_f1"] == 1.0
-    assert rewards["answer_reward"] == 2.0
+    assert rewards["answer_reward"] == 1.0
     assert rewards["support_coverage"] == 1.0
-    assert rewards["retrieval_hit_reward"] == 0.5
-    assert rewards["total"] > 3.0
+    assert rewards["retrieval_hit_reward"] == 1.0
+    assert rewards["total"] == 2.0
 
 
 def test_compute_rl_rewards_caps_duplicate_support_evidence_and_penalizes_repeated_queries() -> None:
@@ -3807,7 +3840,7 @@ def test_compute_rl_rewards_caps_duplicate_support_evidence_and_penalizes_repeat
     assert rewards["support_coverage"] == 1.0
     assert rewards["evidence_reward"] == 1.0
     assert rewards["repeated_query_penalty"] == -0.2
-    assert rewards["retrieval_cost"] == -0.2
+    assert rewards["retrieval_cost"] == 0.0
 
 
 def test_compute_rl_rewards_penalizes_wrong_premature_multihop_answer() -> None:
@@ -3851,7 +3884,8 @@ def test_compute_rl_rewards_penalizes_wrong_premature_multihop_answer() -> None:
     assert rewards["support_facts_required"] == 2.0
     assert rewards["support_facts_covered"] == 1.0
     assert rewards["support_coverage"] == 0.5
-    assert rewards["premature_answer_penalty"] == -1.0
+    assert rewards["premature_answer_penalty"] == 0.0
+    assert rewards["total"] == 0.5
 
 
 def test_compute_rl_rewards_discounts_correct_answer_with_incomplete_support() -> None:
@@ -3893,8 +3927,8 @@ def test_compute_rl_rewards_discounts_correct_answer_with_incomplete_support() -
 
     assert rewards["answer_f1"] == 1.0
     assert rewards["support_coverage"] == 0.5
-    assert rewards["premature_answer_penalty"] == -0.25
-    assert rewards["total"] < 3.5
+    assert rewards["premature_answer_penalty"] == 0.0
+    assert rewards["total"] == 1.5
 
 
 def test_compute_rl_rewards_does_not_penalize_correct_or_sufficient_multihop_answer() -> None:
@@ -3973,7 +4007,7 @@ def test_compute_grpo_loss_uses_advantages_clipping_and_kl() -> None:
     assert metrics["ratio_p95"] >= metrics["ratio_mean"]
 
 
-def test_compute_grpo_loss_weights_actions_equally_despite_completion_length() -> None:
+def test_compute_grpo_loss_uses_masked_token_mean_across_completion_lengths() -> None:
     zeros = torch.zeros((2, 3), dtype=torch.float32)
     mask = torch.tensor(
         [[True, False, False], [True, True, True]],
@@ -3990,8 +4024,8 @@ def test_compute_grpo_loss_weights_actions_equally_despite_completion_length() -
         kl_beta=0.02,
     )
 
-    assert float(loss.item()) == pytest.approx(0.0)
-    assert metrics["policy_loss"] == pytest.approx(0.0)
+    assert float(loss.item()) == pytest.approx(0.5)
+    assert metrics["policy_loss"] == pytest.approx(0.5)
 
 
 def test_assign_action_advantages_normalizes_combined_returns_by_role_across_rounds() -> None:
@@ -4377,6 +4411,25 @@ def test_policy_generate_disables_cache_for_gradient_checkpointing(monkeypatch) 
     )
 
     assert model.generate_kwargs["use_cache"] is False
+
+    cached_policy = HFSharedPolicy(
+        model=model,
+        tokenizer=DummyTokenizer(),
+        system_prompt="system",
+        max_prompt_length=16,
+        max_completion_length=8,
+        temperature=0.0,
+        top_p=1.0,
+        top_k=0,
+        score_completions=False,
+        generation_use_cache=True,
+    )
+    cached_policy.generate(
+        role=AgentRole.ANSWER_GENERATOR,
+        question="Who?",
+        state=RAGState(question="Who?"),
+    )
+    assert model.generate_kwargs["use_cache"] is True
 
 
 def test_sequence_logprobs_keeps_only_completion_logits() -> None:

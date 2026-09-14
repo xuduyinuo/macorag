@@ -2,65 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-
-def compute_grpo_loss(
-    *,
-    current_logprobs: Any,
-    old_logprobs: Any,
-    ref_logprobs: Any,
-    action_mask: Any,
-    advantages: Any,
-    clip_epsilon: float,
-    kl_beta: float,
-) -> tuple[Any, dict[str, float]]:
-    import torch
-
-    mask = action_mask.to(dtype=current_logprobs.dtype)
-    tokens_per_action = mask.sum(dim=-1).clamp_min(1.0)
-    logratio = current_logprobs - old_logprobs
-    ratio = torch.exp(logratio)
-    clipped_ratio = ratio.clamp(1.0 - clip_epsilon, 1.0 + clip_epsilon)
-    expanded_advantages = advantages.to(dtype=current_logprobs.dtype).unsqueeze(-1)
-    unclipped = ratio * expanded_advantages
-    clipped = clipped_ratio * expanded_advantages
-    policy_loss_per_action = -(
-        (torch.minimum(unclipped, clipped) * mask).sum(dim=-1)
-        / tokens_per_action
-    )
-    policy_loss = policy_loss_per_action.mean()
-
-    kl_per_action = (
-        (
-            torch.exp(ref_logprobs - current_logprobs)
-            - (ref_logprobs - current_logprobs)
-            - 1.0
-        )
-        * mask
-    ).sum(dim=-1) / tokens_per_action
-    kl = kl_per_action.mean()
-    loss = policy_loss + (kl_beta * kl)
-    valid = action_mask.to(dtype=torch.bool)
-    valid_logratio = logratio[valid]
-    valid_ratio = ratio[valid]
-    valid_clipped_ratio = clipped_ratio[valid]
-    metrics = {
-        "loss": float(loss.detach().item()),
-        "policy_loss": float(policy_loss.detach().item()),
-        "kl": float(kl.detach().item()),
-        "clip_fraction": float(
-            ((valid_ratio - valid_clipped_ratio).abs() > 1e-8)
-            .to(torch.float32)
-            .mean()
-            .detach()
-            .item()
-        ),
-        "preupdate_logratio_mean": float(valid_logratio.mean().detach().item()),
-        "preupdate_logratio_max_abs": float(valid_logratio.abs().max().detach().item()),
-        "ratio_mean": float(valid_ratio.mean().detach().item()),
-        "ratio_p95": float(torch.quantile(valid_ratio.float(), 0.95).detach().item()),
-    }
-    return loss, metrics
-
+from .grpo_loss import compute_grpo_loss
 
 def normalize_group_advantages(rewards: list[float]) -> list[float]:
     if not rewards:

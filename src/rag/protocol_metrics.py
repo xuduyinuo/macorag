@@ -16,7 +16,13 @@ def _is_parse_error(error: str) -> bool:
     return not error.startswith("final_answer_required:")
 
 
-def compute_protocol_metrics(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
+def compute_protocol_metrics(
+    rollouts: list[dict[str, Any]],
+    *,
+    max_parse_failure_rate: float = 0.01,
+    max_missing_answer_tag_rate: float = 0.002,
+    min_final_compliance_rate: float = 0.99,
+) -> dict[str, Any]:
     total = len(rollouts)
     if total == 0:
         return {
@@ -50,7 +56,11 @@ def compute_protocol_metrics(rollouts: list[dict[str, Any]]) -> dict[str, Any]:
         "parse_failure_rate": parse_rate,
         "missing_answer_tag_rate": missing_rate,
         "final_compliance_rate": final_rate,
-        "checkpoint_eligible": parse_rate <= 0.01 and missing_rate <= 0.002 and final_rate >= 0.99,
+        "checkpoint_eligible": (
+            parse_rate <= max_parse_failure_rate
+            and missing_rate <= max_missing_answer_tag_rate
+            and final_rate >= min_final_compliance_rate
+        ),
     }
 
 

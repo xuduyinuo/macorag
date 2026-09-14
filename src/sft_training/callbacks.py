@@ -189,6 +189,13 @@ def _make_jsonl_logging_callback(
                         "grad_norm": logs.get("grad_norm"),
                         "learning_rate": logs.get("learning_rate"),
                     }
+                    payload.update(
+                        {
+                            key: value
+                            for key, value in logs.items()
+                            if str(key).startswith("train/")
+                        }
+                    )
                     file.write(json.dumps(payload, ensure_ascii=False) + "\n")
             self.last_logged_sample_seen_total = sample_seen_total
 

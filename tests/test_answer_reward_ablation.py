@@ -29,8 +29,8 @@ def test_training_correctness_exactly_matches_fixed_evaluator(prediction, gold, 
     assert compute_answer_f1(prediction, gold, aliases) == expected
     assert compute_rl_rewards(rollout=rollout, sample=sample)["answer_f1"] == expected
     credit = compute_action_rewards(rollout=rollout, sample=sample)
-    assert credit["terminal_reward"] == 2 * expected
-    assert credit["action_rewards"][0]["components"]["answer_correctness"] == 2 * expected
+    assert credit["terminal_reward"] == expected
+    assert credit["action_rewards"][0]["components"]["answer_decision_reward"] == -1.0
 
 
 def _answer_wait_pair():
@@ -58,7 +58,7 @@ def test_ablation_removes_local_stop_preference_without_changing_terminal_or_oth
         group = []
         for rollout in (immediate, waited):
             credit = compute_action_rewards(rollout=rollout, sample=sample, answer_local_reward_weight=weight)
-            assert credit["terminal_reward"] == 3.0
+            assert credit["terminal_reward"] == 2.0
             action = SimpleNamespace(role="answer_generator", round_index=0)
             group.append({**credit, "actions": [action]})
         assign_action_advantages(group, global_weights={"answer_generator": 7 / 3},
@@ -79,7 +79,7 @@ def test_ablation_preserves_format_penalty_and_partial_scaling():
     values = [compute_action_rewards(rollout=immediate, sample=sample, answer_local_reward_weight=w)
               for w in (0.0, 0.25, 1.0)]
     assert [v["terminal_reward"] for v in values] == [2.0, 2.0, 2.0]
-    assert [v["action_rewards"][-1]["local_reward"] for v in values] == [-1.0, -0.5, 1.0]
+    assert [v["action_rewards"][-1]["local_reward"] for v in values] == [-1.0, -1.0, -1.0]
 
 
 @pytest.mark.parametrize("weight", ["-0.1", "1.1", "nan", "inf"])
@@ -111,4 +111,4 @@ def test_training_entrypoint_passes_local_weight_to_reward_computation():
     answer = immediate["action_rewards"][-1]
     assert answer["role"] == "answer_generator"
     assert answer["local_reward"] == 0.0
-    assert immediate["terminal_reward"] == 3.0
+    assert immediate["terminal_reward"] == 2.0

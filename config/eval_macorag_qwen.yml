@@ -1,14 +1,26 @@
-# Qwen2.5-7B SFT 模型专用评估配置。
-# 与默认 Llama 评估使用不同的输出目录、vLLM 服务名、端口和 GPU。
+# Qwen2.5-7B SFT 模型的单一评估配置。
+# 同时供 eval_vllm_server_qwen.sh 和 eval_macorag_qwen.sh 使用。
+
+# 模型与 vLLM 服务。
+model_path: "model/Qwen2.5-7B-Instruct"
+adapter_path: "outputs/mappo_Qwen2.5-7B-Instruct/2026-09-14_11-15-22/checkpoint-50/actor"
+vllm_model: "macorag-qwen2.5-7b"
+vllm_bin: "/data/conda/envs/macorag/bin/vllm"
+vllm_gpu_indices: "1"
+vllm_base_urls:
+  - "http://127.0.0.1:8001/v1"
+vllm_dtype: "bfloat16"
+vllm_gpu_memory_utilization: 0.85
+vllm_max_model_len: 8192
+vllm_extra_args:
+  - "--disable-log-requests"
+
+# 评估数据与输出。
 data_root: "data/eval_1000_stratified_v2"
 data_files: []
 retrieval_root: "data/eval_1000_stratified_v2_e5_faiss"
 output_root: "outputs/eval_Qwen2.5-7B"
 prompt_config_path: "config/prompts.yml"
-
-# 必须与 config/eval_vllm_server_qwen.yml 保持一致。
-model_path: "model/Qwen2.5-7B-Instruct"
-adapter_path: "outputs/sft_Qwen2.5-7B/2026-09-02_19-13-57/adapter"
 
 # 样本与 RAG 轮次
 max_samples: null
@@ -31,11 +43,7 @@ retrieval_max_workers: 4
 retrieval_batch_size: 32
 use_vectorized_retrieval: true
 
-# Qwen vLLM 服务使用独立端口，避免与默认 Llama 服务的 8000 冲突。
-vllm_base_urls:
-  - "http://127.0.0.1:8001/v1"
-vllm_model: "macorag-qwen2.5-7b-sft"
-eval_request_workers: 4
+eval_request_workers: 32
 
-# 与默认 Llama 评估的 GPU 1 分离。
+# 评估客户端设备；与 vllm_gpu_indices 分开。
 gpu_indices: "1"

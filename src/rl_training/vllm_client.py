@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from .vllm_lora_mapping import collect_lora_named_tensors
+from .runtime import same_model_path
 
 
 @dataclass(frozen=True)
@@ -144,13 +145,16 @@ class VLLMGenerationClient:
         expected_lora_int_id = getattr(args, "vllm_lora_int_id", None)
         if health.get("lora_int_id") != expected_lora_int_id:
             mismatches.append(f"lora_int_id expected {expected_lora_int_id!r} got {health.get('lora_int_id')!r}")
-        if "model" in health and health.get("model") != getattr(args, "model_path", None):
+        if "model" in health and not same_model_path(
+            str(health.get("model") or ""), str(getattr(args, "model_path", None) or "")
+        ):
             mismatches.append(f"model expected {getattr(args, 'model_path', None)!r} got {health.get('model')!r}")
         expected_dtype = str(getattr(args, "vllm_dtype", "") or "").strip()
         if expected_dtype and expected_dtype != "auto" and health.get("dtype") != expected_dtype:
             mismatches.append(f"dtype expected {expected_dtype!r} got {health.get('dtype')!r}")
-        if "lora_adapter_path" in health and health.get("lora_adapter_path") != getattr(
-            args, "vllm_lora_adapter_path", None
+        if "lora_adapter_path" in health and not same_model_path(
+            str(health.get("lora_adapter_path") or ""),
+            str(getattr(args, "vllm_lora_adapter_path", None) or ""),
         ):
             mismatches.append(
                 "lora_adapter_path expected "

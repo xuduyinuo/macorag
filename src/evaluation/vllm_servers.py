@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 from typing import Any
 
 
-DEFAULT_CONFIG_PATH = "config/eval_vllm_server.yml"
+DEFAULT_CONFIG_PATH = "config/eval_macorag.yml"
 
 DEFAULTS: dict[str, Any] = {
     "vllm_bin": "/data/conda/envs/vllm/bin/vllm",
@@ -32,6 +32,17 @@ DEFAULTS: dict[str, Any] = {
     "extra_args": [],
 }
 
+PREFIXED_SERVER_KEYS = {
+    "vllm_gpu_indices": "gpu_indices",
+    "vllm_host": "host",
+    "vllm_dtype": "dtype",
+    "vllm_gpu_memory_utilization": "gpu_memory_utilization",
+    "vllm_max_model_len": "max_model_len",
+    "vllm_trust_remote_code": "trust_remote_code",
+    "vllm_environment": "environment",
+    "vllm_extra_args": "extra_args",
+}
+
 
 def load_config(config_path: str | Path) -> dict[str, Any]:
     """读取 vLLM 服务配置，并用代码默认值补齐稳定参数。"""
@@ -47,8 +58,14 @@ def load_config(config_path: str | Path) -> dict[str, Any]:
         loaded = yaml.safe_load(handle) or {}
     if not isinstance(loaded, dict):
         raise SystemExit(f"vLLM server config must be a mapping: {path}")
+    normalized = {str(key).replace("-", "_"): value for key, value in loaded.items()}
     config = dict(DEFAULTS)
-    config.update({str(key).replace("-", "_"): value for key, value in loaded.items()})
+    config.update(normalized)
+    # 统一配置中 gpu_indices 属于评估客户端；vllm_* 字段专属服务端。
+    # 保留对旧的非前缀服务配置的兼容，便于外部自定义配置迁移。
+    for source, target in PREFIXED_SERVER_KEYS.items():
+        if source in normalized:
+            config[target] = normalized[source]
     return config
 
 

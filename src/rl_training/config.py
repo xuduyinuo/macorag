@@ -21,6 +21,8 @@ PATH_DEFAULTS: dict[str, Any] = {
     "resume_from_checkpoint": "",
     "prompt_config_path": "config/prompts.yml",
     "require_sft_prompt_contract": False,
+    "sft_model_path": "",
+    "reference_model_path": "",
 }
 
 # rollout 与采样：控制每个样本的 RAG 交互轮数、组内采样数和生成截断。
@@ -33,7 +35,7 @@ ROLLOUT_DEFAULTS: dict[str, Any] = {
     "seed": 42,
     "max_rounds": 3,
     "group_size": 4,
-    "degenerate_bucket_fallback_weight": 0.2,
+    "degenerate_bucket_fallback_weight": 0.0,
     "num_train_epochs": 1.0,
     "max_steps": 0,
     "run_until_step": 0,
@@ -42,6 +44,9 @@ ROLLOUT_DEFAULTS: dict[str, Any] = {
     "temperature": 0.8,
     "top_p": 0.95,
     "top_k": 5,
+    "num_rollouts_per_question": None,
+    "max_retrieval_rounds": None,
+    "rollout_batch_size": None,
 }
 
 # GRPO 优化：只训练 LoRA adapter，损失、KL 和梯度累积语义不变。
@@ -68,7 +73,21 @@ OPTIMIZATION_DEFAULTS: dict[str, Any] = {
     "answer_global_reward_weight": 7.0 / 3.0,
     "answer_local_reward_weight": 1.0,
     "advantage_epsilon": 1.0e-8,
-    "advantage_granularity": "role_round",
+    "advantage_granularity": "role_only",
+    # Section 3.3 algorithm parameters. Legacy *_global_reward_weight fields
+    # remain accepted for old experiment manifests but the trainer uses these
+    # explicit paper names.
+    "eta_query": 0.2,
+    "eta_evidence": 0.2,
+    "omega_answer": 1.0,
+    "omega_evidence": 1.0,
+    "lambda_query": 1.0 / 3.0,
+    "lambda_evidence": 3.0 / 7.0,
+    "lambda_answer": 7.0 / 3.0,
+    "advantage_eps": 1.0e-8,
+    "optimization_batch_size": None,
+    "clip_eps": None,
+    "beta_kl": None,
 }
 
 # 运行环境：launcher 会优先读取 gpu_indices，gpu_index 仅作为兼容回退。
@@ -89,6 +108,8 @@ LOGGING_DEFAULTS: dict[str, Any] = {
     "save_milestone_steps": 1000,
     "logging_steps": 1,
     "log_all_group_rollouts": True,
+    "debug_rollout": False,
+    "debug_rollout_samples": 2,
 }
 
 # 检索环境：embedding model 必须与预构建索引保持一致。
@@ -181,6 +202,8 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     paths = parser.add_argument_group("基础路径")
     paths.add_argument("--model-path", default=defaults["model_path"])
     paths.add_argument("--sft-adapter-path", default=defaults["sft_adapter_path"])
+    paths.add_argument("--sft-model-path", default=defaults["sft_model_path"])
+    paths.add_argument("--reference-model-path", default=defaults["reference_model_path"])
     paths.add_argument("--rl-data-root", default=defaults["rl_data_root"])
     paths.add_argument("--rl-data-files", nargs="*", default=defaults["rl_data_files"])
     paths.add_argument("--retrieval-root", default=defaults["retrieval_root"])
@@ -215,6 +238,19 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     rollout.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])
     rollout.add_argument("--group-size", type=int, default=defaults["group_size"])
     rollout.add_argument(
+        "--num-rollouts-per-question",
+        type=int,
+        default=defaults["num_rollouts_per_question"],
+    )
+    rollout.add_argument(
+        "--max-retrieval-rounds",
+        type=int,
+        default=defaults["max_retrieval_rounds"],
+    )
+    rollout.add_argument(
+        "--rollout-batch-size", type=int, default=defaults["rollout_batch_size"]
+    )
+    rollout.add_argument(
         "--degenerate-bucket-fallback-weight",
         type=float,
         default=defaults["degenerate_bucket_fallback_weight"],
@@ -241,6 +277,9 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     optimization.add_argument("--max-grad-norm", type=float, default=defaults["max_grad_norm"])
     optimization.add_argument("--per-device-train-batch-size", type=int, default=defaults["per_device_train_batch_size"])
     optimization.add_argument(
+        "--optimization-batch-size", type=int, default=defaults["optimization_batch_size"]
+    )
+    optimization.add_argument(
         "--reference-per-device-batch-size",
         type=int,
         default=defaults["reference_per_device_batch_size"],
@@ -253,6 +292,8 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     )
     optimization.add_argument("--kl-beta", type=float, default=defaults["kl_beta"])
     optimization.add_argument("--clip-epsilon", type=float, default=defaults["clip_epsilon"])
+    optimization.add_argument("--beta-kl", type=float, default=defaults["beta_kl"])
+    optimization.add_argument("--clip-eps", type=float, default=defaults["clip_eps"])
     optimization.add_argument("--bf16", action=BooleanOptionalAction, default=defaults["bf16"])
     optimization.add_argument("--fp16", action=BooleanOptionalAction, default=defaults["fp16"])
     optimization.add_argument(
@@ -297,6 +338,14 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         choices=("role_only", "role_round"),
         default=defaults["advantage_granularity"],
     )
+    optimization.add_argument("--eta-query", type=float, default=defaults["eta_query"])
+    optimization.add_argument("--eta-evidence", type=float, default=defaults["eta_evidence"])
+    optimization.add_argument("--omega-answer", type=float, default=defaults["omega_answer"])
+    optimization.add_argument("--omega-evidence", type=float, default=defaults["omega_evidence"])
+    optimization.add_argument("--lambda-query", type=float, default=defaults["lambda_query"])
+    optimization.add_argument("--lambda-evidence", type=float, default=defaults["lambda_evidence"])
+    optimization.add_argument("--lambda-answer", type=float, default=defaults["lambda_answer"])
+    optimization.add_argument("--advantage-eps", type=float, default=defaults["advantage_eps"])
 
     vllm = parser.add_argument_group("vLLM 生成与权重同步")
     vllm.add_argument("--use-vllm-generation", action=BooleanOptionalAction, default=defaults["use_vllm_generation"])
@@ -366,6 +415,16 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         action=BooleanOptionalAction,
         default=defaults["log_all_group_rollouts"],
     )
+    logging.add_argument(
+        "--debug-rollout",
+        action=BooleanOptionalAction,
+        default=defaults["debug_rollout"],
+    )
+    logging.add_argument(
+        "--debug-rollout-samples",
+        type=int,
+        default=defaults["debug_rollout_samples"],
+    )
 
     runtime = parser.add_argument_group("运行环境")
     runtime.add_argument("--gpu-index", type=int, default=defaults["gpu_index"])
@@ -391,8 +450,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     defaults = _defaults_from_config(config_args.config, explicit_config=explicit_config)
     parser = _build_parser(defaults)
     args = parser.parse_args(argv)
+    if args.sft_model_path and not args.sft_adapter_path:
+        args.sft_adapter_path = args.sft_model_path
+    elif not args.sft_model_path:
+        args.sft_model_path = args.sft_adapter_path
+    if not args.reference_model_path:
+        args.reference_model_path = args.sft_adapter_path
+    if args.num_rollouts_per_question is not None:
+        args.group_size = args.num_rollouts_per_question
+    else:
+        args.num_rollouts_per_question = args.group_size
+    if args.rollout_batch_size is None:
+        args.rollout_batch_size = args.group_size
+    if args.max_retrieval_rounds is not None:
+        args.max_rounds = args.max_retrieval_rounds
+    else:
+        args.max_retrieval_rounds = args.max_rounds
+    if args.optimization_batch_size is not None:
+        args.per_device_train_batch_size = args.optimization_batch_size
+    else:
+        args.optimization_batch_size = args.per_device_train_batch_size
+    if args.beta_kl is not None:
+        args.kl_beta = args.beta_kl
+    else:
+        args.beta_kl = args.kl_beta
+    if args.clip_eps is not None:
+        args.clip_epsilon = args.clip_eps
+    else:
+        args.clip_eps = args.clip_epsilon
     if args.max_steps < 0:
         parser.error("max_steps must be non-negative")
+    if args.group_size <= 0 or args.max_rounds <= 0:
+        parser.error("num_rollouts_per_question and max_retrieval_rounds must be positive")
+    if args.rollout_batch_size <= 0 or args.optimization_batch_size <= 0:
+        parser.error("rollout_batch_size and optimization_batch_size must be positive")
     if args.run_until_step < 0:
         parser.error("run_until_step must be non-negative")
     if args.max_steps > 0 and args.run_until_step > args.max_steps:
@@ -403,6 +494,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("answer_local_reward_weight must satisfy 0 <= value <= 1")
     if args.max_grad_norm <= 0.0:
         parser.error("max_grad_norm must be positive")
+    if args.advantage_eps <= 0.0:
+        parser.error("advantage_eps must be positive")
+    if args.eta_query < 0.0 or args.eta_evidence < 0.0:
+        parser.error("eta_query and eta_evidence must be non-negative")
+    if args.debug_rollout_samples < 0:
+        parser.error("debug_rollout_samples must be non-negative")
     if not 0.0 <= args.warmup_ratio < 1.0:
         parser.error("warmup_ratio must satisfy 0 <= value < 1")
     if not 0.0 <= args.min_lr_ratio <= 1.0:

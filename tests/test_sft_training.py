@@ -387,7 +387,8 @@ def test_tokenize_records_masks_prompt_and_trains_only_target() -> None:
 
     assert input_ids == [[1, 2, 3, 4, 5, 99]]
     assert attention_masks == [[1, 1, 1, 1, 1, 1]]
-    assert labels == [[-100, -100, -100, 4, 5, 99]]
+    # EOS is chat structure, not part of the teacher decision y_n*.
+    assert labels == [[-100, -100, -100, 4, 5, -100]]
 
 
 def test_tokenize_records_skips_records_over_max_length() -> None:
@@ -567,8 +568,8 @@ def test_synchronize_resume_logs_broadcasts_rank_zero_segment(monkeypatch, tmp_p
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: initialized["value"])
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
-    def init_process_group(*, backend):
-        calls.append(("init", backend))
+    def init_process_group(*, backend, timeout=None):
+        calls.append(("init", backend, timeout))
         initialized["value"] = True
 
     monkeypatch.setattr(torch.distributed, "init_process_group", init_process_group)
@@ -583,7 +584,9 @@ def test_synchronize_resume_logs_broadcasts_rank_zero_segment(monkeypatch, tmp_p
     segment = _synchronize_resume_logs(tmp_path, checkpoint, samples_per_epoch=10)
 
     assert segment == 7
-    assert calls == [("init", "gloo"), ("broadcast", 0), ("barrier", None)]
+    assert calls[0][0:2] == ("init", "gloo")
+    assert calls[0][2].total_seconds() == 2 * 60 * 60
+    assert calls[1:] == [("broadcast", 0), ("barrier", None)]
 
 
 def test_pad_batch_left_aligns_target_suffixes() -> None:
@@ -728,6 +731,17 @@ def test_run_dir_uses_output_root_child_timestamp() -> None:
     assert make_run_dir("outputs/lora_qwen2.5-7b_trajectory", "2026-07-02_12-34-56").as_posix() == (
         "outputs/lora_qwen2.5-7b_trajectory/2026-07-02_12-34-56"
     )
+
+
+def test_json_writers_create_missing_parent_directories(tmp_path: Path) -> None:
+    jsonl_path = tmp_path / "protocol_validation" / "manifest.jsonl"
+    json_path = tmp_path / "nested" / "manifest.json"
+
+    sft_train._write_jsonl(jsonl_path, [{"qid": "q1"}])
+    sft_train._write_json_atomic(json_path, {"ok": True})
+
+    assert json.loads(jsonl_path.read_text(encoding="utf-8")) == {"qid": "q1"}
+    assert json.loads(json_path.read_text(encoding="utf-8")) == {"ok": True}
 
 
 def test_train_sft_yaml_keeps_formal_sampling_and_early_stopping_contract() -> None:

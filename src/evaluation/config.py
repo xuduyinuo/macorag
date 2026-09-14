@@ -49,6 +49,22 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "vllm_retries": 3,
     "vllm_retry_sleep_seconds": 1.0,
     "eval_request_workers": 1,
+    "eval_generate_batch_size": 1,
+    "eval_generate_batch_wait_ms": 20.0,
+}
+
+# 统一 YAML 中供 vLLM 启动器使用的字段。评估客户端验证它们的名称，
+# 但不把它们暴露为 evaluate_rag_model 的命令行参数。
+VLLM_SERVER_CONFIG_KEYS = {
+    "vllm_bin",
+    "vllm_gpu_indices",
+    "vllm_host",
+    "vllm_dtype",
+    "vllm_gpu_memory_utilization",
+    "vllm_max_model_len",
+    "vllm_trust_remote_code",
+    "vllm_environment",
+    "vllm_extra_args",
 }
 
 BooleanOptionalAction = getattr(argparse, "BooleanOptionalAction", None)
@@ -68,11 +84,11 @@ def _load_yaml_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"Invalid config format at {path}: expected a mapping.")
 
     config = {str(key).replace("-", "_"): value for key, value in payload.items()}
-    allowed = {*DEFAULT_ARG_VALUES, "config"}
+    allowed = {*DEFAULT_ARG_VALUES, *VLLM_SERVER_CONFIG_KEYS, "config"}
     unknown = sorted(set(config) - allowed)
     if unknown:
         raise SystemExit(f"Unknown evaluation config keys in {path}: {', '.join(unknown)}")
-    return config
+    return {key: value for key, value in config.items() if key in DEFAULT_ARG_VALUES}
 
 
 def _defaults_from_config(config_path: str, *, explicit_config: bool) -> dict[str, Any]:
@@ -136,6 +152,8 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
     parser.add_argument("--vllm-retries", type=int, default=defaults["vllm_retries"])
     parser.add_argument("--vllm-retry-sleep-seconds", type=float, default=defaults["vllm_retry_sleep_seconds"])
     parser.add_argument("--eval-request-workers", type=int, default=defaults["eval_request_workers"])
+    parser.add_argument("--eval-generate-batch-size", type=int, default=defaults["eval_generate_batch_size"])
+    parser.add_argument("--eval-generate-batch-wait-ms", type=float, default=defaults["eval_generate_batch_wait_ms"])
     return parser
 
 

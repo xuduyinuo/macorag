@@ -9,3 +9,7 @@ __pycache__/
 *.pyc
 model/
 outputs/
+ablation/data/
+ablation/artifacts/
+ablation/outputs/
+config/

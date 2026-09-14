@@ -9,7 +9,9 @@ import json
 import math
 import os
 import random
+from datetime import timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from .callbacks import (
@@ -36,8 +38,26 @@ from .data import (
     trajectory_to_sft_records,
     validate_teacher_dataset_contract,
 )
-from prompt_config import load_prompt_contract
-from .dataset import _build_dataset, _dataset_fingerprint, _pad_batch, _tokenize_records
+from prompt_config import load_prompt_contract, system_prompt_for
+from .dataset import (
+    TokenizationEvent,
+    _build_dataset,
+    _dataset_fingerprint,
+    _pad_batch,
+    _tokenize_records,
+    debug_tokenized_sample,
+    summarize_tokenization,
+)
+from .evaluate import evaluate_structured_targets
+from .protocol_validation import (
+    make_protocol_validation_callback,
+    protocol_sample_manifest,
+    prune_non_candidate_checkpoints,
+    require_eligible_best_checkpoint,
+    select_fixed_protocol_samples,
+    select_top_eval_checkpoints,
+)
+from rl_training.retrieval import validate_retrieval_assets
 from .trainer import _make_target_only_trainer_cls
 
 
@@ -76,6 +96,32 @@ def _is_main_process() -> bool:
     return _local_rank() == 0
 
 
+def _ensure_distributed_initialized(torch: Any) -> None:
+    if (
+        _world_size() <= 1
+        or not torch.distributed.is_available()
+        or torch.distributed.is_initialized()
+    ):
+        return
+    if torch.cuda.is_available():
+        torch.cuda.set_device(_local_rank())
+        backend = "nccl"
+    else:
+        backend = "gloo"
+    # Protocol generation can be much slower than one training step. A longer
+    # timeout prevents a healthy rank from being killed while another rank is
+    # finishing a long multi-round example.
+    torch.distributed.init_process_group(backend=backend, timeout=timedelta(hours=2))
+
+
+def _make_shared_run_dir(output_root: Path, torch: Any) -> Path:
+    if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+        return make_run_dir(output_root)
+    values = [str(make_run_dir(output_root)) if _is_main_process() else None]
+    torch.distributed.broadcast_object_list(values, src=0)
+    return Path(str(values[0]))
+
+
 def _synchronize_resume_logs(
     output_dir: Path,
     checkpoint: Path,
@@ -84,17 +130,7 @@ def _synchronize_resume_logs(
 ) -> int:
     import torch
 
-    if (
-        _world_size() > 1
-        and torch.distributed.is_available()
-        and not torch.distributed.is_initialized()
-    ):
-        if torch.cuda.is_available():
-            torch.cuda.set_device(_local_rank())
-            backend = "nccl"
-        else:
-            backend = "gloo"
-        torch.distributed.init_process_group(backend=backend)
+    _ensure_distributed_initialized(torch)
 
     resume_segment = 0
     if _is_main_process():
@@ -112,12 +148,14 @@ def _synchronize_resume_logs(
 
 
 def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         for item in rows:
             file.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(f".{path.name}.tmp")
     with temp_path.open("w", encoding="utf-8") as file:
         json.dump(payload, file, ensure_ascii=False, indent=2)
@@ -180,7 +218,12 @@ def _validate_resume_runtime_files(checkpoint: Path, *, world_size: int, fp16: b
         )
 
 
-def _validate_resume_compatibility(checkpoint: Path, expected: dict[str, Any]) -> None:
+def _validate_resume_compatibility(
+    checkpoint: Path,
+    expected: dict[str, Any],
+    *,
+    ignored_keys: set[str] | None = None,
+) -> None:
     manifest_path = checkpoint.parent / "sft_run_manifest.json"
     if not manifest_path.is_file():
         return
@@ -188,10 +231,11 @@ def _validate_resume_compatibility(checkpoint: Path, expected: dict[str, Any]) -
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"Invalid SFT run manifest {manifest_path}: {exc}") from exc
+    ignored = ignored_keys or set()
     mismatches = [
         key
         for key, expected_value in expected.items()
-        if payload.get(key) != expected_value
+        if key not in ignored and payload.get(key) != expected_value
     ]
     if mismatches:
         raise SystemExit(
@@ -261,6 +305,17 @@ def _print_check_only(args: Any, training_data: TrainingData) -> None:
             "greater_is_better": args.greater_is_better,
             "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
         },
+        "protocol_validation": {
+            "enabled": args.protocol_validation_enabled,
+            "size": args.protocol_validation_size,
+            "seed": args.protocol_validation_seed,
+            "smoke_size": args.protocol_smoke_size,
+            "smoke_steps": args.protocol_smoke_steps,
+            "candidate_count": args.protocol_candidate_count,
+            "max_parse_failure_rate": args.protocol_max_parse_failure_rate,
+            "max_missing_answer_tag_rate": args.protocol_max_missing_answer_tag_rate,
+            "min_final_compliance_rate": args.protocol_min_final_compliance_rate,
+        },
     }
     print("SFT check contract:", json.dumps(check_contract, ensure_ascii=False, sort_keys=True))
     records = list(training_data.records)
@@ -285,6 +340,53 @@ def _print_check_only(args: Any, training_data: TrainingData) -> None:
     print("Original sample counts:", training_data.source_sample_counts_by_dataset)
     print("Record counts:", dataset_counts)
     print("Action counts:", action_counts)
+
+
+def _dataset_statistics(
+    training_data: TrainingData,
+    events: list[TokenizationEvent],
+    *,
+    skipped_count: int = 0,
+) -> dict[str, Any]:
+    action_counts: dict[str, int] = {}
+    rounds: list[int] = []
+    for sample in training_data.samples:
+        rounds.append(max((record.round_index for record in sample.records), default=-1) + 1)
+        for record in sample.records:
+            action_counts[record.agent_type] = action_counts.get(record.agent_type, 0) + 1
+    return {
+        "number_of_trajectories": len(training_data.samples),
+        "number_of_decision_samples_before_tokenization": len(training_data.records),
+        "query_samples": action_counts.get("query", 0),
+        "evidence_samples": action_counts.get("evidence", 0),
+        "answer_samples": action_counts.get("answer", 0),
+        "average_rounds_per_trajectory": sum(rounds) / max(1, len(rounds)),
+        **summarize_tokenization(events),
+        "skipped_overlength_or_empty_target_count": skipped_count,
+        **training_data.validation_stats.to_dict(),
+        "structured_target_validity": evaluate_structured_targets(training_data.records),
+    }
+
+
+def _print_debug_sft(
+    records: list[TrajectoryRecord],
+    dataset: Any,
+    events: list[TokenizationEvent],
+    tokenizer: Any,
+    *,
+    count: int,
+    seed: int,
+) -> None:
+    record_by_id = {record.sample_id: record for record in records}
+    pairs = [
+        (record_by_id[event.sample_id], dataset[index])
+        for index, event in enumerate(events)
+        if event.sample_id in record_by_id
+    ]
+    random.Random(seed).shuffle(pairs)
+    for record, feature in pairs[:count]:
+        print("\n" + "=" * 72)
+        print(debug_tokenized_sample(record, feature, tokenizer))
 
 
 def _load_training_dependencies() -> dict[str, Any]:
@@ -426,6 +528,7 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         "warmup_ratio": args.warmup_ratio,
         "lr_scheduler_type": args.lr_scheduler_type,
         "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
         "logging_steps": args.logging_steps,
         "logging_first_step": True,
         "logging_strategy": "steps",
@@ -444,6 +547,7 @@ def _training_arguments(args: Any, output_dir: Path, has_eval: bool, TrainingArg
         "metric_for_best_model": args.metric_for_best_model if has_eval else None,
         "greater_is_better": args.greater_is_better if has_eval else None,
         "restore_callback_states_from_checkpoint": args.restore_callback_states_from_checkpoint,
+        "gradient_checkpointing": args.gradient_checkpointing,
     }
     if _world_size() > 1:
         training_kwargs["ddp_find_unused_parameters"] = False
@@ -487,6 +591,9 @@ def main() -> None:
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     records = training_data.records
+    for record in records:
+        # Bind rho_n to the exact prompt contract selected by this run.
+        record.role_instruction = system_prompt_for(record.agent_role, prompt_contract)
     source_sample_count = training_data.source_sample_count
     print(f"Loaded {len(records)} SFT action records from {data_root}")
     print(f"Loaded {source_sample_count} original trajectory samples from {data_root}")
@@ -494,6 +601,41 @@ def main() -> None:
         raise SystemExit("No usable trajectory samples found.")
     if args.check_only:
         _print_check_only(args, training_data)
+        deps = _load_training_dependencies()
+        tokenizer = deps["AutoTokenizer"].from_pretrained(args.model_path, trust_remote_code=True)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        check_events: list[TokenizationEvent] = []
+        check_skipped: list[dict[str, Any]] = []
+        check_dataset = _build_dataset(
+            tokenizer,
+            records,
+            args.max_length,
+            args.system_prompt,
+            skipped_records=check_skipped,
+            tokenization_events=check_events,
+        )
+        print(
+            "Dataset statistics:",
+            json.dumps(
+                _dataset_statistics(
+                    training_data,
+                    check_events,
+                    skipped_count=len(check_skipped),
+                ),
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+        )
+        if args.debug_sft:
+            _print_debug_sft(
+                records,
+                check_dataset,
+                check_events,
+                tokenizer,
+                count=args.debug_sft_num_samples,
+                seed=args.seed,
+            )
         return
 
     deps = _load_training_dependencies()
@@ -511,11 +653,54 @@ def main() -> None:
     prepare_model_for_kbit_training = deps["prepare_model_for_kbit_training"]
 
     _validate_acceleration_runtime(args, torch)
+    _ensure_distributed_initialized(torch)
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
     train_samples, val_samples = _split_train_eval_samples(args, training_data.samples)
+    protocol_samples = (
+        select_fixed_protocol_samples(
+            val_samples,
+            size=args.protocol_validation_size,
+            seed=args.protocol_validation_seed,
+        )
+        if args.protocol_validation_enabled
+        else []
+    )
+    protocol_smoke_samples = (
+        select_fixed_protocol_samples(
+            protocol_samples,
+            size=args.protocol_smoke_size,
+            seed=args.protocol_validation_seed,
+        )
+        if protocol_samples
+        else []
+    )
+    if protocol_samples:
+        if teacher_metadata:
+            expected_retrieval = {
+                "retrieval_backend": args.protocol_validation_retrieval_backend,
+                "retrieval_root": args.protocol_validation_retrieval_root,
+                "retrieval_embedding_model": args.protocol_validation_embedding_model,
+                "retrieval_max_length": args.protocol_validation_retrieval_max_length,
+            }
+            mismatches = [
+                key
+                for key, expected in expected_retrieval.items()
+                if str(teacher_metadata.get(key)) != str(expected)
+            ]
+            if mismatches:
+                raise SystemExit(
+                    "Protocol validation retrieval differs from teacher provenance: "
+                    + ", ".join(mismatches)
+                )
+        validate_retrieval_assets(
+            backend=args.protocol_validation_retrieval_backend,
+            retrieval_root=args.protocol_validation_retrieval_root,
+            datasets={sample.dataset for sample in protocol_samples},
+            embedding_model=args.protocol_validation_embedding_model,
+        )
     train_records = flatten_training_samples(train_samples)
     val_records = flatten_training_samples(val_samples)
     train_source_sample_count = len(train_samples)
@@ -528,7 +713,11 @@ def main() -> None:
             world_size=_world_size(),
             fp16=bool(args.fp16 and not args.bf16),
         )
-    output_dir = resume_checkpoint.parent if resume_checkpoint is not None else make_run_dir(base_output_dir)
+    output_dir = (
+        resume_checkpoint.parent
+        if resume_checkpoint is not None
+        else _make_shared_run_dir(base_output_dir, torch)
+    )
     train_shuffle = resume_checkpoint is None or _resume_uses_random_sampler(resume_checkpoint)
     log_jsonl_path = output_dir / "train_metrics.jsonl"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -537,12 +726,14 @@ def main() -> None:
         print(f"Run output directory: {output_dir}")
 
     skipped_train_records: list[dict[str, Any]] = []
+    train_tokenization_events: list[TokenizationEvent] = []
     train_dataset = _build_dataset(
         tokenizer,
         train_records,
         args.max_length,
         args.system_prompt,
         skipped_records=skipped_train_records,
+        tokenization_events=train_tokenization_events,
     )
     if _is_main_process() and skipped_train_records:
         skipped_path = output_dir / "skipped_overlength_records.jsonl"
@@ -554,12 +745,14 @@ def main() -> None:
 
     if val_records:
         skipped_eval_records: list[dict[str, Any]] = []
+        eval_tokenization_events: list[TokenizationEvent] = []
         eval_dataset = _build_dataset(
             tokenizer,
             val_records,
             args.max_length,
             args.system_prompt,
             skipped_records=skipped_eval_records,
+            tokenization_events=eval_tokenization_events,
         )
         if _is_main_process() and skipped_eval_records:
             skipped_eval_path = output_dir / "skipped_eval_overlength_records.jsonl"
@@ -571,8 +764,39 @@ def main() -> None:
     else:
         eval_dataset = None
         skipped_eval_records = []
+        eval_tokenization_events = []
     if len(train_dataset) == 0:
         raise SystemExit("No trainable samples remain after max_length filtering.")
+    if _is_main_process():
+        preprocessing_stats = _dataset_statistics(
+            training_data,
+            [*train_tokenization_events, *eval_tokenization_events],
+            skipped_count=len(skipped_train_records) + len(skipped_eval_records),
+        )
+        print("Dataset statistics:", json.dumps(preprocessing_stats, ensure_ascii=False, sort_keys=True))
+        _write_json_atomic(output_dir / "preprocessing_stats.json", preprocessing_stats)
+        if training_data.validation_stats.issues:
+            _write_jsonl(
+                output_dir / "invalid_teacher_decisions.jsonl",
+                [
+                    {
+                        "trajectory_id": issue.trajectory_id,
+                        "round_id": issue.round_id,
+                        "agent_type": issue.agent_type,
+                        "reason": issue.reason,
+                    }
+                    for issue in training_data.validation_stats.issues
+                ],
+            )
+        if args.debug_sft:
+            _print_debug_sft(
+                train_records,
+                train_dataset,
+                train_tokenization_events,
+                tokenizer,
+                count=args.debug_sft_num_samples,
+                seed=args.seed,
+            )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
@@ -582,6 +806,7 @@ def main() -> None:
     if args.load_4bit:
         model = prepare_model_for_kbit_training(
             model,
+            use_gradient_checkpointing=args.gradient_checkpointing,
             gradient_checkpointing_kwargs={"use_reentrant": False},
         )
 
@@ -594,6 +819,11 @@ def main() -> None:
         target_modules=args.target_modules,
     )
     model = get_peft_model(model, lora_config)
+    if args.gradient_checkpointing:
+        # Required for reentrant/non-reentrant checkpointing when the frozen
+        # quantized embedding itself does not require gradients. The hook keeps
+        # the graph connected to trainable LoRA modules without unfreezing base.
+        model.enable_input_require_grads()
     if _is_main_process():
         model.print_trainable_parameters()
 
@@ -647,6 +877,7 @@ def main() -> None:
         "lr_scheduler_type": args.lr_scheduler_type,
         "warmup_ratio": args.warmup_ratio,
         "weight_decay": args.weight_decay,
+        "max_grad_norm": args.max_grad_norm,
         "lora_r": args.lora_r,
         "lora_alpha": args.lora_alpha,
         "lora_dropout": args.lora_dropout,
@@ -655,12 +886,41 @@ def main() -> None:
         "bf16": args.bf16,
         "fp16": args.fp16,
         "attn_implementation": args.attn_implementation,
+        "gradient_checkpointing": args.gradient_checkpointing,
+        "packing": args.packing,
         "world_size": _world_size(),
         "train_sampler": "random" if train_shuffle else "sequential",
         "eval_loss_semantics": "macro_mean_of_per_action_target_token_mean",
+        "protocol_validation_enabled": args.protocol_validation_enabled,
+        "protocol_validation_size": len(protocol_samples),
+        "protocol_validation_seed": args.protocol_validation_seed,
+        "protocol_smoke_size": len(protocol_smoke_samples),
+        "protocol_smoke_steps": args.protocol_smoke_steps,
+        "protocol_candidate_count": args.protocol_candidate_count,
+        "protocol_validation_qid_fingerprint": _sample_qid_fingerprint(protocol_samples),
+        "protocol_validation_retrieval_backend": args.protocol_validation_retrieval_backend,
+        "protocol_validation_retrieval_root": args.protocol_validation_retrieval_root,
+        "protocol_validation_embedding_model": args.protocol_validation_embedding_model,
+        "protocol_validation_thresholds": {
+            "max_parse_failure_rate": args.protocol_max_parse_failure_rate,
+            "max_missing_answer_tag_rate": args.protocol_max_missing_answer_tag_rate,
+            "min_final_compliance_rate": args.protocol_min_final_compliance_rate,
+        },
     }
     if resume_checkpoint is not None:
-        _validate_resume_compatibility(resume_checkpoint, run_manifest)
+        _validate_resume_compatibility(
+            resume_checkpoint,
+            run_manifest,
+            ignored_keys={
+                # These fields only change validation scheduling and final
+                # checkpoint selection; model/data/optimizer state is unchanged.
+                "metric_for_best_model",
+                "greater_is_better",
+                "protocol_smoke_size",
+                "protocol_smoke_steps",
+                "protocol_candidate_count",
+            },
+        )
         resume_segment = _synchronize_resume_logs(
             output_dir,
             resume_checkpoint,
@@ -676,10 +936,50 @@ def main() -> None:
         print(f"Total optimizer steps: {total_optimizer_steps}")
         print(f"Total original sample visits: {total_source_sample_visits}")
         _write_json_atomic(output_dir / "sft_run_manifest.json", run_manifest)
+        if protocol_samples:
+            _write_jsonl(
+                output_dir / "protocol_validation" / "manifest.jsonl",
+                protocol_sample_manifest(protocol_samples),
+            )
+            _write_jsonl(
+                output_dir / "protocol_smoke" / "manifest.jsonl",
+                protocol_sample_manifest(protocol_smoke_samples),
+            )
 
     train_args = _training_arguments(args, output_dir, eval_dataset is not None, TrainingArguments)
 
-    callbacks = [
+    callbacks = []
+    protocol_callback = None
+    if protocol_smoke_samples:
+        protocol_callback = make_protocol_validation_callback(
+            TrainerCallback,
+            output_dir=output_dir,
+            samples=protocol_smoke_samples,
+            tokenizer=tokenizer,
+            prompt_contract=prompt_contract,
+            max_rounds=args.max_rounds,
+            max_prompt_length=args.protocol_validation_max_prompt_length,
+            max_completion_length=args.protocol_validation_max_completion_length,
+            temperature=args.protocol_validation_temperature,
+            top_p=args.protocol_validation_top_p,
+            retrieval_top_k=args.retrieval_top_k,
+            retrieval_backend=args.protocol_validation_retrieval_backend,
+            retrieval_root=args.protocol_validation_retrieval_root,
+            retrieval_embedding_model=args.protocol_validation_embedding_model,
+            retrieval_device=args.protocol_validation_retrieval_device,
+            retrieval_max_length=args.protocol_validation_retrieval_max_length,
+            retrieval_batch_size=args.protocol_validation_retrieval_batch_size,
+            max_parse_failure_rate=args.protocol_max_parse_failure_rate,
+            max_missing_answer_tag_rate=args.protocol_max_missing_answer_tag_rate,
+            min_final_compliance_rate=args.protocol_min_final_compliance_rate,
+            disable_tqdm=args.disable_tqdm,
+            run_every_steps=args.protocol_smoke_steps,
+            metric_prefix="eval_protocol_smoke",
+            artifact_dir_name="protocol_smoke",
+        )
+        # Run before metric logging so smoke metrics are persisted with eval_loss.
+        callbacks.append(protocol_callback)
+    callbacks.extend([
         _make_eval_metrics_callback(
             output_dir / "eval_metrics.jsonl",
             TrainerCallback,
@@ -701,7 +1001,7 @@ def main() -> None:
             ) if eval_dataset is not None else 0,
             resume_segment=resume_segment,
         ),
-    ]
+    ])
     early_stopping_callback = _build_early_stopping_callback(
         args,
         has_eval=eval_dataset is not None,
@@ -725,6 +1025,53 @@ def main() -> None:
 
     _run_trainer(trainer, resume_checkpoint)
     if _is_main_process():
+        protocol_best = None
+        if protocol_samples:
+            candidates = select_top_eval_checkpoints(
+                output_dir,
+                count=args.protocol_candidate_count,
+            )
+            final_protocol_callback = make_protocol_validation_callback(
+                TrainerCallback,
+                output_dir=output_dir,
+                samples=protocol_samples,
+                tokenizer=tokenizer,
+                prompt_contract=prompt_contract,
+                max_rounds=args.max_rounds,
+                max_prompt_length=args.protocol_validation_max_prompt_length,
+                max_completion_length=args.protocol_validation_max_completion_length,
+                temperature=args.protocol_validation_temperature,
+                top_p=args.protocol_validation_top_p,
+                retrieval_top_k=args.retrieval_top_k,
+                retrieval_backend=args.protocol_validation_retrieval_backend,
+                retrieval_root=args.protocol_validation_retrieval_root,
+                retrieval_embedding_model=args.protocol_validation_embedding_model,
+                retrieval_device=args.protocol_validation_retrieval_device,
+                retrieval_max_length=args.protocol_validation_retrieval_max_length,
+                retrieval_batch_size=args.protocol_validation_retrieval_batch_size,
+                max_parse_failure_rate=args.protocol_max_parse_failure_rate,
+                max_missing_answer_tag_rate=args.protocol_max_missing_answer_tag_rate,
+                min_final_compliance_rate=args.protocol_min_final_compliance_rate,
+                disable_tqdm=args.disable_tqdm,
+                load_existing_best=False,
+                distributed_generation=False,
+            )
+            for candidate in candidates:
+                trainer._load_from_checkpoint(candidate["checkpoint_path"], model=model)
+                final_protocol_callback.on_evaluate(
+                    train_args,
+                    SimpleNamespace(
+                        global_step=candidate["step"],
+                        epoch=candidate.get("epoch"),
+                    ),
+                    trainer.control,
+                    {"eval_loss": candidate["eval_loss"]},
+                    model=model,
+                )
+            protocol_best = require_eligible_best_checkpoint(final_protocol_callback)
+            trainer._load_from_checkpoint(protocol_best["checkpoint_path"], model=model)
+            trainer.state.best_model_checkpoint = protocol_best["checkpoint_path"]
+            trainer.state.best_metric = protocol_best["eval_loss"]
         model.save_pretrained(output_dir / "adapter")
         tokenizer.save_pretrained(output_dir / "adapter")
         train_args_dict = {
@@ -762,6 +1109,13 @@ def main() -> None:
             "max_rounds": args.max_rounds,
             "retrieval_top_k": args.retrieval_top_k,
             "teacher_run_config": teacher_metadata,
+            "protocol_validation_enabled": args.protocol_validation_enabled,
+            "protocol_validation_size": len(protocol_samples),
+            "protocol_smoke_size": len(protocol_smoke_samples),
+            "protocol_smoke_steps": args.protocol_smoke_steps,
+            "protocol_candidate_count": args.protocol_candidate_count,
+            "protocol_candidate_checkpoints": candidates if protocol_samples else [],
+            "protocol_best_checkpoint": protocol_best,
             **_trainer_completion_metadata(trainer, total_optimizer_steps),
         }
         with (output_dir / "train_meta.json").open("w", encoding="utf-8") as file:
@@ -778,6 +1132,8 @@ def main() -> None:
                 ensure_ascii=False,
                 indent=2,
             )
+        if protocol_samples:
+            prune_non_candidate_checkpoints(output_dir, candidates)
         print(f"Training complete. Adapter saved to {output_dir/'adapter'}.")
 
 
