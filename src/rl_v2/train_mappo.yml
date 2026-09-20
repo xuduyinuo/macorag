@@ -1,0 +1,198 @@
+# MACORAG RL-v2: one learner GPU plus one vLLM rollout GPU.
+model_path: model/Qwen2.5-7B-Instruct
+sft_adapter_path: outputs/sft_v2_Qwen2.5-7B/2026-09-18_16-24-28/adapter
+train_file: data_v2/train_rl.jsonl
+validation_file: data_v2/dev_rl.jsonl
+# Deterministic proportional subset of the fixed 300-row dev split:
+# 80 2Wiki + 80 HotpotQA + 40 MuSiQue questions.
+validation_max_samples: 200
+prompt_config_path: src/rl_v2/policy_prompts.yml
+expected_prompt_contract_version: macorag-policy-v3
+output_root: outputs/rl_v2_Qwen2.5-7B-Instruct
+prompt_template_version: macorag-policy-v3
+
+# Unified Wiki18 retrieval contract from baseline_eval/run_macorag_eval.py.
+corpus_path: /data/xudu/baseline/baseline_eval/data/retrieval-corpus/wiki18_100w.jsonl
+corpus_offsets_path: data_v2/cache/wiki18_100w.offsets.u64
+index_path: /data/xudu/baseline/baseline_eval/indexes/wiki18_100w_e5_flat/e5_Flat.index
+index_manifest_path: /data/xudu/baseline/baseline_eval/indexes/wiki18_100w_e5_flat/build_manifest.json
+retrieval_backend: e5_faiss
+retrieval_embedding_model: intfloat/e5-base-v2
+retrieval_model_path: /data/conda/tmp/searchr1-hf/hub/models--intfloat--e5-base-v2/snapshots/f52bf8ec8c7124536f0efb74aca902b2995e5bcd
+retrieval_pooling_method: mean
+retrieval_instruction: null
+retrieval_use_fp16: true
+# The trainer sees physical GPUs 0,1. cuda:1 is physical GPU 1, shared with
+# vLLM exactly as in run_macorag_eval.py; FAISS itself remains on CPU.
+retrieval_device: cuda:1
+retrieval_max_length: 128
+retrieval_batch_size: 256
+# Give concurrent trajectories a short coalescing window. At 32 rollout
+# workers this turns single-query E5 calls into actual GPU micro-batches.
+retrieval_batch_wait_ms: 20
+retrieval_top_k: 5
+retrieval_max_passage_chars: 1200
+faiss_mmap: false
+
+# The complete 6,000-row train split is shuffled before training. Set only for
+# smoke/debug runs; limiting happens after the full split has been shuffled.
+max_samples: 3000
+seed: 42
+max_rounds: 4
+# Historical vLLM logs on this host report ~16.3 concurrent 4,096-token
+# sequences. Keep 16 engine slots busy and use 32 outer trajectories so
+# retrieval and role transitions do not leave the generation GPU idle.
+rollout_batch_size: 32
+train_rollout_workers: 32
+validation_rollout_workers: 32
+num_train_epochs: 1.0
+
+# On this 24 GiB learner GPU, trainable 7B/QLoRA preflights still OOM at 2,048
+# and 1,536 tokens. A 1,024-token prompt plus the worst configured 128-token
+# action peaks at 19.74 GiB, leaving about 3.7 GiB of device capacity. This
+# keeps the complete 383-483-token role/few-shot prefix and at least 541 tokens
+# for the dynamic state. vLLM and the learner consume the same truncated IDs.
+max_prompt_length: 1024
+learner_memory_preflight: true
+max_completion_length: 128
+answer_max_completion_length: 128
+evidence_max_completion_length: 96
+prompt_max_evidence_items: 6
+prompt_max_history_items: 3
+prompt_evidence_text_chars: 1200
+prompt_observation_text_chars: 1200
+# Keep the vLLM sampling distribution equal to the learner's raw softmax.
+# Truncated/top-k or temperature-scaled sampling would require transformed
+# learner log-probs and would otherwise make PPO's behavior ratio inconsistent.
+temperature: 1.0
+top_p: 1.0
+top_k: -1
+
+# Physical GPU 1 generates trajectories; run_mappo.sh puts the local
+# actor/critic learner on physical GPU 0.
+use_vllm_generation: true
+vllm_host: 127.0.0.1
+vllm_port: 8003
+vllm_gpu_indices: "1"
+vllm_served_model_name: rl_v2_base
+vllm_lora_name: rl_v2_policy
+vllm_tensor_parallel_size: 1
+vllm_gpu_memory_utilization: 0.80
+vllm_max_model_len: 4608
+vllm_max_num_seqs: 16
+vllm_dtype: bfloat16
+vllm_max_lora_rank: 16
+vllm_timeout_seconds: 180.0
+vllm_generate_attempts: 3
+vllm_retry_backoff_seconds: 1.0
+vllm_sync_after_update: true
+vllm_sync_snapshots_to_keep: 2
+
+# Critical probability alignment: vLLM samples the unmodified softmax above,
+# but its BF16 log-probabilities never enter the PPO ratio. After rollout,
+# re-score fixed prompt/action tokens with the local trainable QLoRA snapshot;
+# old/new log-probs then share one tokenizer, quantization path, chat template
+# and constrained normalization.
+ppo_old_logprob_source: local_actor
+
+actor_learning_rate: 0.000001
+critic_learning_rate: 0.0003
+weight_decay: 0.0
+gamma: 0.99
+gae_lambda: 0.95
+clip_epsilon: 0.2
+value_clip_epsilon: 0.2
+value_loss_coef: 0.5
+entropy_coef: 0.002
+entropy_final_coef: 0.0
+# Step schedules are divided by 8 because rollout_batch_size changed 4 -> 32;
+# their positions in consumed training samples remain approximately unchanged.
+entropy_anneal_start_step: 125
+entropy_anneal_end_step: 188
+reference_kl_beta: 0.01
+reference_kl_mode: adaptive
+reference_kl_target: 0.03
+reference_kl_beta_min: 0.01
+reference_kl_beta_max: 0.20
+reference_kl_ema_decay: 0.90
+reference_kl_deadband_low: 0.80
+reference_kl_deadband_high: 1.20
+reference_kl_controller_rate: 0.10
+reference_kl_emergency_threshold: 0.12
+reference_kl_emergency_patience: 5
+reference_kl_emergency_stop: false
+reference_kl_emergency_validation: false
+reference_kl_recovery_steps: 2
+reference_kl_recovery_role_scale: 0.25
+reference_kl_recovery_beta_multiplier: 1.50
+reference_kl_role_overrides:
+  query_retriever: {target: 0.03, emergency_threshold: 0.12}
+  evidence_updater: {target: 0.02, controller_rate: 0.50, emergency_threshold: 0.08}
+  answer_generator: {target: 0.03, emergency_threshold: 0.12}
+max_grad_norm: 1.0
+ppo_epochs: 1
+minibatch_size: 1
+actor_minibatch_mode: role_balanced
+actor_role_weights:
+  query_retriever: 1.0
+  evidence_updater: 0.5
+  answer_generator: 1.0
+gradient_diagnostics_steps: 3
+gradient_diagnostics_max_groups: 1
+target_kl: 0.02
+normalize_advantages: true
+advantage_normalization_scope: role
+terminal_reward_weight: 1.0
+
+eta_query: 0.2
+eta_evidence: 0.2
+omega_answer: 1.5
+omega_evidence: 1.0
+answer_local_reward_weight: 1.0
+format_reward_weight: 0.1
+invalid_action_penalty: -1.0
+final_answer_invalid_penalty: -3.0
+non_final_wait_reward: 0.2
+final_answer_bonus: 1.0
+gate_terminal_evidence_on_valid_answer: true
+# Do not grammar-constrain Answer generation unless its constrained token
+# partition is also modeled in learner scoring. Invalid final actions receive
+# the explicit penalty below; Evidence guidance is safe because its pointer
+# trie is reproduced exactly by the learner.
+force_final_answer_decoding: false
+force_evidence_guided_decoding: true
+# Empty selection is legal in macorag-policy-v3.
+evidence_min_selected_passages: 0
+
+validation_steps: 13
+validation_temperature: 0.0
+validation_target_seconds_per_sample: 3.0
+validation_target_total_minutes: 15.0
+validation_score_answer_weight: 1.0
+validation_score_evidence_weight: 0.0
+validation_score_parse_penalty: 0.0
+validation_min_delta: 0.001
+early_stopping_patience: 4
+early_stopping_min_steps: 50
+protocol_window_size: 100
+max_protocol_parse_failure_rate: 0.02
+max_validation_missing_answer_tag_rate: 0.01
+min_validation_final_compliance_rate: 0.98
+
+critic_hash_buckets: 32768
+critic_embedding_dim: 128
+critic_hidden_dim: 256
+critic_text_max_tokens: 512
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0.05
+lora_target_modules: q_proj,k_proj,v_proj,o_proj,up_proj,down_proj,gate_proj
+bf16: true
+fp16: false
+load_4bit: true
+gradient_checkpointing: true
+attn_implementation: flash_attention_2
+save_steps: 13
+save_total_limit: 8
+logging_steps: 1
+device: cuda:0

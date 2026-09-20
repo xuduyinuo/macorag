@@ -23,6 +23,7 @@ from evaluation.evaluate_rag_model import (
     _validate_fixed_manifest,
     _build_retrieval_env,
     _configure_visible_gpus,
+    _evaluation_protocol_metrics,
     _load_policy,
     VLLMOpenAIPolicy,
     VLLMTrainingServerPolicy,
@@ -33,6 +34,29 @@ from evaluation.evaluate_rag_model import (
 
 
 from evaluation.local_evaluator import evaluate_predictions
+
+
+def test_mappo_protocol_metrics_use_training_episode_semantics() -> None:
+    args = SimpleNamespace(
+        evaluation_algorithm="mappo",
+        _mappo_config=SimpleNamespace(
+            max_protocol_parse_failure_rate=0.02,
+            max_validation_missing_answer_tag_rate=0.01,
+            min_validation_final_compliance_rate=0.98,
+        ),
+    )
+    metrics = _evaluation_protocol_metrics(args, [{
+        "trajectory": [{"answer": {"can_answer": True, "answer": "x"}}],
+        "parse_errors": [],
+        "mappo_protocol": {
+            "parse_failed": False,
+            "missing_answer_tag": False,
+            "final_compliant": True,
+        },
+    }])
+    assert metrics["missing_answer_tag_rate"] == 0.0
+    assert metrics["final_compliance_rate"] == 1.0
+    assert metrics["checkpoint_eligible"] is True
 
 
 def test_fixed_manifest_selects_per_dataset_deterministically(tmp_path: Path) -> None:

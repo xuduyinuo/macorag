@@ -5,13 +5,14 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from prompt_config import system_prompt_for
 from .mappo_types import AgentRole, RAGState
 
 
 SYSTEM_PROMPTS = {
-    AgentRole.QUERY: "You are the query-retriever role in a cooperative multi-agent RAG system. Output exactly one <query-retriever> tag containing valid JSON. Do not output analysis, Markdown, or any other tag.",
-    AgentRole.EVIDENCE: "You are the evidence-updater role in a cooperative multi-agent RAG system. Output exactly one <update-evidence> tag containing valid JSON. Do not output analysis, Markdown, or any other tag.",
-    AgentRole.ANSWER: "You are the answer-generator role in a cooperative multi-agent RAG system. Output exactly one <answer> tag containing valid JSON with can_answer, answer, and rationale. Do not output analysis, Markdown, or any other tag.",
+    AgentRole.QUERY: system_prompt_for("query_retriever"),
+    AgentRole.EVIDENCE: system_prompt_for("evidence_updater"),
+    AgentRole.ANSWER: system_prompt_for("answer_generator"),
 }
 
 OUTPUT_CONTRACT_MARKER = "<output-contract>"
@@ -50,6 +51,20 @@ def _compact_passage(item: Any, text_chars: int) -> dict[str, Any]:
             compact[key] = item[key]
     compact["text"] = _clip_text(item.get("text", ""), text_chars)
     return compact
+
+
+def passage_pointer(passage_id: int) -> str:
+    return f"P{int(passage_id)}"
+
+
+def _pointer_passages(passages: list[dict[str, Any]]) -> str:
+    """Render local passage pointers next to their semantic content compactly."""
+    return "\n".join(
+        f"<{passage_pointer(item['passage_id'])}>"
+        f"{_dump({'title': item.get('title', ''), 'text': item.get('text', '')})}"
+        f"</{passage_pointer(item['passage_id'])}>"
+        for item in passages
+    )
 
 
 def _compact_state(
@@ -119,6 +134,8 @@ def build_prompt(
     max_history_items: int = 3,
     evidence_text_chars: int = 160,
     observation_text_chars: int = 200,
+    evidence_min_selected_passages: int = 1,
+    evidence_rationale_max_chars: int = 64,
 ) -> str:
     state_json = _dump(_compact_state(
         state,
@@ -142,12 +159,35 @@ def build_prompt(
             max_items=max_evidence_items,
             text_chars=observation_text_chars,
         )
+        passages = compact_observation["passages"]
+        minimum = min(evidence_min_selected_passages, len(passages))
+        example_ids = [
+            passage_pointer(item["passage_id"])
+            for item in passages[:max(1, minimum)]
+        ]
+        selection_rule = (
+            f"Select at least {minimum} passage pointer(s); an empty selection is not allowed."
+            if minimum > 0 else
+            "The observation is empty, so return an empty passage-pointer list."
+        )
         return (
-            "Select only useful passage IDs from the latest observation.\n"
+            "Task: select evidence from the latest observation.\n"
+            "Pick only passage pointers whose adjacent title/text support the question, "
+            "current sub-goal, or a needed reasoning step. "
+            f"{selection_rule} Keep rationale within {evidence_rationale_max_chars} characters.\n"
             f"Question: {question}\n<state>{state_json}</state>\n"
-            f"<observation>{_dump(compact_observation)}</observation>\n"
+            "<observation>\n"
+            f"<query>{compact_observation['query']}</query>\n"
+            f"<passage_count>{compact_observation['passage_count']}</passage_count>\n"
+            f"{_pointer_passages(passages)}\n"
+            "</observation>\n"
             f"{OUTPUT_CONTRACT_MARKER}\n"
-            'Return exactly one tag: <update-evidence>{"selected_passage_ids":[],"rationale":"..."}</update-evidence>\n'
+            "Return exactly one tag: <update-evidence>"
+            + _dump({
+                "selected_passage_ids": example_ids,
+                "rationale": "selected passages support the sub-goal",
+            })
+            + "</update-evidence>\n"
             "Do not return analysis, Markdown, or any other text.\n"
             "</output-contract>"
         )
@@ -266,8 +306,22 @@ def parse_action(text: str, role: AgentRole, *, final_round: bool = False) -> di
                 raise ValueError(f"query_retriever.{key} must be a non-empty string")
     elif role is AgentRole.EVIDENCE:
         ids = value.get("selected_passage_ids")
-        if not isinstance(ids, list) or any(isinstance(x, bool) or not isinstance(x, int) for x in ids):
-            raise ValueError("selected_passage_ids must be a list of integers")
+        if not isinstance(ids, list):
+            raise ValueError("selected_passage_ids must be a list of P-prefixed pointers")
+        normalized_ids = []
+        for item in ids:
+            if isinstance(item, bool):
+                raise ValueError("selected_passage_ids must not contain booleans")
+            if isinstance(item, int):
+                # Backward-compatible parsing for non-guided old checkpoints.
+                normalized_ids.append(item)
+            elif isinstance(item, str) and re.fullmatch(r"P\d+", item):
+                normalized_ids.append(int(item[1:]))
+            else:
+                raise ValueError("selected_passage_ids must contain P-prefixed pointers")
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise ValueError("selected_passage_ids must not contain duplicates")
+        value["selected_passage_ids"] = normalized_ids
     else:
         if not isinstance(value.get("can_answer"), bool):
             raise ValueError("answer.can_answer must be a JSON boolean")

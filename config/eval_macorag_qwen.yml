@@ -3,7 +3,7 @@
 
 # 模型与 vLLM 服务。
 model_path: "model/Qwen2.5-7B-Instruct"
-adapter_path: "outputs/mappo_Qwen2.5-7B-Instruct/2026-09-14_11-15-22/checkpoint-50/actor"
+adapter_path: "outputs/mappo_Qwen2.5-7B-Instruct/2026-09-16_11-38-24/best_answer_actor"
 vllm_model: "macorag-qwen2.5-7b"
 vllm_bin: "/data/conda/envs/macorag/bin/vllm"
 vllm_gpu_indices: "1"
@@ -21,15 +21,17 @@ data_files: []
 retrieval_root: "data/eval_1000_stratified_v2_e5_faiss"
 output_root: "outputs/eval_Qwen2.5-7B"
 prompt_config_path: "config/prompts.yml"
+evaluation_algorithm: "mappo"
+mappo_config_path: "src/rl_mappo/train_mappo.yml"
 
 # 样本与 RAG 轮次
 max_samples: null
 max_rounds: 4
 
 # 生成采样参数
-max_prompt_length: 4096
-max_completion_length: 256
-temperature: 0.2
+max_prompt_length: 1024
+max_completion_length: 128
+temperature: 0.0
 top_p: 0.95
 
 # 检索参数

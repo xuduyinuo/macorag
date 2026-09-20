@@ -13,3 +13,10 @@ ablation/data/
 ablation/artifacts/
 ablation/outputs/
 config/
+paper/
+data_v2/
+
+# Keep the isolated SFT-v2 source configuration tracked even though generic
+# runtime config directories are ignored above.
+!src/sft_v2/config/
+!src/sft_v2/config/teacher_trajectory.yml

@@ -9,15 +9,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from prompt_config import DEFAULT_PROMPT_CONTRACT, load_prompt_contract, system_prompt_for
-from rag import (
-    AnswerPromptContext,
-    RAGState,
-    advance_rag_state,
-    build_answer_generator_prompt,
-    build_evidence_updater_prompt,
-    build_query_retriever_prompt,
-)
+from prompt_config import load_prompt_contract, system_prompt_for
+from rag import RAGState, advance_rag_state
+from rl_mappo.mappo_types import AgentRole, RAGState as MAPPORAGState
+from rl_mappo.protocol import build_prompt, passage_pointer
 from .trajectory_parser import (
     TeacherValidationStats,
     validate_answer_decision,
@@ -147,7 +142,11 @@ def _mask_update_evidence(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _tagged_json(tag: str, payload: Any) -> str:
-    return f"<{tag}>{json.dumps(payload, ensure_ascii=False)}</{tag}>"
+    return (
+        f"<{tag}>"
+        f"{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        f"</{tag}>"
+    )
 
 
 def _rag_state_from_dict(question: str, payload: dict[str, Any]) -> RAGState:
@@ -193,6 +192,24 @@ def _state_with_update_evidence(state: dict[str, Any], update_evidence: dict[str
     current_evidence = list(merged.get("evidence") or [])
     merged["evidence"] = [*current_evidence, *_clean_evidence_for_state(update_evidence)]
     return merged
+
+
+def _mappo_state(state: RAGState, *, round_index: int) -> MAPPORAGState:
+    return MAPPORAGState(
+        question=state.question,
+        sub_goal=str(state.current_sub_goal or ""),
+        evidence=[dict(item) for item in state.evidence],
+        retrieval_history=[dict(item) for item in state.retrieval_history],
+        round_index=round_index,
+    )
+
+
+def _pointer_evidence_target(payload: dict[str, Any]) -> dict[str, Any]:
+    target = dict(payload)
+    target["selected_passage_ids"] = [
+        passage_pointer(item) for item in target.get("selected_passage_ids", [])
+    ]
+    return target
 
 
 def trajectory_to_sft_records(
@@ -246,10 +263,14 @@ def trajectory_to_sft_records(
                     question=question,
                     dataset=dataset,
                     action_type="query_retriever",
-                    prompt_text=build_query_retriever_prompt(question=question, state=state_before),
+                    prompt_text=build_prompt(
+                        AgentRole.QUERY, question=question,
+                        state=_mappo_state(state_before, round_index=round_index),
+                        final_round=False,
+                    ),
                     target_text=_tagged_json("query-retriever", query_target),
                     agent_role="query_retriever",
-                    role_instruction=system_prompt_for("query_retriever", DEFAULT_PROMPT_CONTRACT),
+                    role_instruction=system_prompt_for("query_retriever"),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,
@@ -278,14 +299,16 @@ def trajectory_to_sft_records(
                     question=question,
                     dataset=dataset,
                     action_type="evidence_update",
-                    prompt_text=build_evidence_updater_prompt(
-                        question=question,
-                        state=updater_state,
-                        observation=observation,
+                    prompt_text=build_prompt(
+                        AgentRole.EVIDENCE, question=question,
+                        state=_mappo_state(updater_state, round_index=round_index),
+                        observation=observation, final_round=False,
                     ),
-                    target_text=_tagged_json("update-evidence", masked_update_evidence),
+                    target_text=_tagged_json(
+                        "update-evidence", _pointer_evidence_target(masked_update_evidence),
+                    ),
                     agent_role="evidence_updater",
-                    role_instruction=system_prompt_for("evidence_updater", DEFAULT_PROMPT_CONTRACT),
+                    role_instruction=system_prompt_for("evidence_updater"),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,
@@ -312,14 +335,14 @@ def trajectory_to_sft_records(
                     question=question,
                     dataset=dataset,
                     action_type="answer",
-                    prompt_text=build_answer_generator_prompt(
-                        question=question,
-                        state=answer_state,
-                        context=AnswerPromptContext(round_index=round_index, max_rounds=max_rounds),
+                    prompt_text=build_prompt(
+                        AgentRole.ANSWER, question=question,
+                        state=_mappo_state(answer_state, round_index=round_index),
+                        final_round=round_index + 1 == max_rounds,
                     ),
                     target_text=_tagged_json("answer", answer),
                     agent_role="answer_generator",
-                    role_instruction=system_prompt_for("answer_generator", DEFAULT_PROMPT_CONTRACT),
+                    role_instruction=system_prompt_for("answer_generator"),
                     round_index=round_index,
                     max_rounds=max_rounds,
                     prompt_contract_fingerprint=contract_fingerprint,

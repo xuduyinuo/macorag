@@ -1,0 +1,69 @@
+schema_version: 1
+
+# Source questions. The adapter maps id/golden_answers and canonicalizes
+# 2wikimultihopqa -> 2wiki without rewriting the source file.
+source_path: "/data/xudu/macorag/data_v2/train_sft.jsonl"
+output_dir: "/data/xudu/macorag/data_v2/teacher_deepseek_v41_flash"
+dataset_aliases:
+  hotpotqa: hotpotqa
+  2wikimultihopqa: 2wiki
+  musique: musique
+candidate_limits_by_dataset:
+  hotpotqa: 2000
+  2wiki: 2000
+  musique: 1000
+
+# Stop at the 1,252 qualified trajectories already collected. Deterministically
+# use 1,000 for SFT training, 200 for validation, and retain 52 as an untouched
+# reserve pool for audit or replacement. No per-dataset quota is imposed.
+accepted_target_total: 1252
+train_target_total: 1000
+validation_target_total: 200
+
+# One shared Wiki18 corpus and one shared E5 Flat index for every dataset.
+corpus_path: "/data/xudu/baseline/baseline_eval/data/retrieval-corpus/wiki18_100w.jsonl"
+index_path: "/data/xudu/baseline/baseline_eval/indexes/wiki18_100w_e5_flat/e5_Flat.index"
+index_manifest_path: "/data/xudu/baseline/baseline_eval/indexes/wiki18_100w_e5_flat/build_manifest.json"
+corpus_offsets_path: "/data/xudu/macorag/data_v2/cache/wiki18_100w.offsets.u64"
+retrieval_model_path: "/data/conda/tmp/searchr1-hf/hub/models--intfloat--e5-base-v2/snapshots/f52bf8ec8c7124536f0efb74aca902b2995e5bcd"
+retrieval_device: "cpu"
+retrieval_batch_size: 8
+# A one-second coalescing window groups staggered DeepSeek responses without
+# creating the very long single-batch latency observed with 32-query Flat
+# searches on this host.
+retrieval_batch_wait_ms: 1000
+retrieval_max_length: 512
+retrieval_top_k: 5
+faiss_mmap: true
+
+# DeepSeek V4.1 Flash. The official current API model ID is deepseek-flash.
+api_base: "https://api.deepseek.com"
+api_key_env: "DEEPSEEK_API_KEY"
+teacher_model: "deepseek-flash"
+thinking: "disabled"
+temperature: 0.2
+max_tokens: 1200
+request_timeout_seconds: 180
+request_retries: 4
+# Retry only the invalid role action, without repeating earlier retrieval or
+# leaking gold labels into the corrective prompt.
+role_validation_retries: 2
+retry_base_seconds: 2.0
+
+prompt_path: "/data/xudu/macorag/src/sft_v2/prompts.yml"
+max_rounds: 4
+# Eight concurrent trajectories balance Flat-index throughput and per-batch
+# latency on the current dual-socket CPU host.
+sample_workers: 8
+seed: 42
+# Shuffle the complete 5,000-example pool before accepting the first 2,200
+# qualified trajectories. This prevents source-file dataset blocks from
+# starving later datasets such as MuSiQue; it does not impose dataset quotas.
+shuffle_source_examples: true
+# After every FAISS search, shuffle the returned passages deterministically and
+# then assign fresh P0...Pk pointers. The teacher therefore cannot equate P0
+# with the highest-scoring retrieval result.
+shuffle_retrieved_passages: true
+resume: true
+retry_failed: true
+skip_filtered_on_resume: true

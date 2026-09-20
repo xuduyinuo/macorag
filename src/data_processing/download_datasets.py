@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
+import shutil
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -150,6 +153,67 @@ FILES: tuple[DownloadItem, ...] = (
         None,
         "Linked from https://github.com/Alab-NII/2wikimultihop README.md",
     ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets README",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/README.md",
+        "data/README_flashrag_datasets.md",
+        11310,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets nq train",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/nq/train.jsonl",
+        "data/nq/train.jsonl",
+        9960189,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets nq dev",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/nq/dev.jsonl",
+        "data/nq/dev.jsonl",
+        1073443,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets nq test",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/nq/test.jsonl",
+        "data/nq/test.jsonl",
+        487676,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets triviaqa train",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/triviaqa/train.jsonl",
+        "data/triviaqa/train.jsonl",
+        32952174,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets triviaqa dev",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/triviaqa/dev.jsonl",
+        "data/triviaqa/dev.jsonl",
+        3714793,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets triviaqa test",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/triviaqa/test.jsonl",
+        "data/triviaqa/test.jsonl",
+        4797585,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets popqa test",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/popqa/test.jsonl",
+        "data/popqa/test.jsonl",
+        8526089,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets bamboogle test",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/bamboogle/test.jsonl",
+        "data/bamboogle/test.jsonl",
+        17031,
+    ),
+    DownloadItem(
+        "RUC-NLPIR/FlashRAG_datasets wiki18_100w retrieval corpus",
+        "https://huggingface.co/datasets/RUC-NLPIR/FlashRAG_datasets/resolve/main/retrieval-corpus/wiki18_100w.zip",
+        "data/wikipedia/wiki18_100w.zip",
+        5130719280,
+        "Shared open-domain Wikipedia corpus used by FlashRAG for NQ/TriviaQA/PopQA/Bamboogle retrieval.",
+    ),
 )
 
 
@@ -161,17 +225,27 @@ def sha256sum(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(item: DownloadItem) -> dict[str, Any]:
-    target = ROOT / item.path
-    target.parent.mkdir(parents=True, exist_ok=True)
-    expected = item.size
-    if target.exists() and (expected is None or target.stat().st_size == expected):
-        status = "already_present"
-    else:
-        cmd = [
+# Files at or above this size are fetched with several parallel range requests.
+# A single curl connection through the proxy sustains ~0.5 MB/s, while 6 parallel
+# connections reach ~2.5 MB/s; more than ~8 connections makes it slower again.
+PARALLEL_THRESHOLD = 256 * 1024 * 1024
+PART_SIZE = 64 * 1024 * 1024
+PARALLEL_WORKERS = 6
+
+
+def _curl(argv: list[str]) -> None:
+    subprocess.run(argv, cwd=ROOT, check=True)
+
+
+def _download_single(url: str, target: Path) -> None:
+    _curl(
+        [
             "curl",
             "-L",
             "--fail",
+            "--silent",
+            "--show-error",
+            "--no-progress-meter",
             "--connect-timeout",
             "30",
             "--retry",
@@ -182,10 +256,99 @@ def download(item: DownloadItem) -> dict[str, Any]:
             "-",
             "-o",
             str(target),
-            item.url,
+            url,
         ]
+    )
+
+
+def _download_range(url: str, start: int, end: int, dest: Path, attempts: int = 5) -> None:
+    expected = end - start + 1
+    for attempt in range(1, attempts + 1):
+        if dest.exists() and dest.stat().st_size == expected:
+            return
+        dest.unlink(missing_ok=True)
+        try:
+            _curl(
+                [
+                    "curl",
+                    "-L",
+                    "--fail",
+                    "--silent",
+                    "--show-error",
+                    "--no-progress-meter",
+                    "--connect-timeout",
+                    "30",
+                    "--retry",
+                    "4",
+                    "--retry-delay",
+                    "5",
+                    "-r",
+                    f"{start}-{end}",
+                    "-o",
+                    str(dest),
+                    url,
+                ]
+            )
+        except subprocess.CalledProcessError:
+            if attempt == attempts:
+                raise
+            print(f"  retry {attempt}/{attempts - 1}: bytes {start}-{end}", flush=True)
+            continue
+        if dest.exists() and dest.stat().st_size == expected:
+            return
+    raise RuntimeError(f"incomplete range {start}-{end} for {url}")
+
+
+def _download_parallel(url: str, target: Path, expected: int) -> None:
+    parts_dir = target.parent / f".{target.name}.parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    ranges = [
+        (index, start, min(start + PART_SIZE, expected) - 1)
+        for index, start in enumerate(range(0, expected, PART_SIZE))
+    ]
+    pending = [
+        (index, start, end)
+        for index, start, end in ranges
+        if not (parts_dir / f"part-{index:05d}").exists()
+        or (parts_dir / f"part-{index:05d}").stat().st_size != end - start + 1
+    ]
+    cached = len(ranges) - len(pending)
+    if cached:
+        print(f"  resuming: {cached}/{len(ranges)} parts already complete", flush=True)
+
+    completed = cached
+    with ThreadPoolExecutor(max_workers=PARALLEL_WORKERS) as pool:
+        futures = {
+            pool.submit(_download_range, url, start, end, parts_dir / f"part-{index:05d}"): index
+            for index, start, end in pending
+        }
+        for future in as_completed(futures):
+            future.result()
+            completed += 1
+            print(f"  part {completed}/{len(ranges)} done", flush=True)
+
+    print(f"  assembling {target.name} from {len(ranges)} parts", flush=True)
+    assembling = target.parent / f".{target.name}.assembling"
+    with assembling.open("wb") as out:
+        for index, _start, _end in ranges:
+            with (parts_dir / f"part-{index:05d}").open("rb") as part:
+                shutil.copyfileobj(part, out, 4 * 1024 * 1024)
+    assembling.replace(target)
+    shutil.rmtree(parts_dir, ignore_errors=True)
+
+
+def download(item: DownloadItem) -> dict[str, Any]:
+    target = ROOT / item.path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    expected = item.size
+    if target.exists() and (expected is None or target.stat().st_size == expected):
+        status = "already_present"
+    else:
         print(f"Downloading {item.name} -> {item.path}", flush=True)
-        subprocess.run(cmd, cwd=ROOT, check=True)
+        if expected is not None and expected >= PARALLEL_THRESHOLD:
+            _download_parallel(item.url, target, expected)
+        else:
+            _download_single(item.url, target)
         status = "downloaded"
 
     actual_size = target.stat().st_size if target.exists() else None
@@ -203,13 +366,77 @@ def download(item: DownloadItem) -> dict[str, Any]:
     }
 
 
-def main() -> None:
+def _load_manifest_entries(path: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists():
+        return {}
+    try:
+        entries = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return {}
+    if not isinstance(entries, list):
+        return {}
+    return {
+        entry["path"]: entry
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("path"), str)
+    }
+
+
+def select_items(only: Optional[list[str]]) -> list[DownloadItem]:
+    if not only:
+        return list(FILES)
+    needles = [needle.lower() for needle in only]
+    return [
+        item
+        for item in FILES
+        if any(needle in item.path.lower() or needle in item.name.lower() for needle in needles)
+    ]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Download and verify dataset files into data/.",
+    )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=None,
+        metavar="SUBSTRING",
+        help=(
+            "Only process items whose name or path contains SUBSTRING "
+            "(repeatable). Matched entries are merged into the existing manifest."
+        ),
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="List the items that would be processed and exit.",
+    )
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    args = build_parser().parse_args(argv)
+    items = select_items(args.only)
+    if args.list:
+        for item in items:
+            print(f"{item.path}\t{item.size if item.size is not None else '?'}\t{item.name}")
+        return
+    if not items:
+        raise SystemExit("no download items matched the given filters")
+
     results = []
-    for item in tqdm(FILES, desc="Downloading dataset files", unit="file"):
+    for item in tqdm(items, desc="Downloading dataset files", unit="file"):
         results.append(download(item))
 
     manifest = ROOT / "data" / "DOWNLOAD_MANIFEST.json"
-    manifest.write_text(json.dumps(results, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    merged = _load_manifest_entries(manifest)
+    for result in results:
+        merged[result["path"]] = result
+    manifest.write_text(
+        json.dumps(list(merged.values()), indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
     failures = [result for result in results if not result["ok"]]
     print(f"Wrote {manifest.relative_to(ROOT)}")

@@ -1,21 +1,34 @@
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from .mappo import (
+    AdaptiveReferenceKLController,
     clipped_value_loss,
     compute_gae,
+    gradient_conflict_metrics,
     mappo_actor_loss,
     normalize_advantages_by_role,
 )
 from .data import load_samples, sample_stratum, split_train_validation
-from .models import FINAL_ANSWER_GUIDED_REGEX, RoleConditionedActor
+from .evaluation import align_evaluation_args
+from .models import (
+    FINAL_ANSWER_GUIDED_REGEX,
+    RoleConditionedActor,
+    evidence_action_layout,
+    evidence_completion_budget,
+    evidence_guided_regex,
+)
 from .protocol import ProtocolWindowMonitor, build_prompt, parse_action, protocol_metrics
-from .rollout import RolloutCollector
+from .rollout import (
+    RolloutCollector, _merge_unique_evidence, _without_existing_evidence,
+)
 from .mappo_types import AgentRole, Episode, MAPPOTransition, RAGState, RLSample
 from .trainer import MAPPOTrainer
 from .vllm_client import VLLMClient
@@ -50,6 +63,62 @@ def test_actor_clipping_and_mask() -> None:
     assert new.grad is not None
 
 
+def test_gradient_conflict_metrics_reports_cancellation_and_alignment() -> None:
+    metrics = gradient_conflict_metrics({
+        "answer_generator": [torch.tensor([1.0, 0.0]), None],
+        "evidence_updater": [torch.tensor([-1.0, 0.0]), torch.tensor([0.0])],
+        "query_retriever": [torch.tensor([0.0, 1.0]), torch.tensor([0.0])],
+    })
+    assert metrics["pairwise_cosine"][
+        "answer_generator__evidence_updater"
+    ] == pytest.approx(-1.0)
+    assert metrics["pairwise_cosine"][
+        "answer_generator__query_retriever"
+    ] == pytest.approx(0.0)
+    assert metrics["conflicting_pairs"] == 1
+    assert metrics["conflict_rate"] == pytest.approx(1.0 / 3.0)
+    assert metrics["combined_gradient_norm"] == pytest.approx(1.0)
+    assert metrics["gradient_cancellation_ratio"] == pytest.approx(2.0 / 3.0)
+
+
+def test_mappo_evaluation_args_follow_training_rollout_contract() -> None:
+    args = SimpleNamespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        max_rounds=99,
+        max_prompt_length=4096,
+        max_completion_length=256,
+        temperature=0.7,
+        top_p=0.8,
+        retrieval_backend="e5_faiss",
+        retrieval_embedding_model="wrong",
+        retrieval_device="cuda",
+        retrieval_max_length=123,
+        retrieval_batch_size=1,
+        retrieval_top_k=9,
+    )
+    config = SimpleNamespace(
+        model_path="model/Qwen2.5-7B-Instruct",
+        max_rounds=4,
+        max_prompt_length=1024,
+        max_completion_length=128,
+        validation_temperature=0.0,
+        top_p=0.95,
+        retrieval_backend="e5_faiss",
+        retrieval_embedding_model="intfloat/e5-base-v2",
+        retrieval_device="cpu",
+        retrieval_max_length=512,
+        retrieval_batch_size=32,
+        retrieval_top_k=5,
+    )
+    align_evaluation_args(args, config)
+    assert (args.max_rounds, args.max_prompt_length, args.max_completion_length) == (
+        4, 1024, 128,
+    )
+    assert args.temperature == 0.0
+    assert args.retrieval_embedding_model == "intfloat/e5-base-v2"
+    assert args.retrieval_top_k == 5
+
+
 def test_value_clipping_uses_larger_error() -> None:
     loss = clipped_value_loss(torch.tensor([2.0]), torch.tensor([0.0]), torch.tensor([1.0]), 0.2)
     assert torch.isclose(loss, torch.tensor(0.5))
@@ -66,6 +135,203 @@ def test_advantages_are_normalized_per_role_without_erasing_singletons() -> None
     assert query_low.advantage == -1.0
     assert query_high.advantage == 1.0
     assert answer_only.advantage == 7.0
+
+
+def test_adaptive_reference_kl_controller_updates_and_restores_state() -> None:
+    controller = AdaptiveReferenceKLController(
+        beta=0.01, target=0.03, beta_min=0.005, beta_max=0.2,
+        ema_decay=0.0, controller_rate=1.0,
+        emergency_threshold=0.08, emergency_patience=2,
+    )
+    first = controller.update(0.09)
+    assert first["reference_kl_beta_next"] > first["reference_kl_beta"]
+    assert first["reference_kl_emergency_triggered"] == 0.0
+    second = controller.update(0.09)
+    assert second["reference_kl_emergency_triggered"] == 1.0
+    restored = AdaptiveReferenceKLController(
+        beta=0.01, target=0.03, beta_min=0.005, beta_max=0.2,
+    )
+    restored.load_state_dict(controller.state_dict())
+    assert restored.state_dict() == controller.state_dict()
+    high_beta = restored.beta
+    restored.ema_decay = 0.0
+    restored.controller_rate = 1.0
+    restored.update(0.0)
+    assert restored.beta < high_beta
+
+
+def test_reference_kl_emergency_requires_current_and_ema_violation() -> None:
+    controller = AdaptiveReferenceKLController(
+        beta=0.01, target=0.03, beta_min=0.005, beta_max=0.2,
+        ema_decay=0.9, emergency_threshold=0.08, emergency_patience=2,
+    )
+    first = controller.update(0.2)
+    assert first["reference_kl_emergency_count"] == 1.0
+    recovered = controller.update(0.0)
+    assert recovered["reference_kl_ema"] > 0.08
+    assert recovered["reference_kl_emergency_count"] == 0.0
+    assert recovered["reference_kl_emergency_triggered"] == 0.0
+
+
+def test_evidence_guidance_allows_only_unique_observed_passage_ids() -> None:
+    pattern = evidence_guided_regex([7, 2, 7])
+    assert re.fullmatch(
+        pattern,
+        '<update-evidence>{"selected_passage_ids":["P2","P7"],"rationale":"both support"}</update-evidence>',
+    )
+    assert not re.fullmatch(
+        pattern,
+        '<update-evidence>{"selected_passage_ids":[],"rationale":"none"}</update-evidence>',
+    )
+    assert not re.fullmatch(
+        pattern,
+        '<update-evidence>{"selected_passage_ids":["P7","P7"],"rationale":"duplicate"}</update-evidence>',
+    )
+    assert not re.fullmatch(
+        pattern,
+        '<update-evidence>{"selected_passage_ids":["P9"],"rationale":"not observed"}</update-evidence>',
+    )
+    assert not re.fullmatch(
+        pattern,
+        '<update-evidence>{"selected_passage_ids":["P2"],"rationale":"'
+        + "x" * 65
+        + '"}</update-evidence>',
+    )
+    empty_observation_pattern = evidence_guided_regex([])
+    assert re.fullmatch(
+        empty_observation_pattern,
+        '<update-evidence>{"selected_passage_ids":[],"rationale":"none"}</update-evidence>',
+    )
+
+
+def test_evidence_pointer_layout_optimizes_only_constrained_choice_tokens() -> None:
+    class CharacterTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(item) for item in text]
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            del add_special_tokens
+            result = {"input_ids": self.encode(text)}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
+            return result
+
+    response = (
+        '<update-evidence>{"selected_passage_ids":["P0","P2"],'
+        '"rationale":"both support"}</update-evidence>'
+    )
+    tokenizer = CharacterTokenizer()
+    action_ids = tokenizer.encode(response)
+    constraints, optimize, segments = evidence_action_layout(
+        tokenizer, response=response, action_ids=action_ids,
+        passage_ids=[0, 1, 2], min_selected=1,
+    )
+    assert any(optimize)
+    assert all(constraints[index] is not None for index, active in enumerate(optimize) if active)
+    assert not any(active for active, segment in zip(optimize, segments) if segment == "rationale")
+    assert "selection" in segments and "rationale" in segments and "format" in segments
+
+
+def test_evidence_pointer_layout_tokenizes_complete_response_at_bpe_boundary() -> None:
+    class BoundaryMergingTokenizer:
+        """Mimic a BPE token that crosses the header/rationale boundary."""
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            marker = '"rationale":"s'
+            output = []
+            index = 0
+            while index < len(text):
+                if text.startswith(marker, index):
+                    output.extend(ord(item) for item in marker[:-2])
+                    output.append(100_001)
+                    index += len(marker)
+                else:
+                    output.append(ord(text[index]))
+                    index += 1
+            return output
+
+        def __call__(self, *args, **kwargs):
+            del args, kwargs
+            raise NotImplementedError
+
+    response = (
+        '<update-evidence>{"selected_passage_ids":["P1"],'
+        '"rationale":"support"}</update-evidence>'
+    )
+    tokenizer = BoundaryMergingTokenizer()
+    action_ids = tokenizer.encode(response)
+    constraints, optimize, segments = evidence_action_layout(
+        tokenizer, response=response, action_ids=action_ids,
+        passage_ids=[0, 1, 2], min_selected=1,
+    )
+    assert any(optimize)
+    assert len(constraints) == len(action_ids)
+    assert not any(active for active, segment in zip(optimize, segments) if segment == "rationale")
+
+
+def test_evidence_pointer_layout_accepts_trailing_special_stop_token() -> None:
+    class CharacterTokenizer:
+        all_special_ids = [0]
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(item) for item in text]
+
+        def __call__(self, *args, **kwargs):
+            del args, kwargs
+            raise NotImplementedError
+
+    response = (
+        '<update-evidence>{"selected_passage_ids":["P0"],'
+        '"rationale":"support"}</update-evidence>'
+    )
+    tokenizer = CharacterTokenizer()
+    action_ids = [*tokenizer.encode(response), 0]
+    constraints, optimize, segments = evidence_action_layout(
+        tokenizer, response=response, action_ids=action_ids,
+        passage_ids=[0, 1], min_selected=1,
+    )
+    assert len(constraints) == len(action_ids)
+    assert constraints[-1] is None and not optimize[-1] and segments[-1] == "format"
+
+
+def test_evidence_pointer_parser_normalizes_labels_to_local_ids() -> None:
+    parsed = parse_action(
+        '<update-evidence>{"selected_passage_ids":["P1","P4"],'
+        '"rationale":"support"}</update-evidence>',
+        AgentRole.EVIDENCE,
+    )
+    assert parsed["selected_passage_ids"] == [1, 4]
+
+
+def test_evidence_completion_budget_rejects_token_overflow() -> None:
+    class CharacterTokenizer:
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return list(text)
+
+    with pytest.raises(ValueError, match="token budget is too small"):
+        evidence_completion_budget(
+            CharacterTokenizer(), passage_ids=list(range(5)),
+            rationale_max_chars=64, max_completion_length=32,
+        )
+
+
+def test_role_balanced_minibatches_group_one_microbatch_per_role() -> None:
+    trainer = MAPPOTrainer.__new__(MAPPOTrainer)
+    trainer.config = SimpleNamespace(minibatch_size=1, actor_minibatch_mode="role_balanced")
+    transitions = [
+        *[_transition(AgentRole.QUERY, 0.0, 0.0) for _ in range(2)],
+        _transition(AgentRole.EVIDENCE, 0.0, 0.0),
+        *[_transition(AgentRole.ANSWER, 0.0, 0.0) for _ in range(3)],
+    ]
+    groups = trainer._actor_minibatch_groups(transitions)
+    assert len(groups) == 3
+    assert {batch[0].role for batch in groups[0]} == set(AgentRole)
+    assert all(len({item.role for item in batch}) == 1 for group in groups for batch in group)
+    assert sum(len(batch) for group in groups for batch in group) == len(transitions)
 
 
 def test_protocol_is_strict() -> None:
@@ -152,10 +418,13 @@ def test_evidence_prompt_compacts_observation_but_keeps_ids() -> None:
         max_evidence_items=3,
         observation_text_chars=64,
     )
-    assert '"passage_count":12' in prompt
-    assert all(f'"passage_id":{index}' in prompt for index in (0, 1, 2))
-    assert '"passage_id":3' not in prompt
+    assert "<passage_count>12</passage_count>" in prompt
+    assert all(f"<P{index}>" in prompt for index in (0, 1, 2))
+    assert "<P3>" not in prompt
     assert "X" * 1000 not in prompt
+    assert '"selected_passage_ids":["P0"]' in prompt
+    assert "an empty selection is not allowed" in prompt
+    assert "within 64 characters" in prompt
     assert prompt.index("<output-contract>") > prompt.index("</observation>")
 
 
@@ -288,7 +557,7 @@ def test_protocol_metrics_and_window_monitor_detect_failures() -> None:
     assert monitor.add([valid, invalid])["should_warn"] is True
 
 
-def test_validation_protocol_requires_every_dataset_to_be_eligible() -> None:
+def test_validation_protocol_uses_overall_gate_and_keeps_dataset_diagnostics() -> None:
     trainer = MAPPOTrainer.__new__(MAPPOTrainer)
     trainer.config = SimpleNamespace(
         max_protocol_parse_failure_rate=0.01,
@@ -312,7 +581,8 @@ def test_validation_protocol_requires_every_dataset_to_be_eligible() -> None:
     assert metrics["protocol_by_dataset"]["a"]["parse_failure_rate"] == 0.02
     assert metrics["protocol_by_dataset"]["a"]["checkpoint_eligible"] is False
     assert metrics["protocol_by_dataset"]["b"]["checkpoint_eligible"] is True
-    assert metrics["checkpoint_eligible"] is False
+    assert metrics["checkpoint_eligible"] is True
+    assert metrics["checkpoint_eligibility_scope"] == "overall"
 
 
 def test_rollout_assigns_local_and_team_rewards_to_all_agents() -> None:
@@ -358,7 +628,241 @@ def test_rollout_assigns_local_and_team_rewards_to_all_agents() -> None:
     assert episode.global_reward == 2.0
     assert len(episode.transitions) == 3
     assert all(item.done for item in episode.transitions)
+    assert all(item.parsed_action is not None for item in episode.transitions)
+    assert all(item.team_reward == 2.0 for item in episode.transitions)
     assert [item.reward for item in episode.transitions] == [3.0, 3.0, 3.0]
+
+
+def test_rollout_passes_dynamic_guidance_to_evidence_actor() -> None:
+    class Actor:
+        guidance = None
+
+        def generate(self, role, prompt, *, guided_regex=None, max_tokens=None):
+            del prompt
+            assert role is AgentRole.EVIDENCE
+            assert max_tokens == 192
+            self.guidance = guided_regex
+            response = (
+                '<update-evidence>{"selected_passage_ids":["P3"],'
+                '"rationale":"supported"}</update-evidence>'
+            )
+            return response, [1], [2], torch.tensor([-0.1])
+
+    class Critic:
+        torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    actor = Actor()
+    collector = RolloutCollector(
+        actor=actor, critic=Critic(), retrieval=None,
+        config=SimpleNamespace(
+            max_rounds=2, force_evidence_guided_decoding=True,
+            format_reward_weight=0.1,
+        ),
+    )
+    parsed, transition = collector._act(
+        Episode(qid="q", dataset="d"), AgentRole.EVIDENCE,
+        RAGState(question="q"),
+        observation={"passages": [{"passage_id": 3}, {"passage_id": 8}]},
+        final_round=False,
+    )
+    assert parsed is not None and transition.valid
+    assert actor.guidance is not None
+    assert re.fullmatch(actor.guidance, transition.response)
+    assert "9" not in actor.guidance
+
+
+def test_rollout_uses_answer_specific_completion_budget() -> None:
+    class Actor:
+        seen_max_tokens = None
+
+        def generate(self, role, prompt, *, max_tokens=None):
+            del prompt
+            assert role is AgentRole.ANSWER
+            self.seen_max_tokens = max_tokens
+            response = (
+                '<answer>{"can_answer":true,"answer":"Ada",'
+                '"rationale":"supported"}</answer>'
+            )
+            return response, [1], [2], torch.tensor([-0.1])
+
+    class Critic:
+        torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    actor = Actor()
+    collector = RolloutCollector(
+        actor=actor, critic=Critic(), retrieval=None,
+        config=SimpleNamespace(
+            max_rounds=2, force_evidence_guided_decoding=False,
+            answer_max_completion_length=192, format_reward_weight=0.1,
+        ),
+    )
+    parsed, transition = collector._act(
+        Episode(qid="q", dataset="d"), AgentRole.ANSWER,
+        RAGState(question="q"), observation=None, final_round=True,
+    )
+    assert parsed["answer"] == "Ada" and transition.valid
+    assert actor.seen_max_tokens == 192
+
+
+def test_cross_round_evidence_candidates_and_state_are_deduplicated() -> None:
+    existing = [{
+        "dataset": "d", "chunk_id": "chunk-a", "passage_id": 0,
+        "title": "A", "text": "existing text",
+    }]
+    retrieved = [
+        {
+            "dataset": "d", "chunk_id": "chunk-a", "passage_id": 4,
+            "title": "A", "text": "existing text",
+        },
+        {
+            "dataset": "d", "chunk_id": "chunk-b", "passage_id": 1,
+            "title": "B", "text": "new text",
+        },
+        {
+            "dataset": "d", "chunk_id": "chunk-b", "passage_id": 2,
+            "title": "B duplicate", "text": "new text",
+        },
+    ]
+    candidates = _without_existing_evidence(retrieved, existing)
+    assert [item["chunk_id"] for item in candidates] == ["chunk-b"]
+    merged = _merge_unique_evidence(existing, retrieved)
+    assert [item["chunk_id"] for item in merged] == ["chunk-a", "chunk-b"]
+
+
+def test_recoverable_evidence_json_is_repaired_and_rescored() -> None:
+    class Actor:
+        def generate(self, role, prompt, *, guided_regex=None, max_tokens=None):
+            del role, prompt, guided_regex, max_tokens
+            response = (
+                '<update-evidence>{"selected_passage_ids":["P3"],'
+                '"rationale":"Dallol\\\'s record"}</update-evidence>'
+            )
+            return response, [1], [2], torch.tensor([-0.1])
+
+        def rescore_response(self, prompt_ids, response):
+            assert prompt_ids == [1]
+            assert "\\'" not in response and "Dallol's" in response
+            return [9], torch.tensor([-0.2])
+
+    class Critic:
+        torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    collector = RolloutCollector(
+        actor=Actor(), critic=Critic(), retrieval=None,
+        config=SimpleNamespace(
+            max_rounds=2, force_evidence_guided_decoding=True,
+            format_reward_weight=0.1,
+        ),
+    )
+    parsed, transition = collector._act(
+        Episode(qid="q", dataset="d"), AgentRole.EVIDENCE,
+        RAGState(question="q"),
+        observation={"passages": [{"passage_id": 3}]}, final_round=False,
+    )
+    assert parsed["rationale"] == "Dallol's record"
+    assert transition.valid and transition.format_recovery == "repaired"
+    assert transition.action_ids == [9]
+
+
+def test_noncanonical_guided_evidence_tokens_are_canonicalized() -> None:
+    class Tokenizer:
+        all_special_ids = [0]
+
+        def encode(self, text, add_special_tokens=False):
+            del add_special_tokens
+            return [ord(item) for item in text]
+
+        def __call__(self, text, add_special_tokens=False, return_offsets_mapping=False):
+            del add_special_tokens
+            result = {"input_ids": self.encode(text)}
+            if return_offsets_mapping:
+                result["offset_mapping"] = [(i, i + 1) for i in range(len(text))]
+            return result
+
+    class Actor:
+        tokenizer = Tokenizer()
+
+        def generate(self, role, prompt, *, guided_regex=None, max_tokens=None):
+            del role, prompt, guided_regex, max_tokens
+            response = (
+                '<update-evidence>{"selected_passage_ids":["P3"],'
+                '"rationale":"supported"}</update-evidence>'
+            )
+            # Same legal text was produced by a non-canonical guided-decoding
+            # token path, represented minimally here by unrelated IDs.
+            return response, [1], [999, 998], torch.tensor([-0.1, -0.2])
+
+        def rescore_response(self, prompt_ids, response):
+            assert prompt_ids == [1]
+            canonical = self.tokenizer.encode(response)
+            return canonical, torch.full((len(canonical),), -0.3)
+
+    class Critic:
+        torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    collector = RolloutCollector(
+        actor=Actor(), critic=Critic(), retrieval=None,
+        config=SimpleNamespace(
+            max_rounds=2, force_evidence_guided_decoding=True,
+            evidence_min_selected_passages=1, format_reward_weight=0.1,
+            evidence_max_completion_length=512,
+            ppo_old_logprob_source="local_actor",
+        ),
+    )
+    parsed, transition = collector._act(
+        Episode(qid="q", dataset="d"), AgentRole.EVIDENCE,
+        RAGState(question="q"),
+        observation={"passages": [{"passage_id": 3}, {"passage_id": 8}]},
+        final_round=False,
+    )
+    assert parsed["selected_passage_ids"] == [3]
+    assert transition.valid
+    assert transition.tokenization_recovery == "canonicalized"
+    assert transition.action_ids == Actor.tokenizer.encode(transition.response)
+    assert torch.count_nonzero(transition.old_token_logprobs) == 0
+    assert transition.token_constraints is not None
+    assert any(transition.optimization_token_mask)
+
+
+def test_unrepairable_format_error_is_retried_once() -> None:
+    class Actor:
+        responses = iter([
+            "missing tag",
+            '<query-retriever>{"sub_goal":"birth","query":"Ada birth"}</query-retriever>',
+        ])
+
+        def generate(self, role, prompt):
+            del role, prompt
+            return next(self.responses), [1], [2], torch.tensor([-0.1])
+
+    class Critic:
+        torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    collector = RolloutCollector(
+        actor=Actor(), critic=Critic(), retrieval=None,
+        config=SimpleNamespace(max_rounds=2, format_reward_weight=0.1),
+    )
+    parsed, transition = collector._act(
+        Episode(qid="q", dataset="d"), AgentRole.QUERY,
+        RAGState(question="q"), observation=None, final_round=False,
+    )
+    assert parsed["query"] == "Ada birth"
+    assert transition.valid and transition.format_recovery == "retried"
 
 
 def test_rollout_adds_format_reward_to_valid_actions() -> None:
@@ -469,6 +973,30 @@ def test_actor_scores_only_required_tail_logits() -> None:
     logp, entropy = actor.score_batch([([1, 2], [3, 4])])
     assert logp.shape == entropy.shape == (1, 2)
     assert torch.isfinite(logp).all() and torch.isfinite(entropy).all()
+
+
+def test_actor_constrained_scoring_renormalizes_same_legal_token_set() -> None:
+    class Model(torch.nn.Module):
+        def forward(self, input_ids, attention_mask, use_cache, logits_to_keep=0):
+            del attention_mask, use_cache
+            logits = torch.nn.functional.one_hot(input_ids, num_classes=8).float()
+            if logits_to_keep:
+                logits = logits[:, -logits_to_keep:, :]
+            return SimpleNamespace(logits=logits.requires_grad_())
+
+    class Tokenizer:
+        pad_token_id = 0
+        eos_token_id = 7
+
+    actor = RoleConditionedActor(
+        Model(), Tokenizer(), max_prompt_length=8, max_completion_length=2,
+        temperature=0.8, top_p=0.95, top_k=5, device=torch.device("cpu"),
+    )
+    constrained, _, raw = actor.score_batch_detailed(
+        [([1, 2], [3, 4])], token_constraints=[[None, [4]]],
+    )
+    assert constrained[0, 1].item() == 0.0
+    assert raw[0, 1].item() < 0.0
 
 
 def test_actor_no_grad_scoring_restores_training_mode() -> None:
@@ -586,6 +1114,71 @@ def test_kl_guard_rejects_update_before_parameter_mutation(tmp_path) -> None:
     assert stats["ppo_early_stop"] == 1.0
 
 
+def test_role_balanced_actor_update_accumulates_then_steps_once(tmp_path) -> None:
+    class Actor:
+        device = torch.device("cpu")
+
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1, bias=False)
+            torch.nn.init.zeros_(self.model.weight)
+
+        def score_batch(self, sequences):
+            rows = len(sequences)
+            logp = self.model.weight.reshape(1, 1).expand(rows, 1)
+            return logp, torch.zeros_like(logp)
+
+    class Critic(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.value = torch.nn.Parameter(torch.tensor(0.0))
+
+        def forward(self, states):
+            return self.value.expand(len(states))
+
+    actor, critic = Actor(), Critic()
+    trainer = MAPPOTrainer.__new__(MAPPOTrainer)
+    trainer.torch, trainer.actor, trainer.critic = torch, actor, critic
+    trainer.run_dir, trainer.global_step = tmp_path, 0
+    trainer.config = SimpleNamespace(
+        use_vllm_generation=False, ppo_old_logprob_source="local_actor",
+        normalize_advantages=False, ppo_epochs=1, minibatch_size=1,
+        actor_minibatch_mode="role_balanced", clip_epsilon=0.2,
+        entropy_coef=0.0, target_kl=0.02, max_grad_norm=1.0,
+        value_clip_epsilon=0.2, value_loss_coef=0.5,
+        actor_role_weights={
+            "query_retriever": 1.0,
+            "evidence_updater": 0.5,
+            "answer_generator": 1.0,
+        },
+        gradient_diagnostics_steps=1,
+        gradient_diagnostics_max_groups=1,
+        reference_kl_recovery_role_scale=0.25,
+    )
+    trainer.reference_kl_recovery_steps = {
+        AgentRole.QUERY: 0, AgentRole.EVIDENCE: 2, AgentRole.ANSWER: 0,
+    }
+    trainer.actor_optimizer = torch.optim.SGD(actor.model.parameters(), lr=0.1)
+    trainer.critic_optimizer = torch.optim.SGD(critic.parameters(), lr=0.1)
+    transitions = [_transition(role, reward=1.0, value=0.0) for role in AgentRole]
+    for item in transitions:
+        item.old_token_logprobs = torch.tensor([0.0])
+        item.advantage = item.raw_advantage = item.return_ = 1.0
+    stats = trainer._update(transitions)
+    assert stats["policy_updates_applied"] == 1.0
+    assert actor.model.weight.item() > 0.0
+    assert set(stats["role_metrics"]) == {role.value for role in AgentRole}
+    assert all(
+        metrics["optimizer_microbatches"] == 1.0
+        for metrics in stats["role_metrics"].values()
+    )
+    assert stats["role_metrics"]["evidence_updater"]["configured_actor_role_weight"] == 0.5
+    assert stats["role_metrics"]["evidence_updater"]["recovery_role_scale_applied"] == 0.25
+    assert trainer.reference_kl_recovery_steps[AgentRole.EVIDENCE] == 1
+    assert len(stats["gradient_diagnostics"]) == 1
+    assert stats["gradient_diagnostics"][0]["conflict_rate"] == 0.0
+    assert (tmp_path / "gradient_diagnostics.jsonl").is_file()
+
+
 def test_validation_exports_best_actor_and_restores_temperature(tmp_path) -> None:
     class Saver:
         def save_pretrained(self, path, **kwargs):
@@ -645,9 +1238,12 @@ def test_validation_exports_best_actor_and_restores_temperature(tmp_path) -> Non
     assert (tmp_path / "best_actor" / "saved").is_file()
     assert (tmp_path / "best_answer_actor" / "saved").is_file()
     assert (tmp_path / "best_protocol_actor" / "saved").is_file()
-    assert json.loads(
+    exported_contract = json.loads(
         (tmp_path / "best_actor" / "prompt_contract.json").read_text(encoding="utf-8")
-    ) == {"prompt_contract_version": "test"}
+    )
+    assert exported_contract["prompt_contract_version"] == "test"
+    assert exported_contract["evidence_pointer_format"] == "P{local_passage_id}"
+    assert exported_contract["evidence_rationale_in_policy_loss"] is False
     assert (tmp_path / "baseline_validation.json").is_file()
     assert (tmp_path / "best_validation.json").is_file()
     assert (tmp_path / "validation_metrics.jsonl").is_file()
@@ -722,12 +1318,30 @@ def test_protocol_ineligible_validation_cannot_replace_best_actor(tmp_path) -> N
     assert ineligible["improved"] is False
     assert trainer.best_validation_score == 0.25
     assert trainer.best_validation_step == 0
-    assert trainer.bad_validation_count == 1
+    # Protocol eligibility controls exports, while early-stop patience tracks
+    # actual answer-quality stagnation independently.
+    assert ineligible["quality_improved"] is True
+    assert trainer.bad_validation_count == 0
     assert json.loads(
         (tmp_path / "best_validation.json").read_text(encoding="utf-8")
     )["global_step"] == 0
 
+    trainer.collector.invalid = False
     trainer.bad_validation_count = 2
+    early_score = trainer.best_early_stopping_score
+    trainer.global_step = 2
+    emergency = trainer._validate(kind="kl_emergency")
+    assert emergency["affects_early_stopping"] is False
+    assert emergency["early_stopping_improved"] is None
+    assert trainer.bad_validation_count == 2
+    assert trainer.best_early_stopping_score == early_score
+    assert trainer.stopped_early is False
+    trainer.global_step = 3
+    final = trainer._validate(kind="final")
+    assert final["affects_early_stopping"] is False
+    assert trainer.bad_validation_count == 2
+    assert trainer.best_early_stopping_score == early_score
+
     trainer.global_step = 299
     trainer._validate()
     assert trainer.stopped_early is False

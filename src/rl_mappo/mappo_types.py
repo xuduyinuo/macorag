@@ -52,14 +52,24 @@ class MAPPOTransition:
     central_state: dict[str, Any]
     next_central_state: dict[str, Any]
     reference_token_logprobs: Any = None
+    reference_raw_token_logprobs: Any = None
+    token_constraints: list[list[int] | None] | None = None
+    optimization_token_mask: list[bool] | None = None
+    token_segments: list[str] | None = None
+    parsed_action: dict[str, Any] | None = None
+    local_reward: float = 0.0
+    team_reward: float = 0.0
     reward: float = 0.0
     old_value: float = 0.0
     next_value: float = 0.0
     advantage: float = 0.0
+    raw_advantage: float = 0.0
     return_: float = 0.0
     done: bool = False
     valid: bool = True
     parse_error: str | None = None
+    format_recovery: str | None = None
+    tokenization_recovery: str | None = None
     response: str = ""
 
 
@@ -73,4 +83,5 @@ class Episode:
     global_reward: float = 0.0
     answer_f1: float = 0.0
     evidence_coverage: float = 0.0
+    evidence_duplicates_filtered: int = 0
     parse_errors: list[str] = field(default_factory=list)

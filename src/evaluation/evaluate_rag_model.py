@@ -152,6 +152,21 @@ def _build_evaluation_contract(
     payload = {
         "manifest_fingerprint": manifest_fingerprint,
         "prompt_contract_fingerprint": prompt_contract.fingerprint,
+        "evaluation_algorithm": getattr(args, "evaluation_algorithm", "rag_loop"),
+        "mappo_training_config": (
+            {
+                "path": str(getattr(args, "mappo_config_path", "")),
+                "sha256": _sha256_path(Path(args.mappo_config_path)),
+                "prompt_template_version": args._mappo_config.prompt_template_version,
+                "query_max_completion_length": args._mappo_config.max_completion_length,
+                "evidence_max_completion_length": args._mappo_config.evidence_max_completion_length,
+                "answer_max_completion_length": args._mappo_config.answer_max_completion_length,
+                "force_evidence_guided_decoding": args._mappo_config.force_evidence_guided_decoding,
+                "force_final_answer_decoding": args._mappo_config.force_final_answer_decoding,
+            }
+            if getattr(args, "evaluation_algorithm", "rag_loop") == "mappo"
+            else None
+        ),
         "retrieval": {
             "backend": getattr(args, "retrieval_backend", "linear_rag"),
             "root": str(args.retrieval_root),
@@ -490,7 +505,38 @@ def format_prediction(sample: EvalSample, result: Any, error: str | None = None)
     }
     if error is not None:
         prediction["error"] = error
+    elif hasattr(result, "mappo_protocol"):
+        prediction["mappo_protocol"] = dict(result.mappo_protocol)
     return prediction
+
+
+def _evaluation_protocol_metrics(args: Any, predictions: list[dict[str, Any]]) -> dict[str, Any]:
+    if str(getattr(args, "evaluation_algorithm", "rag_loop")) != "mappo":
+        return compute_protocol_metrics([
+            {"trajectory": item.get("trajectory", []), "parse_errors": item.get("parse_errors", [])}
+            for item in predictions
+        ])
+    total = len(predictions)
+    config = args._mappo_config
+    parse_failures = sum(bool(item.get("mappo_protocol", {}).get("parse_failed")) for item in predictions)
+    missing_answers = sum(bool(item.get("mappo_protocol", {}).get("missing_answer_tag")) for item in predictions)
+    compliant = sum(bool(item.get("mappo_protocol", {}).get("final_compliant")) for item in predictions)
+    parse_rate = parse_failures / max(1, total)
+    missing_rate = missing_answers / max(1, total)
+    compliance_rate = compliant / max(1, total)
+    return {
+        "count": total,
+        "parse_failure_rate": parse_rate,
+        "missing_answer_tag_rate": missing_rate,
+        "final_compliance_rate": compliance_rate,
+        "checkpoint_eligible": bool(
+            total
+            and parse_rate <= config.max_protocol_parse_failure_rate
+            and missing_rate <= config.max_validation_missing_answer_tag_rate
+            and compliance_rate >= config.min_validation_final_compliance_rate
+        ),
+        "algorithm": "mappo",
+    }
 
 
 def _is_infrastructure_error(exc: Exception) -> bool:
@@ -543,8 +589,13 @@ def _run_one_prediction(
             policy.set_endpoint_index(index)
         if hasattr(policy, "reset_trace"):
             policy.reset_trace()
-        executor = RAGLoopExecutor(policy=policy, retrieval_env=retrieval_env, max_rounds=args.max_rounds)
-        result = executor.run(question=sample.question, dataset=sample.dataset)
+        if hasattr(policy, "run_evaluation"):
+            result = policy.run_evaluation(sample, retrieval_env)
+        else:
+            executor = RAGLoopExecutor(
+                policy=policy, retrieval_env=retrieval_env, max_rounds=args.max_rounds,
+            )
+            result = executor.run(question=sample.question, dataset=sample.dataset)
         prediction = format_prediction(sample, result)
     except Exception as exc:
         if _is_infrastructure_error(exc):
@@ -662,7 +713,11 @@ def _configure_visible_gpus(args: Any) -> None:
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_indices or "0"
 
 
-def _load_policy(args: Any) -> VLLMOpenAIPolicy:
+def _load_policy(args: Any) -> Any:
+    if str(getattr(args, "evaluation_algorithm", "rag_loop")) == "mappo":
+        from rl_mappo.evaluation import MAPPOAlignedEvaluationPolicy
+
+        return MAPPOAlignedEvaluationPolicy(args=args, config=args._mappo_config)
     transport = str(getattr(args, "vllm_transport", "openai"))
     if transport == "training_server":
         try:
@@ -755,6 +810,11 @@ def _args_to_jsonable(args: Any) -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if str(getattr(args, "evaluation_algorithm", "rag_loop")) == "mappo":
+        from rl_mappo.evaluation import align_evaluation_args, load_aligned_mappo_config
+
+        aligned_config = load_aligned_mappo_config(args.mappo_config_path)
+        align_evaluation_args(args, aligned_config)
     _configure_visible_gpus(args)
     # 固定随机种子保持历史评估顺序和采样行为稳定，配置文件无需暴露该低频参数。
     import random
@@ -813,12 +873,7 @@ def main(argv: list[str] | None = None) -> int:
     for dataset, dataset_samples in _group_samples_by_dataset(samples):
         dataset_dir = _dataset_output_dir(output_dir, dataset)
         predictions = run_predictions(args, dataset_samples, policy, retrieval_env, dataset_dir)
-        protocol_metrics = compute_protocol_metrics(
-            [
-                {"trajectory": item.get("trajectory", []), "parse_errors": item.get("parse_errors", [])}
-                for item in predictions
-            ]
-        )
+        protocol_metrics = _evaluation_protocol_metrics(args, predictions)
         protocol_metrics["error_count"] = sum(bool(item.get("error")) for item in predictions)
         protocol_metrics["error_rate"] = (
             protocol_metrics["error_count"] / len(predictions) if predictions else 0.0
@@ -832,12 +887,7 @@ def main(argv: list[str] | None = None) -> int:
         "datasets": dataset_metrics,
         "num_samples": len(all_predictions),
     }
-    aggregate_protocol = compute_protocol_metrics(
-        [
-            {"trajectory": item.get("trajectory", []), "parse_errors": item.get("parse_errors", [])}
-            for item in all_predictions
-        ]
-    )
+    aggregate_protocol = _evaluation_protocol_metrics(args, all_predictions)
     aggregate_protocol["error_count"] = sum(bool(item.get("error")) for item in all_predictions)
     aggregate_protocol["error_rate"] = (
         aggregate_protocol["error_count"] / len(all_predictions) if all_predictions else 0.0

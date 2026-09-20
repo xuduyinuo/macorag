@@ -38,6 +38,8 @@ from rag import (
     build_evidence_updater_prompt,
     build_query_retriever_prompt,
 )
+from rl_mappo.mappo_types import AgentRole, RAGState as MAPPORAGState
+from rl_mappo.protocol import build_prompt as build_mappo_prompt
 from sft_training.data import (
     TrainingData,
     TrainingSample,
@@ -106,7 +108,7 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
     assert query_record.action_type == "query_retriever"
     assert query_record.agent_role == "query_retriever"
     assert "Are both lakes in the same country?" in query_record.prompt_text
-    assert query_record.prompt_text.startswith("Task: plan the next knowledge-base query.")
+    assert query_record.prompt_text.startswith("Plan the next non-repeated knowledge-base query.")
     assert "You are a retrieval-augmented reasoning assistant" not in query_record.prompt_text
     assert "<state>" in query_record.prompt_text
     assert "state leak" in query_record.prompt_text
@@ -117,15 +119,18 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
     assert "<retrieval>" not in query_record.target_text
     assert "<update-evidence>" not in query_record.target_text
     assert "<answer>" not in query_record.target_text
-    assert '"sub_goal": "find entity"' in query_record.target_text
-    assert '"query": "entity query"' in query_record.target_text
+    assert '"sub_goal":"find entity"' in query_record.target_text
+    assert '"query":"entity query"' in query_record.target_text
     state_before = RAGState(
         question="Are both lakes in the same country?",
         evidence=[{"text": "state leak"}],
     )
-    assert query_record.prompt_text == build_query_retriever_prompt(
-        question=state_before.question,
-        state=state_before,
+    assert query_record.prompt_text == build_mappo_prompt(
+        AgentRole.QUERY, question=state_before.question,
+        state=MAPPORAGState(
+            question=state_before.question, evidence=[{"text": "state leak"}],
+            round_index=0,
+        ), final_round=False,
     )
 
     update_record = records[1]
@@ -144,6 +149,7 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
     assert "<retrieval>" not in update_record.target_text
 
     assert "selected_passage_ids" in update_record.target_text
+    assert '"P0"' in update_record.target_text
     assert "rationale" in update_record.target_text
     assert "evidence leak" not in update_record.target_text
     assert '"evidence"' not in update_record.target_text
@@ -157,10 +163,12 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
     observation = {
         "passages": [{"passage_id": 0, "title": "T", "text": "observation leak", "score": 0.9}]
     }
-    assert update_record.prompt_text == build_evidence_updater_prompt(
-        question=state_before.question,
-        state=updater_state,
-        observation=observation,
+    assert update_record.prompt_text == build_mappo_prompt(
+        AgentRole.EVIDENCE, question=state_before.question,
+        state=MAPPORAGState(
+            question=updater_state.question, sub_goal="find entity",
+            evidence=[{"text": "state leak"}], round_index=0,
+        ), observation=observation, final_round=False,
     )
 
     answer_record = records[2]
@@ -170,7 +178,7 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
     assert "<observation>" not in answer_record.prompt_text
     assert "<update-evidence>" not in answer_record.prompt_text
     assert "observation leak" in answer_record.prompt_text
-    assert answer_record.prompt_text.startswith("Task: answer from accumulated evidence.")
+    assert answer_record.prompt_text.startswith("Answer using only accumulated evidence.")
     assert "You are a retrieval-augmented reasoning assistant" not in answer_record.prompt_text
     assert "<answer>" in answer_record.target_text
     assert "<plan>" not in answer_record.target_text
@@ -182,10 +190,15 @@ def test_trajectory_to_sft_records_splits_query_and_evidence_update_actions() ->
         observation=observation,
         update_action={"selected_passage_ids": [0]},
     )
-    assert answer_record.prompt_text == build_answer_generator_prompt(
-        question=state_before.question,
-        state=answer_state,
-        context=AnswerPromptContext(round_index=0, max_rounds=4),
+    assert answer_record.prompt_text == build_mappo_prompt(
+        AgentRole.ANSWER, question=state_before.question,
+        state=MAPPORAGState(
+            question=answer_state.question,
+            sub_goal=str(answer_state.current_sub_goal or ""),
+            evidence=[dict(item) for item in answer_state.evidence],
+            retrieval_history=[dict(item) for item in answer_state.retrieval_history],
+            round_index=0,
+        ), final_round=False,
     )
     assert answer_record.round_index == 0
     assert answer_record.max_rounds == 4

@@ -157,13 +157,13 @@ def test_agent_prompts_use_dedicated_english_templates() -> None:
         assert not any(term in prompt for term in FORBIDDEN_PROMPT_TERMS)
 
     assert len({prompt.splitlines()[0] for prompt in prompts}) == 3
-    assert prompts[0].startswith("Task: plan the next knowledge-base query.")
-    assert 'Return exactly: <query-retriever>{"sub_goal":"...","query":"..."}</query-retriever>' in prompts[0]
+    assert prompts[0].startswith("Plan the next non-repeated knowledge-base query.")
+    assert '<query-retriever>{"sub_goal":"...","query":"..."}</query-retriever>' in prompts[0]
     assert "<observation>" not in prompts[0]
     assert prompts[1].startswith("Task: select evidence from the latest observation.")
     assert "<observation>" in prompts[1]
     assert "<retrieval>" not in prompts[1]
-    assert prompts[2].startswith("Task: answer from accumulated evidence.")
+    assert prompts[2].startswith("Answer using only accumulated evidence.")
     assert "<observation>" not in prompts[2]
 
 

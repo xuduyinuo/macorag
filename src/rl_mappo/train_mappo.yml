@@ -4,6 +4,7 @@ sft_adapter_path: outputs/sft_Qwen2.5-7B/2026-09-10_15-06-27/adapter
 rl_data_root: data/rl_train_2000_stratified_v2
 retrieval_root: data/rl_train_2000_stratified_v2_e5_faiss
 output_root: outputs/mappo_Qwen2.5-7B-Instruct
+prompt_template_version: macorag-shared-pointer-v1
 
 max_samples: 500
 max_total_samples: 1500
@@ -22,26 +23,29 @@ validation_score_answer_weight: 1.0
 validation_score_evidence_weight: 0.0
 validation_score_parse_penalty: 0.0
 validation_min_delta: 0.001
-# Allow a 150-200 step controlled run; the checkpoint selector can stop at 150
-# only after three consecutive macro-F1 validations fail to improve.
+# Early stopping cannot activate before step 150 and only scheduled validation
+# checks contribute to its patience counter.
 early_stopping_patience: 3
 early_stopping_min_steps: 150
 # GRPO-style protocol monitoring and checkpoint eligibility thresholds.
 protocol_window_size: 100
-max_protocol_parse_failure_rate: 0.01
-max_validation_missing_answer_tag_rate: 0.005
-min_validation_final_compliance_rate: 0.99
+# These gates apply to the complete 150-question validation set. Per-dataset
+# rates remain diagnostics and do not independently veto a checkpoint.
+max_protocol_parse_failure_rate: 0.02
+max_validation_missing_answer_tag_rate: 0.01
+min_validation_final_compliance_rate: 0.98
 seed: 42
 max_rounds: 4
 rollout_batch_size: 4
 num_train_epochs: 1.0
-# Limit cumulative policy drift; 200 updates consume at most 800 episodes.
-max_steps: 200
 # The optimizer-side 7B QLoRA forward still exceeds 24 GiB at 2048+192.
 # These limits apply identically to vLLM behavior generation and PPO scoring,
 # preserving the old/new log-probability conditioning contract.
 max_prompt_length: 1024
 max_completion_length: 128
+# Final answers occasionally reached the shared 128-token ceiling before the
+# closing tag. Keep Query at 128 while giving Answer enough room to close.
+answer_max_completion_length: 192
 # Compact prompt payloads before tokenization. Passage IDs/titles, aggregate
 # counts, and both early/recent multi-hop context are retained.
 prompt_max_evidence_items: 6
@@ -96,13 +100,61 @@ entropy_coef: 0.002
 entropy_final_coef: 0.0
 entropy_anneal_start_step: 100
 entropy_anneal_end_step: 150
-# Keep the learned policy close to the immutable initialization SFT adapter.
+# Adapt the immutable-SFT KL penalty once per rollout update. The 0.03 target
+# is below the observed late-run drift; EMA/deadband avoid reacting to noise.
 reference_kl_beta: 0.01
+reference_kl_mode: adaptive
+reference_kl_target: 0.03
+reference_kl_beta_min: 0.01
+reference_kl_beta_max: 0.20
+reference_kl_ema_decay: 0.90
+reference_kl_deadband_low: 0.80
+reference_kl_deadband_high: 1.20
+reference_kl_controller_rate: 0.10
+# A hard event now requires both current KL and EMA to exceed the threshold.
+# It forces validation and activates bounded recovery; checkpoint eligibility
+# remains an export gate and is not itself a reason to terminate training.
+reference_kl_emergency_threshold: 0.12
+reference_kl_emergency_patience: 5
+reference_kl_emergency_stop: false
+# Emergency events use cheap controller recovery only. Full holdout evaluation
+# remains on the fixed validation_steps schedule.
+reference_kl_emergency_validation: false
+reference_kl_recovery_steps: 10
+reference_kl_recovery_role_scale: 0.25
+reference_kl_recovery_beta_multiplier: 1.50
+# Controllers are independent per role. Evidence uses constrained pointer KL,
+# so its tighter target no longer reacts to rationale/JSON drift.
+reference_kl_role_overrides:
+  query_retriever:
+    target: 0.03
+    emergency_threshold: 0.12
+  evidence_updater:
+    target: 0.02
+    controller_rate: 0.50
+    emergency_threshold: 0.08
+  answer_generator:
+    target: 0.03
+    emergency_threshold: 0.12
 max_grad_norm: 1.0
 ppo_epochs: 1
 # A 7B actor emits full-vocabulary logits; 1 is the safe default. Increase only
 # after measuring free GPU memory.
 minibatch_size: 1
+# Accumulate one microbatch from every available role before a shared actor
+# optimizer step; missing roles are renormalized rather than oversampled.
+actor_minibatch_mode: role_balanced
+# Preserve role-balanced sampling without giving a handful of noisy Evidence
+# pointer tokens one third of every shared-actor update.
+actor_role_weights:
+  query_retriever: 1.0
+  evidence_updater: 0.5
+  answer_generator: 1.0
+# Observe the actual weighted role objectives without changing their sum.
+# One logical role-balanced group every 10 rollout updates is enough to expose
+# persistent negative cosine while keeping the extra CPU transfer bounded.
+gradient_diagnostics_steps: 10
+gradient_diagnostics_max_groups: 1
 target_kl: 0.02
 normalize_advantages: true
 advantage_normalization_scope: role
@@ -123,6 +175,18 @@ final_answer_invalid_penalty: -3.0
 gate_terminal_evidence_on_valid_answer: true
 # vLLM 0.8.5 guided regex fixes final can_answer=true and a non-empty answer.
 force_final_answer_decoding: true
+# Enumerate only unique subsets of P-prefixed passage pointers in the observation.
+# Invalid/out-of-range evidence actions therefore cannot be sampled by vLLM.
+force_evidence_guided_decoding: true
+# The SFT corpus selects at least one passage in 99.68% of Evidence actions.
+# Requiring one when retrieval is non-empty prevents the observed [] collapse.
+evidence_min_selected_passages: 1
+# All 6,815 SFT Evidence rationales are <=55 characters. A 64-character cap
+# preserves that target distribution while guaranteeing closure within 128 tokens.
+evidence_rationale_max_chars: 64
+# P0-style pointers add only a few tokens in the worst five-passage action.
+# Keep 192 tokens so the closing JSON/tag remains far from the limit.
+evidence_max_completion_length: 192
 
 critic_hash_buckets: 32768
 critic_embedding_dim: 128

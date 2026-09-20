@@ -1,24 +1,29 @@
 from __future__ import annotations
 
-import json
 from typing import Any
 
-from prompt_config import load_prompt_contract
-
 from .schema import AnswerPromptContext, RAGState
+from rl_mappo.mappo_types import AgentRole as MAPPOAgentRole, RAGState as MAPPORAGState
+from rl_mappo.protocol import build_prompt
 
 
-def _json_block(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+def _shared_state(state: RAGState, *, round_index: int | None = None) -> MAPPORAGState:
+    return MAPPORAGState(
+        question=state.question,
+        sub_goal=str(state.current_sub_goal or ""),
+        evidence=[dict(item) for item in state.evidence],
+        retrieval_history=[dict(item) for item in state.retrieval_history],
+        round_index=(
+            max(0, int(state.retrieval_count))
+            if round_index is None else int(round_index)
+        ),
+    )
 
 
 def build_query_retriever_prompt(*, question: str, state: RAGState) -> str:
-    return (
-        "Task: plan the next knowledge-base query.\n"
-        "Use only the question and verified facts in <state>. Avoid repeated queries and unsupported intermediate facts.\n"
-        f"Question: {question}\n"
-        f"<state>{_json_block(state.to_dict())}</state>\n"
-        'Return exactly: <query-retriever>{"sub_goal":"...","query":"..."}</query-retriever>'
+    return build_prompt(
+        MAPPOAgentRole.QUERY, question=question, state=_shared_state(state),
+        final_round=False,
     )
 
 
@@ -28,13 +33,9 @@ def build_evidence_updater_prompt(
     state: RAGState,
     observation: dict[str, Any],
 ) -> str:
-    return (
-        "Task: select evidence from the latest observation.\n"
-        "Pick only passage IDs from <observation> that support the question, current sub-goal, or a needed reasoning step.\n"
-        f"Question: {question}\n"
-        f"<state>{_json_block(state.to_dict())}</state>\n"
-        f"<observation>{_json_block(observation)}</observation>\n"
-        'Return exactly: <update-evidence>{"selected_passage_ids":[],"rationale":"..."}</update-evidence>'
+    return build_prompt(
+        MAPPOAgentRole.EVIDENCE, question=question, state=_shared_state(state),
+        observation=observation, final_round=False,
     )
 
 
@@ -48,25 +49,9 @@ def build_answer_generator_prompt(
     if context is not None and force_final_answer is not None:
         raise ValueError("Pass AnswerPromptContext instead of force_final_answer, not both")
     is_final_round = context.is_final_round if context is not None else bool(force_final_answer)
-    instructions = load_prompt_contract().instructions["answer"]
-    decision_rule = (
-        str(instructions["final"] if is_final_round else instructions["normal"]).strip()
-    )
-    output_example = str(
-        instructions["final_output_example"] if is_final_round else instructions["normal_output_example"]
-    ).strip()
-    round_line = ""
-    if context is not None:
-        round_line = (
-            f"Round: {context.round_index + 1}/{context.max_rounds}; "
-            f"remaining retrieval rounds after this answer: {context.remaining_rounds}.\n"
-        )
-    return (
-        "Task: answer from accumulated evidence.\n"
-        "Use selected evidence in <state>.\n"
-        f"{decision_rule}\n"
-        f"{round_line}"
-        f"Question: {question}\n"
-        f"<state>{_json_block(state.to_dict())}</state>\n"
-        f"Return exactly: {output_example}"
+    round_index = context.round_index if context is not None else state.retrieval_count
+    return build_prompt(
+        MAPPOAgentRole.ANSWER, question=question,
+        state=_shared_state(state, round_index=round_index),
+        final_round=is_final_round,
     )

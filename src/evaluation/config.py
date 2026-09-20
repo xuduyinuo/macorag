@@ -21,6 +21,8 @@ DEFAULT_ARG_VALUES: dict[str, Any] = {
     "adapter_identity_path": "",
     "model_path": "",
     "adapter_path": "",
+    "evaluation_algorithm": "rag_loop",
+    "mappo_config_path": "src/rl_mappo/train_mappo.yml",
     "prompt_config_path": "config/prompts.yml",
     # 推理采样。
     "max_samples": None,
@@ -123,6 +125,12 @@ def _build_parser(defaults: dict[str, Any]) -> argparse.ArgumentParser:
         default=defaults["adapter_path"],
         help="LoRA adapter served by vLLM; recorded as evaluation provenance.",
     )
+    parser.add_argument(
+        "--evaluation-algorithm",
+        choices=("rag_loop", "mappo"),
+        default=defaults["evaluation_algorithm"],
+    )
+    parser.add_argument("--mappo-config-path", default=defaults["mappo_config_path"])
     parser.add_argument("--prompt-config-path", default=defaults["prompt_config_path"])
     parser.add_argument("--max-samples", type=int, default=defaults["max_samples"])
     parser.add_argument("--max-rounds", type=int, default=defaults["max_rounds"])

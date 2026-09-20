@@ -95,12 +95,25 @@ def parse_action_text(text: str, role: AgentRole | str) -> ParsedAction:
         if "selected_passage_ids" not in update_evidence:
             raise ValueError("Missing required field: update_evidence.selected_passage_ids")
         selected_ids = update_evidence["selected_passage_ids"]
-        if not isinstance(selected_ids, list) or any(
-            isinstance(item, bool) or not isinstance(item, int) for item in selected_ids
-        ):
+        if not isinstance(selected_ids, list):
             raise ValueError(
-                "update_evidence.selected_passage_ids must be a list of integer passage IDs."
+                "update_evidence.selected_passage_ids must be a list of passage pointers."
             )
+        normalized_ids = []
+        for item in selected_ids:
+            if isinstance(item, bool):
+                raise ValueError("update_evidence.selected_passage_ids contains a boolean.")
+            if isinstance(item, int):
+                normalized_ids.append(item)
+            elif isinstance(item, str) and re.fullmatch(r"P\d+", item):
+                normalized_ids.append(int(item[1:]))
+            else:
+                raise ValueError(
+                    "update_evidence.selected_passage_ids must contain integers or P-prefixed pointers."
+                )
+        if len(normalized_ids) != len(set(normalized_ids)):
+            raise ValueError("update_evidence.selected_passage_ids must not contain duplicates.")
+        update_evidence["selected_passage_ids"] = normalized_ids
         _validate_optional_string(
             update_evidence,
             "rationale",

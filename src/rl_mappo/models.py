@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import itertools
 import re
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,170 @@ FINAL_ANSWER_GUIDED_REGEX = (
     r'<answer>\{"can_answer":true,"answer":"([^"\\]|\\.)+",'
     r'"rationale":"([^"\\]|\\.)*"\}</answer>'
 )
+
+
+def evidence_guided_regex(
+    passage_ids: list[int], *, min_selected: int = 1,
+    rationale_max_chars: int = 64,
+) -> str:
+    """Build a finite grammar for non-degenerate, bounded evidence actions."""
+    ids = sorted(set(int(item) for item in passage_ids))
+    if min_selected < 0:
+        raise ValueError("min_selected must be non-negative")
+    if rationale_max_chars <= 0:
+        raise ValueError("rationale_max_chars must be positive")
+    # An empty observation has no legal ID to select, so retain one defensive
+    # empty action. Normal retrieval observations use the configured minimum.
+    effective_min = min(min_selected, len(ids))
+    selections = [
+        ",".join(f'"P{item}"' for item in chosen)
+        for size in range(effective_min, len(ids) + 1)
+        for chosen in itertools.combinations(ids, size)
+    ]
+    selection_pattern = "(" + "|".join(re.escape(item) for item in selections) + ")"
+    return (
+        r'<update-evidence>\{"selected_passage_ids":\['
+        + selection_pattern
+        + r'\],"rationale":"([^"\\]|\\.){1,'
+        + str(rationale_max_chars)
+        + r'}"\}</update-evidence>'
+    )
+
+
+def evidence_action_layout(
+    tokenizer: Any,
+    *,
+    response: str,
+    action_ids: list[int],
+    passage_ids: list[int],
+    min_selected: int = 1,
+) -> tuple[list[list[int] | None], list[bool], list[str]]:
+    """Describe the Evidence pointer decision in learner-token space.
+
+    vLLM samples Evidence actions under a finite grammar.  The returned trie
+    constraints let both policy and reference scorers normalize over the same
+    legal next-token set.  Only genuine pointer-choice positions are optimized;
+    fixed JSON and free-form rationale tokens stay diagnostic-only.
+    """
+    ids = sorted(set(int(item) for item in passage_ids))
+    effective_min = min(max(0, int(min_selected)), len(ids))
+    choices = [
+        chosen
+        for size in range(effective_min, len(ids) + 1)
+        for chosen in itertools.combinations(ids, size)
+    ]
+    selection_match = re.search(
+        r'"selected_passage_ids":(\[(?:"P\d+"(?:,"P\d+")*)?\])(?=,"rationale":")',
+        response,
+    )
+    if selection_match is None:
+        raise ValueError("Evidence response is missing its canonical pointer span")
+
+    # Tokenizing a partial JSON header is not safe for BPE tokenizers: the last
+    # header token can merge with the first rationale character.  Construct the
+    # legal alternatives in the context of the *complete* sampled response so
+    # their tokenization has exactly the same left and right boundaries as the
+    # action scored by PPO.
+    candidate_responses = [
+        response[:selection_match.start(1)]
+        + "["
+        + ",".join(f'"P{item}"' for item in chosen)
+        + "]"
+        + response[selection_match.end(1):]
+        for chosen in choices
+    ]
+    encoded = [
+        list(tokenizer.encode(item, add_special_tokens=False))
+        for item in candidate_responses
+    ]
+    chosen_index = next(
+        (index for index, item in enumerate(candidate_responses) if item == response),
+        None,
+    )
+    if chosen_index is None:
+        raise ValueError("Generated Evidence pointer is outside the legal selection set")
+
+    chosen_tokens = encoded[chosen_index]
+    token_prefix_matches = action_ids[:len(chosen_tokens)] == chosen_tokens
+    trailing_ids = action_ids[len(chosen_tokens):] if token_prefix_matches else []
+    special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    trailing_is_special = not trailing_ids or (
+        bool(special_ids) and all(item in special_ids for item in trailing_ids)
+    )
+    if not token_prefix_matches or not trailing_is_special:
+        raise ValueError(
+            "Evidence response/action token mismatch while building constrained KL layout"
+        )
+
+    constraints: list[list[int] | None] = [None] * len(action_ids)
+    optimize: list[bool] = [False] * len(action_ids)
+    active = list(encoded)
+    for position, actual in enumerate(chosen_tokens):
+        active = [item for item in active if item[:position] == chosen_tokens[:position]]
+        allowed = sorted({item[position] for item in active if len(item) > position})
+        if actual not in allowed:
+            raise ValueError("Generated Evidence token is outside the legal pointer trie")
+        constraints[position] = allowed
+        optimize[position] = len(allowed) > 1
+        # Once only one complete legal response remains, the pointer decision
+        # is resolved.  Do not constrain or optimize its rationale/suffix.
+        active = [
+            item for item in active
+            if len(item) > position and item[position] == actual
+        ]
+        if len(active) == 1:
+            break
+
+    segments = ["format"] * len(action_ids)
+    try:
+        tokenized = tokenizer(
+            response, add_special_tokens=False, return_offsets_mapping=True,
+        )
+        tokenized_ids = list(tokenized["input_ids"])
+        if action_ids[:len(tokenized_ids)] == tokenized_ids:
+            offsets = list(tokenized["offset_mapping"])
+            rationale_match = re.search(r'"rationale":"((?:[^"\\]|\\.)*)"', response)
+            spans = []
+            if selection_match:
+                spans.append(("selection", selection_match.start(1), selection_match.end(1)))
+            if rationale_match:
+                spans.append(("rationale", rationale_match.start(1), rationale_match.end(1)))
+            for index, (start, end) in enumerate(offsets):
+                for name, span_start, span_end in spans:
+                    if start < span_end and end > span_start:
+                        segments[index] = name
+                        break
+    except (TypeError, KeyError, NotImplementedError):
+        # Slow/custom tokenizers may not expose offsets. Pointer optimization
+        # remains exact; only the optional diagnostic split falls back.
+        pass
+    return constraints, optimize, segments
+
+
+def evidence_completion_budget(
+    tokenizer: Any, *, passage_ids: list[int], rationale_max_chars: int,
+    max_completion_length: int,
+) -> dict[str, int]:
+    """Measure adversarial valid Evidence actions against the token budget."""
+    selected = ",".join(f'"P{item}"' for item in sorted(set(passage_ids)))
+    wrapper = '<update-evidence>{"selected_passage_ids":[' + selected + '],"rationale":"'
+    suffix = '"}</update-evidence>'
+    candidates = {
+        "ascii": "x" * rationale_max_chars,
+        "unicode": "证" * rationale_max_chars,
+        "escaped": "\\n" * rationale_max_chars,
+    }
+    counts = {
+        name: len(tokenizer.encode(wrapper + rationale + suffix, add_special_tokens=False))
+        for name, rationale in candidates.items()
+    }
+    required = max(counts.values(), default=0)
+    if required > max_completion_length:
+        raise ValueError(
+            "Evidence completion token budget is too small: "
+            f"requires at least {required}, configured {max_completion_length}"
+        )
+    return {**counts, "required": required, "available": int(max_completion_length)}
 
 
 class CentralizedCritic:
@@ -141,8 +306,13 @@ class RoleConditionedActor:
         head_length = min(max(1, self.max_prompt_length // 4), head_length)
         return [*ids[:head_length], *ids[-(self.max_prompt_length - head_length):]]
 
-    def generate(self, role: AgentRole, prompt: str) -> tuple[str, list[int], list[int], Any]:
+    def generate(
+        self, role: AgentRole, prompt: str, *, guided_regex: str | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, list[int], list[int], Any]:
         import torch
+        if guided_regex is not None:
+            raise RuntimeError("guided decoding requires the configured vLLM generator")
         prompt_ids = self.encode_prompt(role, prompt)
         inputs = torch.tensor([prompt_ids], dtype=torch.long, device=self.device)
         attention = torch.ones_like(inputs)
@@ -153,7 +323,7 @@ class RoleConditionedActor:
                 output = self.model.generate(
                     input_ids=inputs,
                     attention_mask=attention,
-                    max_new_tokens=self.max_completion_length,
+                    max_new_tokens=max_tokens or self.max_completion_length,
                     do_sample=self.temperature > 0,
                     temperature=self.temperature if self.temperature > 0 else None,
                     top_p=self.top_p if self.temperature > 0 else None,
@@ -172,7 +342,13 @@ class RoleConditionedActor:
         response = self.tokenizer.decode(action_ids, skip_special_tokens=True)
         return response, prompt_ids, action_ids, old_logprobs[0].detach().cpu()
 
-    def score_batch(self, sequences: list[tuple[list[int], list[int]]]) -> tuple[Any, Any]:
+    def _score_batch(
+        self,
+        sequences: list[tuple[list[int], list[int]]],
+        *,
+        token_constraints: list[list[list[int] | None] | None] | None = None,
+        return_raw: bool = False,
+    ) -> Any:
         """Return completion token log-probabilities and token entropies."""
         import torch
         if not sequences:
@@ -180,11 +356,12 @@ class RoleConditionedActor:
         pad_id = int(self.tokenizer.pad_token_id)
         max_action = max(len(action) for _, action in sequences)
         rows_logp: list[Any] = []
+        rows_raw_logp: list[Any] = []
         rows_entropy: list[Any] = []
         # Score separately to keep the 7B actor's full-vocabulary logits within
         # the same memory envelope as generation. MAPPO minibatches default to
         # one; larger values trade speed for activation memory.
-        for prompt, action in sequences:
+        for row, (prompt, action) in enumerate(sequences):
             full = prompt + action
             input_ids = torch.tensor([full], dtype=torch.long, device=self.device)
             forward_kwargs = {
@@ -201,31 +378,82 @@ class RoleConditionedActor:
             start = 0 if self._supports_logits_to_keep else len(prompt) - 1
             completion_logits = outputs.logits[0, start:start + len(action)].float()
             targets = torch.tensor(action, dtype=torch.long, device=self.device)
-            log_partition = torch.logsumexp(completion_logits, dim=-1)
+            raw_log_partition = torch.logsumexp(completion_logits, dim=-1)
             chosen = completion_logits.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-            token_logp = chosen - log_partition
+            raw_token_logp = chosen - raw_log_partition
+            token_logp = raw_token_logp.clone()
             probabilities = torch.softmax(completion_logits, dim=-1)
-            token_entropy = log_partition - (probabilities * completion_logits).sum(-1)
+            token_entropy = raw_log_partition - (probabilities * completion_logits).sum(-1)
+            row_constraints = token_constraints[row] if token_constraints is not None else None
+            if row_constraints is not None:
+                if len(row_constraints) != len(action):
+                    raise ValueError("token constraint length must equal action length")
+                for position, allowed in enumerate(row_constraints):
+                    if allowed is None:
+                        continue
+                    allowed_ids = torch.tensor(allowed, dtype=torch.long, device=self.device)
+                    if int(targets[position]) not in allowed:
+                        raise ValueError("target token is outside its constrained vocabulary")
+                    legal_logits = completion_logits[position].index_select(0, allowed_ids)
+                    legal_partition = torch.logsumexp(legal_logits, dim=-1)
+                    token_logp[position] = completion_logits[position, targets[position]] - legal_partition
+                    legal_probabilities = torch.softmax(legal_logits, dim=-1)
+                    token_entropy[position] = legal_partition - (
+                        legal_probabilities * legal_logits
+                    ).sum()
             padding = max_action - len(action)
             rows_logp.append(torch.nn.functional.pad(token_logp, (0, padding)))
+            rows_raw_logp.append(torch.nn.functional.pad(raw_token_logp, (0, padding)))
             rows_entropy.append(torch.nn.functional.pad(token_entropy, (0, padding)))
-        return torch.stack(rows_logp), torch.stack(rows_entropy)
+        result = torch.stack(rows_logp), torch.stack(rows_entropy)
+        if return_raw:
+            return *result, torch.stack(rows_raw_logp)
+        return result
 
-    def score_batch_no_grad(self, sequences: list[tuple[list[int], list[int]]]) -> tuple[Any, Any]:
+    def score_batch(
+        self, sequences: list[tuple[list[int], list[int]]],
+        *, token_constraints: list[list[list[int] | None] | None] | None = None,
+    ) -> tuple[Any, Any]:
+        return self._score_batch(sequences, token_constraints=token_constraints)
+
+    def score_batch_detailed(
+        self, sequences: list[tuple[list[int], list[int]]],
+        *, token_constraints: list[list[list[int] | None] | None] | None = None,
+    ) -> tuple[Any, Any, Any]:
+        return self._score_batch(
+            sequences, token_constraints=token_constraints, return_raw=True,
+        )
+
+    def score_batch_no_grad(
+        self, sequences: list[tuple[list[int], list[int]]], *,
+        token_constraints: list[list[list[int] | None] | None] | None = None,
+    ) -> tuple[Any, Any]:
         """Score a fixed policy snapshot deterministically without retaining activations."""
         import torch
         was_training = self.model.training
         self.model.eval()
         try:
             with torch.no_grad():
-                logprobs, entropy = self.score_batch(sequences)
+                logprobs, entropy = self.score_batch(
+                    sequences, token_constraints=token_constraints,
+                )
         finally:
             self.model.train(was_training)
         return logprobs.detach(), entropy.detach()
 
+    def rescore_response(
+        self, prompt_ids: list[int], response: str,
+    ) -> tuple[list[int], Any]:
+        """Retokenize a conservatively repaired action on the learner path."""
+        action_ids = list(self.tokenizer.encode(response, add_special_tokens=False))
+        logprobs, _ = self.score_batch_no_grad([(prompt_ids, action_ids)])
+        return action_ids, logprobs[0, :len(action_ids)].detach().cpu()
+
     def score_reference_batch_no_grad(
-        self, sequences: list[tuple[list[int], list[int]]]
-    ) -> tuple[Any, Any]:
+        self, sequences: list[tuple[list[int], list[int]]], *,
+        token_constraints: list[list[list[int] | None] | None] | None = None,
+        return_raw: bool = False,
+    ) -> Any:
         """Score fixed actions with the frozen initial SFT adapter."""
         if not self.policy_adapter_name or not self.reference_adapter_name:
             raise RuntimeError("SFT reference adapter is not configured")
@@ -235,7 +463,10 @@ class RoleConditionedActor:
         try:
             self.model.set_adapter(self.reference_adapter_name)
             with torch.no_grad():
-                logprobs, entropy = self.score_batch(sequences)
+                result = self._score_batch(
+                    sequences, token_constraints=token_constraints,
+                    return_raw=return_raw,
+                )
         finally:
             self.model.set_adapter(self.policy_adapter_name)
             # PEFT set_adapter() toggles trainability. Keep the fixed reference
@@ -244,7 +475,7 @@ class RoleConditionedActor:
                 if f".{self.reference_adapter_name}." in name:
                     parameter.requires_grad_(False)
             self.model.train(was_training)
-        return logprobs.detach(), entropy.detach()
+        return tuple(item.detach() for item in result)
 
 
 class VLLMRoleConditionedActor(RoleConditionedActor):
@@ -262,24 +493,30 @@ class VLLMRoleConditionedActor(RoleConditionedActor):
         self.generation_seed = int(generation_seed)
         self.generation_counter = 0
 
-    def generate(self, role: AgentRole, prompt: str) -> tuple[str, list[int], list[int], Any]:
+    def generate(
+        self, role: AgentRole, prompt: str, *, guided_regex: str | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, list[int], list[int], Any]:
         import torch
         prompt_ids = self.encode_prompt(role, prompt)
         seed = self.generation_seed + self.generation_counter
         self.generation_counter += 1
         output = self.vllm_client.generate(
             prompt_ids,
-            max_tokens=self.max_completion_length,
+            max_tokens=max_tokens or self.max_completion_length,
             temperature=self.temperature,
             top_p=self.top_p,
             top_k=self.top_k,
             seed=seed,
             guided_regex=(
-                FINAL_ANSWER_GUIDED_REGEX
-                if getattr(self, "force_final_answer_decoding", False)
-                and role is AgentRole.ANSWER
-                and "This is the final round." in prompt
-                else None
+                guided_regex
+                or (
+                    FINAL_ANSWER_GUIDED_REGEX
+                    if getattr(self, "force_final_answer_decoding", False)
+                    and role is AgentRole.ANSWER
+                    and "This is the final round." in prompt
+                    else None
+                )
             ),
         )
         response = output.text or self.tokenizer.decode(output.token_ids, skip_special_tokens=True)
@@ -377,5 +614,8 @@ def load_actor(config: Any, device: Any, *, vllm_client: Any | None = None) -> R
         actor.reference_adapter_name = reference_adapter_name
     actor.force_final_answer_decoding = bool(getattr(
         config, "force_final_answer_decoding", False,
+    ))
+    actor.force_evidence_guided_decoding = bool(getattr(
+        config, "force_evidence_guided_decoding", False,
     ))
     return actor

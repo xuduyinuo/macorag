@@ -45,9 +45,21 @@ def main(argv: list[str] | None = None) -> int:
         "adapter_path": str(adapter), "retrieval_backend": config.retrieval_backend,
         "actor_load_4bit": config.load_4bit,
         "ppo_old_logprob_source": config.ppo_old_logprob_source,
-        "max_steps": config.max_steps,
+        "completion_budgets": {
+            "default": config.max_completion_length,
+            "answer": config.answer_max_completion_length,
+            "evidence": config.evidence_max_completion_length,
+        },
+        "actor_role_weights": config.actor_role_weights,
         "musique_rare_hop_oversample_factor": config.musique_rare_hop_oversample_factor,
         "reference_kl_beta": config.reference_kl_beta,
+        "reference_kl_recovery": {
+            "steps": config.reference_kl_recovery_steps,
+            "role_scale": config.reference_kl_recovery_role_scale,
+            "beta_multiplier": config.reference_kl_recovery_beta_multiplier,
+            "emergency_stop": config.reference_kl_emergency_stop,
+            "emergency_validation": config.reference_kl_emergency_validation,
+        },
         "entropy_schedule": {
             "initial": config.entropy_coef,
             "final": config.entropy_final_coef,
@@ -56,6 +68,12 @@ def main(argv: list[str] | None = None) -> int:
         },
         "force_final_answer_decoding": config.force_final_answer_decoding,
         "checkpoint_selection": "protocol-gated macro_answer_f1",
+        "early_stopping": {
+            "scope": "scheduled_validation_only",
+            "validation_steps": config.validation_steps,
+            "patience": config.early_stopping_patience,
+            "min_steps": config.early_stopping_min_steps,
+        },
         "generation_backend": "vllm" if config.use_vllm_generation else "huggingface",
         "vllm_url": f"http://{config.vllm_host}:{config.vllm_port}" if config.use_vllm_generation else None,
     }
@@ -94,6 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         device=device,
     )
     collector = RolloutCollector(actor=actor, critic=critic, retrieval=retrieval, config=config)
+    report["evidence_completion_budget"] = collector.evidence_completion_budget
     (run_dir / "run_config.json").write_text(
         json.dumps(config.to_dict(), ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
