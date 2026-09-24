@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import random
 import time
 from datetime import datetime
@@ -9,7 +10,8 @@ from pathlib import Path
 
 from .config import parse_args
 from .data import (
-    shuffled_training_samples, split_manifest, stratified_validation_samples,
+    evenly_spaced_steps, shuffled_training_samples, split_manifest,
+    stratified_epoch_order, stratified_validation_samples,
 )
 from .models import CentralizedCritic, load_actor
 from .retrieval import RetrievalEnvironment
@@ -28,6 +30,10 @@ def main(argv: list[str] | None = None) -> int:
         config.validation_file,
         seed=config.seed,
         limit=config.validation_max_samples,
+    )
+    epoch_zero_order = stratified_epoch_order(
+        samples, seed=config.seed, epoch=0,
+        batch_size=config.rollout_batch_size,
     )
     loaded_samples = [*samples, *validation_samples]
     retrieval = RetrievalEnvironment(
@@ -77,9 +83,36 @@ def main(argv: list[str] | None = None) -> int:
             "evidence": config.evidence_max_completion_length,
         },
         "actor_role_weights": config.actor_role_weights,
+        "optimizer": {
+            "actor_learning_rate": config.actor_learning_rate,
+            "critic_learning_rate": config.critic_learning_rate,
+            "ppo_epochs": config.ppo_epochs,
+            "minibatch_size": config.minibatch_size,
+            "gradient_accumulation_steps": config.gradient_accumulation_steps,
+            "target_kl": config.target_kl,
+        },
+        "reward_mode": (
+            "local_plus_outcome" if config.local_reward_enabled else "outcome_only"
+        ),
+        "local_reward_enabled": config.local_reward_enabled,
+        "reward_contract": {
+            "eta_query": config.eta_query,
+            "eta_evidence": config.eta_evidence,
+            "evidence_duplicate_penalty": config.evidence_duplicate_penalty,
+            "omega_answer": config.omega_answer,
+            "omega_evidence": config.omega_evidence,
+            "answer_local_reward_weight": config.answer_local_reward_weight,
+            "non_final_wait_reward": config.non_final_wait_reward,
+            "final_answer_bonus": config.final_answer_bonus,
+        },
         "train_file": str(Path(config.train_file).resolve()),
         "validation_file": str(Path(config.validation_file).resolve()),
         "training_shuffle": {"enabled": True, "seed": config.seed, "before_limit": True},
+        "training_batching": {
+            "mode": "dataset_stratified_proportional",
+            "batch_size": config.rollout_batch_size,
+            "lossless": True,
+        },
         "parallel_rollouts": {
             "train_workers": config.train_rollout_workers,
             "validation_workers": config.validation_rollout_workers,
@@ -106,10 +139,27 @@ def main(argv: list[str] | None = None) -> int:
             "end_step": config.entropy_anneal_end_step,
         },
         "force_final_answer_decoding": config.force_final_answer_decoding,
-        "checkpoint_selection": "protocol-gated macro_answer_f1",
+        "checkpoint_selection": {
+            "gate": "protocol_eligible",
+            "objective": (
+                "macro_answer_f1 + macro_evidence_coverage + "
+                "macro_format_compliance"
+            ),
+            "weights": {
+                "answer_f1": config.validation_score_answer_weight,
+                "evidence_coverage": config.validation_score_evidence_weight,
+                "format_compliance": config.validation_score_format_weight,
+            },
+        },
         "early_stopping": {
+            "enabled": config.early_stopping_patience > 0,
             "scope": "scheduled_validation_only",
             "validation_steps": config.validation_steps,
+            "validation_checks_per_epoch": config.validation_checks_per_epoch,
+            "scheduled_steps": evenly_spaced_steps(
+                math.ceil(len(samples) / config.rollout_batch_size),
+                config.validation_checks_per_epoch,
+            ),
             "patience": config.early_stopping_patience,
             "min_steps": config.early_stopping_min_steps,
         },
@@ -177,6 +227,9 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps({
             "shuffle": {"enabled": True, "seed": config.seed, "before_limit": True},
             "train": split_manifest(samples, config.train_file),
+            "epoch_0_stratified_order_ids": [
+                item.qid for item in epoch_zero_order
+            ],
             "validation": split_manifest(validation_samples, config.validation_file),
         }, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",

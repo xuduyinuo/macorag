@@ -68,6 +68,9 @@ class RolloutCollector:
     def _add_timing(episode: Episode, name: str, seconds: float) -> None:
         episode.timing[name] = episode.timing.get(name, 0.0) + float(seconds)
 
+    def _local_rewards_enabled(self) -> bool:
+        return bool(getattr(self.config, "local_reward_enabled", True))
+
     def _act(self, episode: Episode, role: AgentRole, state: RAGState, *, observation: dict[str, Any] | None, final_round: bool) -> tuple[dict[str, Any] | None, MAPPOTransition]:
         prompt = build_prompt(
             role, question=state.question, state=state,
@@ -231,9 +234,13 @@ class RolloutCollector:
             transition.token_constraints = constraints
             transition.optimization_token_mask = optimize
             transition.token_segments = segments
+        local_rewards_enabled = self._local_rewards_enabled()
         if parsed is not None:
             transition.parsed_action = parsed
-            transition.reward = float(getattr(self.config, "format_reward_weight", 0.0))
+            if local_rewards_enabled:
+                transition.reward = float(getattr(
+                    self.config, "format_reward_weight", 0.0,
+                ))
         else:
             transition.valid = False
             if failure is None:
@@ -244,10 +251,11 @@ class RolloutCollector:
                 if role is AgentRole.ANSWER and final_round
                 else "invalid_action_penalty"
             )
-            transition.reward = float(getattr(
-                self.config, penalty_name,
-                getattr(self.config, "invalid_action_penalty", -1.0),
-            ))
+            if local_rewards_enabled:
+                transition.reward = float(getattr(
+                    self.config, penalty_name,
+                    getattr(self.config, "invalid_action_penalty", -1.0),
+                ))
             episode.parse_errors.append(str(failure))
         episode.transitions.append(transition)
         return parsed, transition
@@ -270,7 +278,11 @@ class RolloutCollector:
             )
             episode.timing["retrieval_calls"] = episode.timing.get("retrieval_calls", 0.0) + 1.0
             retrieved = list(observation["passages"])
-            query_transition.reward += query_reward(retrieved, previous_retrieved, sample.supporting_facts, self.config.eta_query)
+            if self._local_rewards_enabled():
+                query_transition.reward += query_reward(
+                    retrieved, previous_retrieved,
+                    sample.supporting_facts, self.config.eta_query,
+                )
             previous_retrieved.extend(retrieved)
 
             updater_state = RAGState(
@@ -295,9 +307,16 @@ class RolloutCollector:
                 len(requested_ids) == len(set(requested_ids))
                 and len(selected) == len(requested_ids)
             )
-            if ids_valid:
-                evidence_transition.reward += evidence_reward(retrieved, selected, sample.supporting_facts, self.config.eta_evidence)
-            else:
+            if ids_valid and self._local_rewards_enabled():
+                evidence_transition.reward += evidence_reward(
+                    retrieved, selected, sample.supporting_facts,
+                    self.config.eta_evidence,
+                    previous=state.evidence,
+                    duplicate_eta=float(getattr(
+                        self.config, "evidence_duplicate_penalty", 0.2,
+                    )),
+                )
+            elif not ids_valid and self._local_rewards_enabled():
                 evidence_transition.reward = float(getattr(self.config, "invalid_action_penalty", -1.0))
             evidence_transition.valid = ids_valid
             next_state = RAGState(
@@ -315,12 +334,20 @@ class RolloutCollector:
             answer_action, answer_transition = self._act(episode, AgentRole.ANSWER, next_state, observation=None, final_round=final_round)
             if answer_action is None:
                 break
-            answer_transition.reward += self.config.answer_local_reward_weight * answer_decision_reward(
-                answer_action["can_answer"], next_state.evidence, sample.supporting_facts,
-                final_round=final_round,
-                non_final_wait_reward=float(getattr(self.config, "non_final_wait_reward", 0.2)),
-                final_answer_bonus=float(getattr(self.config, "final_answer_bonus", 1.0)),
-            )
+            if self._local_rewards_enabled():
+                answer_transition.reward += (
+                    self.config.answer_local_reward_weight
+                    * answer_decision_reward(
+                        answer_action["can_answer"], next_state.evidence,
+                        sample.supporting_facts, final_round=final_round,
+                        non_final_wait_reward=float(getattr(
+                            self.config, "non_final_wait_reward", 0.2,
+                        )),
+                        final_answer_bonus=float(getattr(
+                            self.config, "final_answer_bonus", 1.0,
+                        )),
+                    )
+                )
             episode.trajectory.append({
                 "round": round_index, "query_retriever": query_action,
                 "observation": observation, "update_evidence": evidence_action,

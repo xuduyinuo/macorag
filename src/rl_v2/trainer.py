@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .checkpoint import prune_checkpoints, restore_checkpoint, save_actor_export, save_checkpoint
-from .data import epoch_order, sample_stratum
+from .data import evenly_spaced_steps, sample_stratum, stratified_epoch_order
 from .mappo import (
     AdaptiveReferenceKLController,
     clipped_value_loss,
@@ -153,6 +153,13 @@ class MAPPOTrainer:
             restored_best_observed = restored.get("best_observed_validation_score")
             if restored_best_observed is not None:
                 self.best_observed_validation_score = float(restored_best_observed)
+            restored_best = restored.get("best_validation_score")
+            if restored_best is not None:
+                self.best_validation_score = float(restored_best)
+                self.best_validation_step = int(restored["best_validation_step"])
+            restored_baseline = restored.get("baseline_validation_score")
+            if restored_baseline is not None:
+                self.baseline_validation_score = float(restored_baseline)
             restored_early_score = restored.get("best_early_stopping_score")
             if restored_early_score is not None:
                 self.best_early_stopping_score = float(restored_early_score)
@@ -264,6 +271,41 @@ class MAPPOTrainer:
         }
 
     @staticmethod
+    def _validation_selection_score(
+        quality_by_dataset: dict[str, dict[str, float]],
+        protocol: dict[str, Any],
+        config: Any,
+    ) -> dict[str, float]:
+        """Compute the equal-dataset checkpoint-selection objective."""
+        dataset_quality = list(quality_by_dataset.values())
+        dataset_protocol = list(
+            protocol.get("protocol_by_dataset", {}).values()
+        ) or [protocol]
+        answer_f1 = sum(
+            item["answer_f1_mean"] for item in dataset_quality
+        ) / len(dataset_quality)
+        evidence_coverage = sum(
+            item["evidence_coverage_mean"] for item in dataset_quality
+        ) / len(dataset_quality)
+        format_compliance = sum(
+            item["final_compliance_rate"] for item in dataset_protocol
+        ) / len(dataset_protocol)
+        parse_penalty = float(protocol["parse_failure_rate"])
+        score = (
+            float(config.validation_score_answer_weight) * answer_f1
+            + float(config.validation_score_evidence_weight) * evidence_coverage
+            + float(config.validation_score_format_weight) * format_compliance
+            - float(config.validation_score_parse_penalty) * parse_penalty
+        )
+        return {
+            "answer_f1_macro": answer_f1,
+            "evidence_coverage_macro": evidence_coverage,
+            "format_compliance_macro": format_compliance,
+            "parse_failure_penalty": parse_penalty,
+            "validation_score": score,
+        }
+
+    @staticmethod
     def _protocol_rank(protocol: dict[str, Any], answer_f1: float) -> tuple[float, ...]:
         rows = list(protocol.get("protocol_by_dataset", {}).values()) or [protocol]
         return (
@@ -280,7 +322,11 @@ class MAPPOTrainer:
         if kind not in {"baseline", "scheduled", "kl_emergency", "final"}:
             raise ValueError(f"Unknown validation kind: {kind}")
         validation_kind = "baseline" if self.global_step == 0 else kind
-        affects_early_stopping = validation_kind in {"baseline", "scheduled"}
+        early_stopping_enabled = self.config.early_stopping_patience > 0
+        affects_early_stopping = bool(
+            early_stopping_enabled
+            and validation_kind in {"baseline", "scheduled"}
+        )
         from tqdm.auto import tqdm
 
         validation_started = time.perf_counter()
@@ -328,11 +374,11 @@ class MAPPOTrainer:
         f1 = sum(item.answer_f1 for item in episodes) / count
         coverage = sum(item.evidence_coverage for item in episodes) / count
         # Equal-weight datasets prevent the easiest/largest validation subset
-        # from dominating checkpoint selection. Evidence remains diagnostic;
-        # protocol metrics are hard gates rather than additive score terms.
-        score = sum(
-            item["answer_f1_mean"] for item in quality_by_dataset.values()
-        ) / len(quality_by_dataset)
+        # from dominating any component of checkpoint selection.
+        selection = self._validation_selection_score(
+            quality_by_dataset, protocol, self.config,
+        )
+        score = selection["validation_score"]
         previous_best_observed = float(getattr(
             self, "best_observed_validation_score", -math.inf,
         ))
@@ -345,7 +391,10 @@ class MAPPOTrainer:
             self, "best_early_stopping_score", -math.inf,
         ))
         early_stopping_improved: bool | None = None
-        if validation_kind == "baseline":
+        if not early_stopping_enabled:
+            early_stopping_improved = None
+            self.bad_validation_count = 0
+        elif validation_kind == "baseline":
             self.best_early_stopping_score = score
             self.bad_validation_count = 0
             early_stopping_improved = True
@@ -399,18 +448,31 @@ class MAPPOTrainer:
             },
             "retrieval_batch_stats": self.collector.retrieval.batch_stats(),
             "validation_kind": validation_kind,
+            "early_stopping_enabled": early_stopping_enabled,
             "affects_early_stopping": affects_early_stopping,
             "early_stopping_improved": early_stopping_improved,
-            "best_early_stopping_score": self.best_early_stopping_score,
+            "best_early_stopping_score": (
+                self.best_early_stopping_score
+                if math.isfinite(self.best_early_stopping_score) else None
+            ),
             "reward_mean": reward, "answer_f1_mean": f1,
-            "answer_f1_macro": score,
+            "answer_f1_macro": selection["answer_f1_macro"],
             "evidence_coverage_mean": coverage,
+            "evidence_coverage_macro": selection["evidence_coverage_macro"],
+            "format_compliance_macro": selection["format_compliance_macro"],
+            "validation_score_components": {
+                "answer_f1": selection["answer_f1_macro"],
+                "evidence_coverage": selection["evidence_coverage_macro"],
+                "format_compliance": selection["format_compliance_macro"],
+                "parse_failure_penalty": selection["parse_failure_penalty"],
+            },
             "quality_by_dataset": quality_by_dataset,
             "quality_by_stratum": self._quality_by_stratum(
                 episodes, self.validation_samples,
             ),
-            "validation_score": score, "answer_selection_score": score,
-            "improved": improved, "answer_improved": improved,
+            "validation_score": score,
+            "answer_selection_score": selection["answer_f1_macro"],
+            "improved": improved, "answer_improved": None,
             "protocol_improved": protocol_improved,
             "score_improved": score_improved,
             "quality_improved": quality_improved,
@@ -420,6 +482,17 @@ class MAPPOTrainer:
                 if math.isfinite(self.best_validation_score) else None
             ),
             "best_validation_step": self.best_validation_step,
+            "best_checkpoint": (
+                str(self.run_dir / f"checkpoint-{self.best_validation_step}")
+                if (
+                    self.best_validation_step > 0
+                    and (
+                        self.run_dir
+                        / f"checkpoint-{self.best_validation_step}"
+                        / "COMPLETE"
+                    ).is_file()
+                ) else None
+            ),
             "bad_validation_count": self.bad_validation_count,
             **protocol,
         }
@@ -432,11 +505,15 @@ class MAPPOTrainer:
             )
         if improved:
             save_actor_export(
+                self.run_dir / "best_composite_actor", actor=self.actor,
+                metadata=result, config=self.config,
+            )
+            save_actor_export(
                 self.run_dir / "best_answer_actor", actor=self.actor, metadata=result,
                 config=self.config,
             )
             # Compatibility alias for existing evaluation launchers. It now
-            # always means the protocol-eligible best macro answer-F1 actor.
+            # means the protocol-eligible best composite-score actor.
             save_actor_export(
                 self.run_dir / "best_actor", actor=self.actor, metadata=result,
                 config=self.config,
@@ -456,7 +533,8 @@ class MAPPOTrainer:
             )
         self.last_validation_step = self.global_step
         if (
-            validation_kind == "scheduled"
+            early_stopping_enabled
+            and validation_kind == "scheduled"
             and self.config.early_stopping_patience > 0
             and self.bad_validation_count >= self.config.early_stopping_patience
             and self.global_step >= int(
@@ -819,176 +897,209 @@ class MAPPOTrainer:
         if not hasattr(self, "reference_kl_recovery_steps"):
             self.reference_kl_recovery_steps = {role: 0 for role in AgentRole}
         recovery_steps_applied = dict(self.reference_kl_recovery_steps)
+        accumulation_steps = int(getattr(
+            self.config, "gradient_accumulation_steps", 1,
+        ))
+        logical_groups_applied = 0
         for _ in range(self.config.ppo_epochs):
-            for logical_group_index, microbatches in enumerate(
-                self._actor_minibatch_groups(transitions)
-            ):
-                self.actor_optimizer.zero_grad(set_to_none=True)
-                logical_rejected = False
-                logical_rows: list[Any] = []
-                capture_role_gradients = diagnostic_groups_remaining > 0
-                captured_gradients: dict[str, list[Any | None]] = {}
-                configured_role_weights = getattr(
-                    self.config, "actor_role_weights", {},
-                ) or {}
-                raw_role_weights = [
-                    float(configured_role_weights.get(batch[0].role.value, 1.0))
-                    for batch in microbatches
+            logical_groups = self._actor_minibatch_groups(transitions)
+            for window_start in range(0, len(logical_groups), accumulation_steps):
+                accumulation_window = logical_groups[
+                    window_start:window_start + accumulation_steps
                 ]
-                role_weight_denominator = sum(raw_role_weights)
-                for batch, raw_role_weight in zip(microbatches, raw_role_weights):
-                    logical_rows.extend(batch)
-                    batch_role = batch[0].role
-                    role_weight = raw_role_weight / max(
-                        1.0e-12, role_weight_denominator,
-                    )
-                    recovery_policy_scale = 1.0
-                    if recovery_steps_applied.get(batch_role, 0) > 0:
-                        recovery_policy_scale = float(getattr(
-                            self.config, "reference_kl_recovery_role_scale", 0.25,
-                        ))
-                    reference_kl_beta = self._reference_kl_beta(batch_role)
-                    sequences = [(item.prompt_ids, item.action_ids) for item in batch]
-                    constraints = [item.token_constraints for item in batch]
-                    has_constraints = any(item is not None for item in constraints)
-                    if has_constraints:
-                        new_logp, entropy, raw_new_logp = self.actor.score_batch_detailed(
-                            sequences, token_constraints=constraints,
+                window_size = len(accumulation_window)
+                self.actor_optimizer.zero_grad(set_to_none=True)
+                self.critic_optimizer.zero_grad(set_to_none=True)
+                window_rejected = False
+                window_critic_losses: list[Any] = []
+                accepted_groups = 0
+                for window_offset, microbatches in enumerate(accumulation_window):
+                    logical_group_index = window_start + window_offset
+                    logical_rows: list[Any] = []
+                    capture_role_gradients = diagnostic_groups_remaining > 0
+                    captured_gradients: dict[str, list[Any | None]] = {}
+                    configured_role_weights = getattr(
+                        self.config, "actor_role_weights", {},
+                    ) or {}
+                    raw_role_weights = [
+                        float(configured_role_weights.get(batch[0].role.value, 1.0))
+                        for batch in microbatches
+                    ]
+                    role_weight_denominator = sum(raw_role_weights)
+                    for batch, raw_role_weight in zip(microbatches, raw_role_weights):
+                        logical_rows.extend(batch)
+                        batch_role = batch[0].role
+                        role_weight = raw_role_weight / max(
+                            1.0e-12, role_weight_denominator,
                         )
-                    else:
-                        new_logp, entropy = self.actor.score_batch(sequences)
-                        raw_new_logp = new_logp
-                    mask = torch.zeros_like(new_logp, dtype=torch.bool)
-                    old_logp = torch.zeros_like(new_logp)
-                    for row, item in enumerate(batch):
-                        length = len(item.action_ids)
-                        if item.role is AgentRole.EVIDENCE:
-                            if item.optimization_token_mask is not None:
-                                mask[row, :length] = torch.tensor(
-                                    item.optimization_token_mask,
-                                    dtype=torch.bool, device=new_logp.device,
-                                )
+                        recovery_policy_scale = 1.0
+                        if recovery_steps_applied.get(batch_role, 0) > 0:
+                            recovery_policy_scale = float(getattr(
+                                self.config, "reference_kl_recovery_role_scale", 0.25,
+                            ))
+                        reference_kl_beta = self._reference_kl_beta(batch_role)
+                        sequences = [(item.prompt_ids, item.action_ids) for item in batch]
+                        constraints = [item.token_constraints for item in batch]
+                        has_constraints = any(item is not None for item in constraints)
+                        if has_constraints:
+                            new_logp, entropy, raw_new_logp = self.actor.score_batch_detailed(
+                                sequences, token_constraints=constraints,
+                            )
                         else:
-                            mask[row, :length] = True
-                        old_logp[row, :length] = item.old_token_logprobs.to(new_logp.device)
-                    token_count = int(mask.sum().item())
-                    reference_kl = torch.zeros((), dtype=new_logp.dtype, device=new_logp.device)
-                    segment_values = {name: 0.0 for name in ("selection", "format")}
-                    if reference_kl_beta > 0:
-                        reference_logp = torch.zeros_like(new_logp)
-                        raw_reference_logp = torch.zeros_like(new_logp)
+                            new_logp, entropy = self.actor.score_batch(sequences)
+                            raw_new_logp = new_logp
+                        mask = torch.zeros_like(new_logp, dtype=torch.bool)
+                        old_logp = torch.zeros_like(new_logp)
                         for row, item in enumerate(batch):
-                            if item.reference_token_logprobs is None:
-                                raise RuntimeError("Missing SFT reference log-probabilities")
                             length = len(item.action_ids)
-                            reference_logp[row, :length] = item.reference_token_logprobs.to(
-                                device=new_logp.device, dtype=new_logp.dtype,
-                            )
-                            raw_reference_logp[row, :length] = item.reference_raw_token_logprobs.to(
-                                device=new_logp.device, dtype=new_logp.dtype,
-                            )
-                        ref_log_ratio = (reference_logp - new_logp).clamp(-20.0, 20.0)
-                        token_reference_kl = ref_log_ratio.exp() - 1.0 - ref_log_ratio
-                        reference_kl = (
-                            token_reference_kl * mask
-                        ).sum() / mask.sum().clamp_min(1)
-                        raw_ratio = (raw_reference_logp - raw_new_logp).clamp(-20.0, 20.0)
-                        raw_token_kl = raw_ratio.exp() - 1.0 - raw_ratio
-                        for segment in segment_values:
-                            segment_mask = torch.zeros_like(mask)
-                            for row, item in enumerate(batch):
-                                labels = item.token_segments or []
-                                if labels:
-                                    segment_mask[row, :len(labels)] = torch.tensor(
-                                        [name == segment for name in labels],
+                            if item.role is AgentRole.EVIDENCE:
+                                if item.optimization_token_mask is not None:
+                                    mask[row, :length] = torch.tensor(
+                                        item.optimization_token_mask,
                                         dtype=torch.bool, device=new_logp.device,
                                     )
-                            count = int(segment_mask.sum().item())
-                            if count:
-                                segment_values[segment] = float(
-                                    ((raw_token_kl * segment_mask).sum() / count).detach().float().cpu()
-                                )
-                    advantages = torch.tensor(
-                        [item.advantage for item in batch], dtype=torch.float32,
-                        device=new_logp.device,
-                    )
-                    actor_loss, policy_stats = mappo_actor_loss(
-                        new_logp, old_logp, advantages, mask, self.config.clip_epsilon,
-                    )
-                    entropy_mean = (entropy * mask).sum() / mask.sum().clamp_min(1)
-                    numbers = {
-                        "actor_loss": float(actor_loss.detach().float().cpu()),
-                        "entropy": float(entropy_mean.detach().float().cpu()),
-                        "reference_kl": float(reference_kl.detach().float().cpu()),
-                        "selection_kl": (
-                            float(reference_kl.detach().float().cpu())
-                            if batch_role is AgentRole.EVIDENCE else 0.0
-                        ),
-                        "selection_raw_kl": segment_values["selection"],
-                        "format_kl": segment_values["format"],
-                        "approx_kl": float(policy_stats["approx_kl"].detach().float().cpu()),
-                        "clip_fraction": float(policy_stats["clip_fraction"].detach().float().cpu()),
-                    }
-                    for name, number in numbers.items():
-                        if not math.isfinite(number):
-                            raise FloatingPointError(f"Non-finite MAPPO metric {name}: {number}")
-                        aggregate[name].append(number)
-                        role_optimizer[batch[0].role.value][name].append(number)
-                    observed_by_role[batch_role]["sum"] += numbers["reference_kl"] * token_count
-                    observed_by_role[batch_role]["tokens"] += token_count
-                    if numbers["approx_kl"] > self.config.target_kl:
-                        logical_rejected = True
-                        break
-                    # Recovery suppresses the noisy PPO/entropy signal while
-                    # preserving the full reference-KL restoring gradient.
-                    actor_objective = role_weight * (
-                        recovery_policy_scale * (
-                            actor_loss - entropy_coefficient * entropy_mean
-                        )
-                        + reference_kl_beta * reference_kl
-                    )
-                    if capture_role_gradients:
-                        role_gradients = torch.autograd.grad(
-                            actor_objective,
-                            actor_parameters,
-                            allow_unused=True,
-                        )
-                        captured_gradients[batch_role.value] = [
-                            None if gradient is None else gradient.detach().float().cpu()
-                            for gradient in role_gradients
-                        ]
-                        for parameter, gradient in zip(actor_parameters, role_gradients):
-                            if gradient is None:
-                                continue
-                            detached = gradient.detach()
-                            if parameter.grad is None:
-                                parameter.grad = detached
                             else:
-                                parameter.grad.add_(detached)
-                    else:
-                        actor_objective.backward()
-                if logical_rejected:
-                    # One role crossing the trust-region limit rejects the
-                    # entire balanced logical update before optimizer.step().
+                                mask[row, :length] = True
+                            old_logp[row, :length] = item.old_token_logprobs.to(new_logp.device)
+                        token_count = int(mask.sum().item())
+                        reference_kl = torch.zeros((), dtype=new_logp.dtype, device=new_logp.device)
+                        segment_values = {name: 0.0 for name in ("selection", "format")}
+                        if reference_kl_beta > 0:
+                            reference_logp = torch.zeros_like(new_logp)
+                            raw_reference_logp = torch.zeros_like(new_logp)
+                            for row, item in enumerate(batch):
+                                if item.reference_token_logprobs is None:
+                                    raise RuntimeError("Missing SFT reference log-probabilities")
+                                length = len(item.action_ids)
+                                reference_logp[row, :length] = item.reference_token_logprobs.to(
+                                    device=new_logp.device, dtype=new_logp.dtype,
+                                )
+                                raw_reference_logp[row, :length] = item.reference_raw_token_logprobs.to(
+                                    device=new_logp.device, dtype=new_logp.dtype,
+                                )
+                            ref_log_ratio = (reference_logp - new_logp).clamp(-20.0, 20.0)
+                            token_reference_kl = ref_log_ratio.exp() - 1.0 - ref_log_ratio
+                            reference_kl = (
+                                token_reference_kl * mask
+                            ).sum() / mask.sum().clamp_min(1)
+                            raw_ratio = (raw_reference_logp - raw_new_logp).clamp(-20.0, 20.0)
+                            raw_token_kl = raw_ratio.exp() - 1.0 - raw_ratio
+                            for segment in segment_values:
+                                segment_mask = torch.zeros_like(mask)
+                                for row, item in enumerate(batch):
+                                    labels = item.token_segments or []
+                                    if labels:
+                                        segment_mask[row, :len(labels)] = torch.tensor(
+                                            [name == segment for name in labels],
+                                            dtype=torch.bool, device=new_logp.device,
+                                        )
+                                count = int(segment_mask.sum().item())
+                                if count:
+                                    segment_values[segment] = float(
+                                        ((raw_token_kl * segment_mask).sum() / count).detach().float().cpu()
+                                    )
+                        advantages = torch.tensor(
+                            [item.advantage for item in batch], dtype=torch.float32,
+                            device=new_logp.device,
+                        )
+                        actor_loss, policy_stats = mappo_actor_loss(
+                            new_logp, old_logp, advantages, mask, self.config.clip_epsilon,
+                        )
+                        entropy_mean = (entropy * mask).sum() / mask.sum().clamp_min(1)
+                        numbers = {
+                            "actor_loss": float(actor_loss.detach().float().cpu()),
+                            "entropy": float(entropy_mean.detach().float().cpu()),
+                            "reference_kl": float(reference_kl.detach().float().cpu()),
+                            "selection_kl": (
+                                float(reference_kl.detach().float().cpu())
+                                if batch_role is AgentRole.EVIDENCE else 0.0
+                            ),
+                            "selection_raw_kl": segment_values["selection"],
+                            "format_kl": segment_values["format"],
+                            "approx_kl": float(policy_stats["approx_kl"].detach().float().cpu()),
+                            "clip_fraction": float(policy_stats["clip_fraction"].detach().float().cpu()),
+                        }
+                        for name, number in numbers.items():
+                            if not math.isfinite(number):
+                                raise FloatingPointError(f"Non-finite MAPPO metric {name}: {number}")
+                            aggregate[name].append(number)
+                            role_optimizer[batch[0].role.value][name].append(number)
+                        observed_by_role[batch_role]["sum"] += numbers["reference_kl"] * token_count
+                        observed_by_role[batch_role]["tokens"] += token_count
+                        if numbers["approx_kl"] > self.config.target_kl:
+                            window_rejected = True
+                            break
+                        # Recovery suppresses the noisy PPO/entropy signal while
+                        # preserving the full reference-KL restoring gradient.
+                        actor_objective = role_weight * (
+                            recovery_policy_scale * (
+                                actor_loss - entropy_coefficient * entropy_mean
+                            )
+                            + reference_kl_beta * reference_kl
+                        )
+                        if capture_role_gradients:
+                            role_gradients = torch.autograd.grad(
+                                actor_objective,
+                                actor_parameters,
+                                allow_unused=True,
+                            )
+                            captured_gradients[batch_role.value] = [
+                                None if gradient is None else gradient.detach().float().cpu()
+                                for gradient in role_gradients
+                            ]
+                            for parameter, gradient in zip(actor_parameters, role_gradients):
+                                if gradient is None:
+                                    continue
+                                detached = gradient.detach() / window_size
+                                if parameter.grad is None:
+                                    parameter.grad = detached
+                                else:
+                                    parameter.grad.add_(detached)
+                        else:
+                            (actor_objective / window_size).backward()
+                    if window_rejected:
+                        break
+                    if capture_role_gradients and len(captured_gradients) >= 2:
+                        diagnostic = gradient_conflict_metrics(captured_gradients)
+                        diagnostic.update({
+                            "event": "role_gradient_conflict",
+                            "global_step": self.global_step + 1,
+                            "ppo_epoch": _,
+                            "logical_group_index": logical_group_index,
+                            "roles": sorted(captured_gradients),
+                            "objective": "weighted_actor_loss_entropy_reference_kl",
+                        })
+                        gradient_diagnostics.append(diagnostic)
+                        _append(self.run_dir / "gradient_diagnostics.jsonl", diagnostic)
+                        diagnostic_groups_remaining -= 1
+
+                    values = self.critic([item.central_state for item in logical_rows])
+                    old_values = torch.tensor(
+                        [item.old_value for item in logical_rows],
+                        dtype=torch.float32, device=values.device,
+                    )
+                    returns = torch.tensor(
+                        [item.return_ for item in logical_rows],
+                        dtype=torch.float32, device=values.device,
+                    )
+                    critic_loss = clipped_value_loss(
+                        values, old_values, returns, self.config.value_clip_epsilon,
+                    )
+                    critic_objective = self.config.value_loss_coef * critic_loss
+                    (critic_objective / window_size).backward()
+                    window_critic_losses.append(critic_loss)
+                    accepted_groups += 1
+
+                if window_rejected:
+                    # A KL violation rejects every pending gradient in this
+                    # accumulation window; optimizer state is left unchanged.
                     self.actor_optimizer.zero_grad(set_to_none=True)
+                    self.critic_optimizer.zero_grad(set_to_none=True)
                     kl_rejected_updates += 1
                     stop_for_kl = True
                     break
-                if capture_role_gradients and len(captured_gradients) >= 2:
-                    diagnostic = gradient_conflict_metrics(captured_gradients)
-                    diagnostic.update({
-                        "event": "role_gradient_conflict",
-                        "global_step": self.global_step + 1,
-                        "ppo_epoch": _,
-                        "logical_group_index": logical_group_index,
-                        "roles": sorted(captured_gradients),
-                        "objective": "weighted_actor_loss_entropy_reference_kl",
-                    })
-                    gradient_diagnostics.append(diagnostic)
-                    _append(self.run_dir / "gradient_diagnostics.jsonl", diagnostic)
-                    diagnostic_groups_remaining -= 1
-                # Gradients have already been accumulated across roles; do not
-                # clear them before clipping and stepping.
+                # Gradients have been averaged across this window and across
+                # roles inside each logical group.
                 for parameter in actor_parameters:
                     if parameter.grad is not None:
                         break
@@ -998,25 +1109,31 @@ class MAPPOTrainer:
                     actor_parameters,
                     self.config.max_grad_norm,
                 )
+                critic_parameters = list(self.critic.parameters())
+                critic_norm = torch.nn.utils.clip_grad_norm_(
+                    critic_parameters, self.config.max_grad_norm,
+                )
                 self.actor_optimizer.step()
-                policy_updates_applied += 1
-
-                values = self.critic([item.central_state for item in logical_rows])
-                old_values = torch.tensor([item.old_value for item in logical_rows], dtype=torch.float32, device=values.device)
-                returns = torch.tensor([item.return_ for item in logical_rows], dtype=torch.float32, device=values.device)
-                critic_loss = clipped_value_loss(values, old_values, returns, self.config.value_clip_epsilon)
-                critic_objective = self.config.value_loss_coef * critic_loss
-                self.critic_optimizer.zero_grad(set_to_none=True)
-                critic_objective.backward()
-                critic_norm = torch.nn.utils.clip_grad_norm_(list(self.critic.parameters()), self.config.max_grad_norm)
                 self.critic_optimizer.step()
+                policy_updates_applied += 1
+                logical_groups_applied += accepted_groups
 
-                values_to_add = {"critic_loss": critic_loss, "grad_norm_actor": actor_norm, "grad_norm_critic": critic_norm}
+                values_to_add = {
+                    "grad_norm_actor": actor_norm,
+                    "grad_norm_critic": critic_norm,
+                }
                 for name, value in values_to_add.items():
                     number = float(value.detach().float().cpu())
                     if not math.isfinite(number):
                         raise FloatingPointError(f"Non-finite MAPPO metric {name}: {number}")
                     aggregate[name].append(number)
+                for critic_loss in window_critic_losses:
+                    number = float(critic_loss.detach().float().cpu())
+                    if not math.isfinite(number):
+                        raise FloatingPointError(
+                            f"Non-finite MAPPO metric critic_loss: {number}"
+                        )
+                    aggregate["critic_loss"].append(number)
             if stop_for_kl:
                 break
         for role, values_by_name in role_optimizer.items():
@@ -1108,6 +1225,8 @@ class MAPPOTrainer:
         return {name: sum(values) / max(1, len(values)) for name, values in aggregate.items()} | {
             "ppo_early_stop": float(stop_for_kl),
             "policy_updates_applied": float(policy_updates_applied),
+            "logical_groups_applied": float(logical_groups_applied),
+            "gradient_accumulation_steps": float(accumulation_steps),
             "kl_rejected_updates": float(kl_rejected_updates),
             "entropy_coefficient": entropy_coefficient,
             "role_metrics": role_metrics,
@@ -1125,7 +1244,26 @@ class MAPPOTrainer:
         metrics_path = self.run_dir / "train_metrics.jsonl"
         episodes_path = self.run_dir / "episodes.jsonl"
         for epoch in range(self.start_epoch, total_epochs):
-            ordered = epoch_order(self.samples, seed=self.config.seed, epoch=epoch)
+            ordered = stratified_epoch_order(
+                self.samples, seed=self.config.seed, epoch=epoch,
+                batch_size=self.config.rollout_batch_size,
+            )
+            total_update_steps = math.ceil(
+                len(ordered) / self.config.rollout_batch_size
+            )
+            validation_schedule = set(evenly_spaced_steps(
+                total_update_steps,
+                int(getattr(self.config, "validation_checks_per_epoch", 0)),
+            ))
+
+            def scheduled_validation_due(step: int) -> bool:
+                if validation_schedule:
+                    return step in validation_schedule
+                return (
+                    self.config.validation_steps > 0
+                    and step % self.config.validation_steps == 0
+                )
+
             start = self.sample_offset if epoch == self.start_epoch else 0
             with tqdm(
                 total=len(ordered), initial=start,
@@ -1223,6 +1361,15 @@ class MAPPOTrainer:
                         "reward_mean": sum(x.global_reward for x in episodes) / len(episodes),
                         "answer_f1_mean": sum(x.answer_f1 for x in episodes) / len(episodes),
                         "evidence_coverage_mean": sum(x.evidence_coverage for x in episodes) / len(episodes),
+                        "dataset_counts": {
+                            dataset: sum(
+                                episode.dataset == dataset for episode in episodes
+                            )
+                            for dataset in sorted({
+                                episode.dataset for episode in episodes
+                            })
+                        },
+                        "quality_by_dataset": self._quality_by_dataset(episodes),
                         "evidence_duplicates_filtered": sum(
                             x.evidence_duplicates_filtered for x in episodes
                         ),
@@ -1271,7 +1418,7 @@ class MAPPOTrainer:
                             )
                             emergency_validation_kind = (
                                 "scheduled"
-                                if self.global_step % self.config.validation_steps == 0
+                                if scheduled_validation_due(self.global_step)
                                 else "kl_emergency"
                             )
                             validation = self._validate(
@@ -1334,7 +1481,7 @@ class MAPPOTrainer:
                             refresh=True,
                         )
                     if (
-                        self.global_step % self.config.validation_steps == 0
+                        scheduled_validation_due(self.global_step)
                         and self.last_validation_step != self.global_step
                     ):
                         progress.set_postfix(stage="validation", step=self.global_step, refresh=True)
@@ -1346,7 +1493,12 @@ class MAPPOTrainer:
                                 val_parse=f"{validation['parse_failure_rate']:.1%}",
                                 best=self.best_validation_step, refresh=True,
                             )
-                    if self.global_step % self.config.save_steps == 0:
+                        if bool(getattr(self.config, "save_on_validation", False)):
+                            self._save(epoch, batch_start + len(batch_samples))
+                    if (
+                        self.config.save_steps > 0
+                        and self.global_step % self.config.save_steps == 0
+                    ):
                         progress.set_postfix(stage="checkpoint", step=self.global_step, refresh=True)
                         self._save(epoch, batch_start + len(batch_samples))
                     if self.stopped_early:
@@ -1372,6 +1524,12 @@ class MAPPOTrainer:
                 self.best_observed_validation_score
                 if math.isfinite(self.best_observed_validation_score) else None
             ),
+            best_validation_score=(
+                self.best_validation_score
+                if math.isfinite(self.best_validation_score) else None
+            ),
+            best_validation_step=self.best_validation_step,
+            baseline_validation_score=self.baseline_validation_score,
             best_early_stopping_score=(
                 self.best_early_stopping_score
                 if math.isfinite(self.best_early_stopping_score) else None
@@ -1391,6 +1549,14 @@ class MAPPOTrainer:
             "validation_samples": len(self.validation_samples),
             "baseline_validation_score": self.baseline_validation_score,
             "best_validation_step": self.best_validation_step,
+            "checkpoint_selection_objective": (
+                "macro_answer_f1 + macro_evidence_coverage + "
+                "macro_format_compliance"
+            ),
+            "best_composite_actor": (
+                str(self.run_dir / "best_composite_actor")
+                if (self.run_dir / "best_composite_actor").is_dir() else None
+            ),
             "best_answer_actor": (
                 str(self.run_dir / "best_answer_actor")
                 if (self.run_dir / "best_answer_actor").is_dir() else None

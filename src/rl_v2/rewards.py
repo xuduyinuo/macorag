@@ -62,12 +62,27 @@ def query_reward(current: list[dict[str, Any]], previous: list[dict[str, Any]], 
     return gain - eta * repetition
 
 
-def evidence_reward(retrieved: list[dict[str, Any]], selected: list[dict[str, Any]], gold: tuple[dict[str, Any], ...], eta: float) -> float:
-    retrievable = _matches(retrieved, gold)
+def evidence_reward(
+    retrieved: list[dict[str, Any]],
+    selected: list[dict[str, Any]],
+    gold: tuple[dict[str, Any], ...],
+    eta: float,
+    *,
+    previous: Iterable[dict[str, Any]] = (),
+    duplicate_eta: float = 0.2,
+) -> float:
+    del retrieved
+    previous_rows = list(previous)
+    previous_gold = _matches(previous_rows, gold)
     selected_gold = _matches(selected, gold)
-    retained = len(retrievable & selected_gold) / max(1, len(retrievable))
+    gain = len(selected_gold - previous_gold) / max(1, len(gold))
     noise = sum(1 for item in selected if not _matches([item], gold)) / max(1, len(selected))
-    return retained - eta * noise
+    previous_keys = {_identity(item) for item in previous_rows}
+    duplicates = sum(
+        1 for item in selected
+        if _identity(item) is not None and _identity(item) in previous_keys
+    ) / max(1, len(selected))
+    return gain - eta * noise - duplicate_eta * duplicates
 
 
 def answer_decision_reward(

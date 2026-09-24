@@ -3,16 +3,20 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from .data import (
-    load_split, shuffled_training_samples, stratified_validation_samples,
+    evenly_spaced_steps, load_split, shuffled_training_samples,
+    stratified_epoch_order, stratified_validation_samples,
 )
 from .config import parse_args
-from .mappo_types import AgentRole, Episode, MAPPOTransition, RAGState
+from .mappo_types import (
+    AgentRole, Episode, MAPPOTransition, RAGState, RLSample,
+)
 from .models import (
     FINAL_ANSWER_GUIDED_REGEX, RoleConditionedActor, evidence_guided_regex,
 )
@@ -24,8 +28,9 @@ from .protocol import (
     role_messages,
     validate_prompt_contract,
 )
-from .rewards import terminal_reward
+from .rewards import evidence_reward, terminal_reward
 from .retrieval import RetrievalEnvironment, RetrievedPassage
+from .rollout import RolloutCollector
 from .trainer import MAPPOTrainer, _episode_payload
 
 
@@ -82,9 +87,41 @@ def test_formal_config_enforces_unmodified_vllm_sampling_distribution() -> None:
     assert config.validation_max_samples == 200
     assert config.max_prompt_length == 1024
     assert config.learner_memory_preflight is True
+    assert config.local_reward_enabled is True
+    assert config.gradient_accumulation_steps == 8
+    assert config.actor_learning_rate == pytest.approx(5.0e-7)
+    assert config.entropy_anneal_start_step == 31
+    assert config.entropy_anneal_end_step == 63
+    assert config.answer_local_reward_weight == pytest.approx(0.2)
+    assert config.non_final_wait_reward == pytest.approx(0.05)
+    assert config.final_answer_bonus == pytest.approx(0.2)
+    assert config.evidence_duplicate_penalty == pytest.approx(0.2)
+    assert config.num_train_epochs == 1.0
+    assert config.validation_steps == 0
+    assert config.validation_checks_per_epoch == 10
+    assert config.save_on_validation is True
+    assert config.early_stopping_patience == 0
+    assert config.validation_score_answer_weight == 1.0
+    assert config.validation_score_evidence_weight == 1.0
+    assert config.validation_score_format_weight == 1.0
     config.temperature = 0.8
     with pytest.raises(ValueError, match="unmodified vLLM sampling"):
         config.validate()
+
+
+def test_outcome_only_config_changes_only_reward_mode_and_output_root() -> None:
+    base = parse_args(["--config", str(ROOT / "src/rl_v2/train_mappo.yml")])
+    outcome = parse_args([
+        "--config", str(ROOT / "src/rl_v2/train_mappo_outcome_only.yml"),
+    ])
+    assert outcome.local_reward_enabled is False
+    assert outcome.output_root == "outputs/rl_v2_outcome_only_Qwen2.5-7B-Instruct"
+    ignored = {"local_reward_enabled", "output_root"}
+    assert {
+        key: value for key, value in base.to_dict().items() if key not in ignored
+    } == {
+        key: value for key, value in outcome.to_dict().items() if key not in ignored
+    }
 
 
 def test_vllm_launcher_disables_model_generation_defaults() -> None:
@@ -105,6 +142,36 @@ def test_max_samples_is_the_single_post_shuffle_smoke_limit() -> None:
     expected = shuffled_training_samples(config.train_file, seed=config.seed)[:7]
     assert [item.qid for item in samples] == [item.qid for item in expected]
     assert len(samples) == 7
+
+
+def test_stratified_epoch_batches_are_deterministic_and_lossless() -> None:
+    samples = [
+        RLSample(
+            qid=f"{dataset}-{index}", dataset=dataset, question="q",
+            answer="a", answer_aliases=(),
+            supporting_facts=({"title": "t", "text": "x"},),
+        )
+        for dataset, count in (("2wiki", 40), ("hotpotqa", 40), ("musique", 20))
+        for index in range(count)
+    ]
+    ordered = stratified_epoch_order(samples, seed=42, epoch=0, batch_size=32)
+    again = stratified_epoch_order(samples, seed=42, epoch=0, batch_size=32)
+    assert [item.qid for item in ordered] == [item.qid for item in again]
+    assert Counter(item.qid for item in ordered) == Counter(
+        item.qid for item in samples
+    )
+    for start in range(0, 96, 32):
+        counts = Counter(item.dataset for item in ordered[start:start + 32])
+        assert counts["2wiki"] in {12, 13}
+        assert counts["hotpotqa"] in {12, 13}
+        assert counts["musique"] in {6, 7}
+
+
+def test_validation_schedule_has_ten_checks_and_includes_final_step() -> None:
+    assert evenly_spaced_steps(94, 10) == (
+        10, 19, 29, 38, 47, 57, 66, 76, 85, 94,
+    )
+    assert evenly_spaced_steps(4, 10) == (1, 2, 3, 4)
 
 
 def test_retrieval_preserves_faiss_rank_and_eval_passage_limit() -> None:
@@ -233,6 +300,133 @@ def test_aliases_participate_in_terminal_answer_reward() -> None:
     assert f1 == 1.0
 
 
+def test_evidence_reward_uses_only_new_coverage_and_penalizes_duplicates() -> None:
+    first = {"doc_id": "gold-1", "title": "First", "text": "one"}
+    second = {"doc_id": "gold-2", "title": "Second", "text": "two"}
+    noise = {"doc_id": "noise", "title": "Noise", "text": "irrelevant"}
+    gold = (first, second)
+    assert evidence_reward(
+        [second], [second], gold, 0.2, previous=[first], duplicate_eta=0.2,
+    ) == pytest.approx(0.5)
+    assert evidence_reward(
+        [first], [first], gold, 0.2, previous=[first], duplicate_eta=0.2,
+    ) == pytest.approx(-0.2)
+    assert evidence_reward(
+        [noise], [noise], gold, 0.2, previous=[first], duplicate_eta=0.2,
+    ) == pytest.approx(-0.2)
+
+
+def test_validation_selection_score_adds_three_macro_components() -> None:
+    quality = {
+        "2wiki": {"answer_f1_mean": 0.5, "evidence_coverage_mean": 0.2},
+        "musique": {"answer_f1_mean": 0.7, "evidence_coverage_mean": 0.4},
+    }
+    protocol = {
+        "parse_failure_rate": 0.1,
+        "protocol_by_dataset": {
+            "2wiki": {"final_compliance_rate": 0.9},
+            "musique": {"final_compliance_rate": 1.0},
+        },
+    }
+    config = SimpleNamespace(
+        validation_score_answer_weight=1.0,
+        validation_score_evidence_weight=1.0,
+        validation_score_format_weight=1.0,
+        validation_score_parse_penalty=0.0,
+    )
+    score = MAPPOTrainer._validation_selection_score(
+        quality, protocol, config,
+    )
+    assert score["answer_f1_macro"] == pytest.approx(0.6)
+    assert score["evidence_coverage_macro"] == pytest.approx(0.3)
+    assert score["format_compliance_macro"] == pytest.approx(0.95)
+    assert score["validation_score"] == pytest.approx(1.85)
+
+
+def test_outcome_only_rollout_has_zero_local_and_unchanged_terminal_reward() -> None:
+    torch = pytest.importorskip("torch")
+    responses = {
+        AgentRole.QUERY: (
+            '<query-retriever>{"sub_goal":"find answer","query":"Ada"}'
+            '</query-retriever>'
+        ),
+        AgentRole.EVIDENCE: (
+            '<update-evidence>{"selected_passage_ids":["P0"]}'
+            '</update-evidence>'
+        ),
+        AgentRole.ANSWER: '<answer>{"can_answer":true,"answer":"Ada"}</answer>',
+    }
+
+    class Actor:
+        def generate(self, role, prompt, **kwargs):
+            del prompt, kwargs
+            return responses[role], [1], [2], torch.tensor([0.0])
+
+    class Critic:
+        def __init__(self):
+            self.torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    class Retrieval:
+        def query(self, dataset, query):
+            assert (dataset, query) == ("hotpotqa", "Ada")
+            return {"passages": [{
+                "passage_id": 0, "title": "Ada", "text": "Ada is the answer.",
+            }]}
+
+    config = parse_args([
+        "--config", str(ROOT / "src/rl_v2/train_mappo_outcome_only.yml"),
+    ])
+    config.max_rounds = 1
+    config.force_evidence_guided_decoding = False
+    collector = RolloutCollector(
+        actor=Actor(), critic=Critic(), retrieval=Retrieval(), config=config,
+    )
+    episode = collector.collect(RLSample(
+        qid="q", dataset="hotpotqa", question="Who?", answer="Ada",
+        answer_aliases=(),
+        supporting_facts=({"title": "Ada", "text": "Ada is the answer."},),
+    ))
+    assert episode.global_reward == pytest.approx(2.5)
+    assert len(episode.transitions) == 3
+    assert all(item.local_reward == 0.0 for item in episode.transitions)
+    assert all(item.team_reward == pytest.approx(2.5) for item in episode.transitions)
+    assert all(item.reward == pytest.approx(2.5) for item in episode.transitions)
+
+
+def test_outcome_only_invalid_action_has_no_local_penalty() -> None:
+    torch = pytest.importorskip("torch")
+
+    class Actor:
+        def generate(self, role, prompt, **kwargs):
+            del role, prompt, kwargs
+            return "invalid", [1], [2], torch.tensor([0.0])
+
+    class Critic:
+        def __init__(self):
+            self.torch = torch
+
+        def __call__(self, states):
+            return torch.zeros(len(states))
+
+    config = parse_args([
+        "--config", str(ROOT / "src/rl_v2/train_mappo_outcome_only.yml"),
+    ])
+    collector = RolloutCollector(
+        actor=Actor(), critic=Critic(), retrieval=None, config=config,
+    )
+    episode = Episode(qid="q", dataset="hotpotqa")
+    parsed, transition = collector._act(
+        episode, AgentRole.QUERY, RAGState(question="Who?"),
+        observation=None, final_round=False,
+    )
+    assert parsed is None
+    assert transition.valid is False
+    assert transition.reward == 0.0
+
+
 def test_episode_payload_persists_post_initialization_stage_timing() -> None:
     episode = Episode(
         qid="q", dataset="hotpotqa",
@@ -297,3 +491,69 @@ def test_vllm_logprobs_are_replaced_by_local_learner_scores() -> None:
     stats = trainer._align_old_logprobs([transition])
     assert stats["old_logprobs_recomputed"] == 1.0
     assert transition.old_token_logprobs.tolist() == [-0.25, -0.25]
+
+
+def test_update_accumulates_logical_groups_before_optimizer_step(tmp_path) -> None:
+    torch = pytest.importorskip("torch")
+
+    class Actor:
+        def __init__(self):
+            self.model = torch.nn.Linear(1, 1, bias=False)
+            torch.nn.init.zeros_(self.model.weight)
+
+        def score_batch(self, sequences):
+            width = max(len(action) for _, action in sequences)
+            value = self.model.weight.reshape(1, 1)
+            logprobs = value.expand(len(sequences), width)
+            return logprobs, torch.ones_like(logprobs)
+
+    class Critic(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.value = torch.nn.Parameter(torch.zeros(()))
+
+        def forward(self, states):
+            return self.value.expand(len(states))
+
+    actor = Actor()
+    critic = Critic()
+    transitions = []
+    for role in AgentRole:
+        for index in range(6):
+            transitions.append(MAPPOTransition(
+                role=role, round_index=index, prompt="p", prompt_ids=[1],
+                action_ids=[2], old_token_logprobs=torch.zeros(1),
+                central_state={}, next_central_state={}, advantage=1.0,
+                return_=1.0,
+                optimization_token_mask=(
+                    [True] if role is AgentRole.EVIDENCE else None
+                ),
+            ))
+
+    trainer = MAPPOTrainer.__new__(MAPPOTrainer)
+    trainer.torch = torch
+    trainer.actor = actor
+    trainer.critic = critic
+    trainer.actor_optimizer = torch.optim.SGD(actor.model.parameters(), lr=1.0e-3)
+    trainer.critic_optimizer = torch.optim.SGD(critic.parameters(), lr=1.0e-3)
+    trainer.global_step = 0
+    trainer.run_dir = tmp_path
+    trainer.reference_kl_controllers = {}
+    trainer.reference_kl_recovery_steps = {role: 0 for role in AgentRole}
+    trainer.config = SimpleNamespace(
+        use_vllm_generation=False, ppo_old_logprob_source="local_actor",
+        reference_kl_beta=0.0, normalize_advantages=False,
+        minibatch_size=1, actor_minibatch_mode="role_balanced",
+        actor_role_weights={}, gradient_diagnostics_steps=0,
+        gradient_diagnostics_max_groups=1, ppo_epochs=1,
+        gradient_accumulation_steps=4, entropy_coef=0.0,
+        entropy_final_coef=0.0, entropy_anneal_start_step=0,
+        entropy_anneal_end_step=0, clip_epsilon=0.2, target_kl=100.0,
+        max_grad_norm=10.0, value_clip_epsilon=0.2,
+        value_loss_coef=0.5,
+    )
+    metrics = trainer._update(transitions)
+    assert metrics["gradient_accumulation_steps"] == 4.0
+    assert metrics["logical_groups_applied"] == 6.0
+    assert metrics["policy_updates_applied"] == 2.0
+    assert metrics["kl_rejected_updates"] == 0.0

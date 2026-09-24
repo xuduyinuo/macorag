@@ -78,6 +78,34 @@ grammar partition is not used by learner scoring.
 The vLLM service is launched with `--generation-config vllm`, preventing the
 base model's generation config from silently adding repetition penalties.
 
+## Stabilized optimizer and reward contract
+
+One global step collects 32 question trajectories. The 24 GiB learner keeps a
+physical microbatch of one transition, but accumulates eight role-balanced
+logical groups before each actor/critic optimizer step. A KL violation rejects
+the complete pending accumulation window, so a partially accumulated gradient
+is never committed. The formal actor learning rate is `5e-7`; entropy anneals
+from step 31 through step 63, which is reachable within the 3,000-sample run.
+
+Answer shaping is deliberately conservative (`answer_local_reward_weight=0.2`,
+`non_final_wait_reward=0.05`, `final_answer_bonus=0.2`) while terminal Answer F1
+remains weighted by 1.5. Evidence shaping rewards only newly covered gold
+support and penalizes both noise and evidence already retained in an earlier
+round. The outcome-only YAML inherits all optimizer and scalar settings and
+changes only `local_reward_enabled` plus its output directory.
+
+Training is a fixed budget of at most one epoch; validation never stops it
+early. Dataset pools are shuffled independently and each 32-question rollout
+batch receives a proportional largest-remainder allocation, eliminating the
+large random dataset-mixture swings of the earlier global shuffle. Ten
+validation points are spread uniformly over the actual step budget and always
+include the final step (3,000 samples produce steps 10/19/29/38/47/57/66/76/
+85/94). A full checkpoint is saved at every validation. The selected model
+maximizes equal-dataset Macro Answer F1 + Macro Evidence Coverage + Macro Format
+Compliance, subject to the existing protocol-eligibility gate. Exports are
+written to `best_composite_actor`; `best_actor` and `best_answer_actor` remain
+compatibility aliases for existing evaluation launchers.
+
 ## Commands
 
 Static data/config/prompt-contract preflight (no model or vLLM process):
@@ -104,6 +132,15 @@ Start formal training:
 
 ```bash
 PYTHON=/data/conda/envs/macorag/bin/python bash src/rl_v2/run_mappo.sh
+```
+
+Run the outcome-only reward ablation (all immediate/local rewards, format
+bonuses and invalid-action penalties are disabled; terminal answer F1 and
+evidence coverage reward are unchanged):
+
+```bash
+PYTHON=/data/conda/envs/macorag/bin/python \
+  bash src/rl_v2/run_mappo_outcome_only.sh
 ```
 
 Resume a complete checkpoint:

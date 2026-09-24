@@ -27,11 +27,14 @@ class MAPPOConfig:
     validation_max_samples: int | None = None
     musique_rare_hop_oversample_factor: float = 1.0
     validation_steps: int = 25
+    validation_checks_per_epoch: int = 0
+    save_on_validation: bool = False
     validation_temperature: float = 0.0
     validation_target_seconds_per_sample: float = 3.0
     validation_target_total_minutes: float = 15.0
     validation_score_answer_weight: float = 1.0
     validation_score_evidence_weight: float = 1.0
+    validation_score_format_weight: float = 1.0
     validation_score_parse_penalty: float = 1.0
     validation_min_delta: float = 0.001
     early_stopping_patience: int = 3
@@ -125,6 +128,7 @@ class MAPPOConfig:
     max_grad_norm: float = 1.0
     ppo_epochs: int = 1
     minibatch_size: int = 1
+    gradient_accumulation_steps: int = 1
     actor_minibatch_mode: str = "random"
     actor_role_weights: dict[str, float] = field(default_factory=dict)
     gradient_diagnostics_steps: int = 0
@@ -133,8 +137,10 @@ class MAPPOConfig:
     normalize_advantages: bool = True
     advantage_normalization_scope: str = "role"
     terminal_reward_weight: float = 1.0
+    local_reward_enabled: bool = True
     eta_query: float = 0.2
     eta_evidence: float = 0.2
+    evidence_duplicate_penalty: float = 0.2
     omega_answer: float = 1.5
     omega_evidence: float = 1.0
     answer_local_reward_weight: float = 1.0
@@ -176,11 +182,12 @@ class MAPPOConfig:
             "prompt_max_evidence_items", "prompt_max_history_items",
             "prompt_evidence_text_chars", "prompt_observation_text_chars",
             "minibatch_size", "critic_hash_buckets", "critic_embedding_dim",
-            "critic_hidden_dim", "critic_text_max_tokens", "save_steps",
+            "gradient_accumulation_steps",
+            "critic_hidden_dim", "critic_text_max_tokens",
             "save_total_limit", "vllm_port", "vllm_tensor_parallel_size",
             "vllm_max_model_len", "vllm_max_num_seqs", "vllm_max_lora_rank",
             "vllm_generate_attempts", "vllm_sync_snapshots_to_keep",
-            "validation_steps", "protocol_window_size",
+            "protocol_window_size",
             "reference_kl_emergency_patience",
             "reference_kl_recovery_steps",
             "evidence_max_completion_length",
@@ -248,8 +255,8 @@ class MAPPOConfig:
                 raise ValueError(
                     f"unknown reference KL override keys for {role}: {sorted(unknown)}"
                 )
-        if self.num_train_epochs <= 0:
-            raise ValueError("num_train_epochs must be positive")
+        if not 0.0 < self.num_train_epochs <= 1.0:
+            raise ValueError("num_train_epochs must be in (0, 1]")
         if self.max_samples is not None and self.max_samples <= 0:
             raise ValueError("max_samples must be positive or null")
         if (
@@ -261,6 +268,14 @@ class MAPPOConfig:
             )
         if self.validation_max_samples is not None and self.validation_max_samples <= 0:
             raise ValueError("validation_max_samples must be positive or null")
+        if self.validation_steps < 0 or self.validation_checks_per_epoch < 0:
+            raise ValueError("validation scheduling values must be non-negative")
+        if self.save_steps < 0:
+            raise ValueError("save_steps must be non-negative")
+        if self.validation_steps == 0 and self.validation_checks_per_epoch == 0:
+            raise ValueError(
+                "validation_steps or validation_checks_per_epoch must be positive"
+            )
         if self.musique_rare_hop_oversample_factor < 1.0:
             raise ValueError("musique_rare_hop_oversample_factor must be at least 1")
         if not 0.0 <= self.validation_ratio < 1.0:
@@ -277,7 +292,8 @@ class MAPPOConfig:
             raise ValueError("entropy_anneal_end_step must be >= entropy_anneal_start_step")
         for name in (
             "validation_temperature", "validation_score_answer_weight",
-            "validation_score_evidence_weight", "validation_score_parse_penalty",
+            "validation_score_evidence_weight", "validation_score_format_weight",
+            "validation_score_parse_penalty",
             "validation_min_delta",
             "max_protocol_parse_failure_rate", "max_validation_missing_answer_tag_rate",
             "min_validation_final_compliance_rate",

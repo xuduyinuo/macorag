@@ -8,7 +8,7 @@ validation_file: data_v2/dev_rl.jsonl
 validation_max_samples: 200
 prompt_config_path: src/rl_v2/policy_prompts.yml
 expected_prompt_contract_version: macorag-policy-v3
-output_root: outputs/rl_v2_Qwen2.5-7B-Instruct
+output_root: outputs/rl_v2_outcome_only_Qwen2.5-7B-Instruct
 prompt_template_version: macorag-policy-v3
 
 # Unified Wiki18 retrieval contract from baseline_eval/run_macorag_eval.py.
@@ -132,9 +132,6 @@ reference_kl_role_overrides:
 max_grad_norm: 1.0
 ppo_epochs: 1
 minibatch_size: 1
-# Accumulate role-balanced logical groups without increasing the peak learner
-# microbatch memory. One optimizer step therefore sees up to 8 transitions per
-# role instead of one transition per role.
 gradient_accumulation_steps: 8
 actor_minibatch_mode: role_balanced
 actor_role_weights:
@@ -147,8 +144,11 @@ target_kl: 0.02
 normalize_advantages: true
 advantage_normalization_scope: role
 terminal_reward_weight: 1.0
-local_reward_enabled: true
+local_reward_enabled: false
 
+# These local-reward parameters intentionally remain identical to the main
+# config for a one-factor ablation. local_reward_enabled=false prevents all of
+# them (including format/invalid-action rewards) from entering transitions.
 eta_query: 0.2
 eta_evidence: 0.2
 evidence_duplicate_penalty: 0.2
@@ -170,8 +170,6 @@ force_evidence_guided_decoding: true
 # Empty selection is legal in macorag-policy-v3.
 evidence_min_selected_passages: 0
 
-# Spread ten validations uniformly over the actual one-epoch step budget.
-# For 3,000 samples / batch 32 this is step 10/19/29/38/47/57/66/76/85/94.
 validation_steps: 0
 validation_checks_per_epoch: 10
 save_on_validation: true
@@ -183,8 +181,6 @@ validation_score_evidence_weight: 1.0
 validation_score_format_weight: 1.0
 validation_score_parse_penalty: 0.0
 validation_min_delta: 0.001
-# Fixed one-epoch budget: validation selects the best checkpoint but never
-# shortens training.
 early_stopping_patience: 0
 early_stopping_min_steps: 0
 protocol_window_size: 100

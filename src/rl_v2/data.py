@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 from collections import Counter
 from pathlib import Path
@@ -176,6 +177,84 @@ def epoch_order(samples: list[RLSample], *, seed: int, epoch: int) -> list[RLSam
     result = list(samples)
     random.Random(f"{seed}:rl-v2:epoch:{epoch}").shuffle(result)
     return result
+
+
+def stratified_epoch_order(
+    samples: list[RLSample], *, seed: int, epoch: int, batch_size: int,
+) -> list[RLSample]:
+    """Return a deterministic order whose batches preserve dataset mixture.
+
+    Each dataset pool is shuffled independently. Every batch receives a
+    largest-remainder proportional allocation from the remaining samples, so
+    the flattened order contains every input exactly once without padding,
+    duplication, or dropping a short final batch.
+    """
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    pools: dict[str, list[RLSample]] = {}
+    for sample in samples:
+        pools.setdefault(sample.dataset, []).append(sample)
+    for dataset, rows in pools.items():
+        random.Random(
+            f"{seed}:rl-v2:stratified-epoch:{epoch}:{dataset}"
+        ).shuffle(rows)
+
+    positions = {dataset: 0 for dataset in pools}
+    remaining = {dataset: len(rows) for dataset, rows in pools.items()}
+    ordered: list[RLSample] = []
+    while sum(remaining.values()) > 0:
+        take = min(batch_size, sum(remaining.values()))
+        population = sum(remaining.values())
+        exact = {
+            dataset: take * count / population
+            for dataset, count in remaining.items() if count > 0
+        }
+        quotas = {
+            dataset: min(remaining[dataset], int(value))
+            for dataset, value in exact.items()
+        }
+        unassigned = take - sum(quotas.values())
+        remainder_order = sorted(
+            exact,
+            key=lambda dataset: (
+                -(exact[dataset] - quotas[dataset]), dataset,
+            ),
+        )
+        while unassigned > 0:
+            progressed = False
+            for dataset in remainder_order:
+                if quotas[dataset] >= remaining[dataset]:
+                    continue
+                quotas[dataset] += 1
+                unassigned -= 1
+                progressed = True
+                if unassigned == 0:
+                    break
+            if not progressed:
+                raise RuntimeError("unable to allocate stratified training batch")
+
+        batch: list[RLSample] = []
+        for dataset in sorted(quotas):
+            start = positions[dataset]
+            end = start + quotas[dataset]
+            batch.extend(pools[dataset][start:end])
+            positions[dataset] = end
+            remaining[dataset] -= quotas[dataset]
+        random.Random(
+            f"{seed}:rl-v2:stratified-batch:{epoch}:{len(ordered)}"
+        ).shuffle(batch)
+        ordered.extend(batch)
+    return ordered
+
+
+def evenly_spaced_steps(total_steps: int, checks: int) -> tuple[int, ...]:
+    """Choose up to ``checks`` deterministic validation points including end."""
+    if total_steps <= 0 or checks <= 0:
+        return ()
+    return tuple(sorted({
+        math.ceil(index * total_steps / checks)
+        for index in range(1, checks + 1)
+    }))
 
 
 def split_manifest(samples: list[RLSample], path: str | Path) -> dict[str, Any]:

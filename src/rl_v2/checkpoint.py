@@ -64,6 +64,9 @@ def save_checkpoint(
     reference_kl_controller_state: dict[str, Any] | None = None,
     reference_kl_recovery_state: dict[str, int] | None = None,
     best_observed_validation_score: float | None = None,
+    best_validation_score: float | None = None,
+    best_validation_step: int = 0,
+    baseline_validation_score: float | None = None,
     best_early_stopping_score: float | None = None,
     bad_validation_count: int = 0,
 ) -> None:
@@ -84,7 +87,7 @@ def save_checkpoint(
         "cuda_rng": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
     }, path / "training_state.pt")
     state = {
-        "schema_version": 5,
+        "schema_version": 6,
         "algorithm": "mappo",
         "global_step": global_step,
         "epoch": epoch,
@@ -94,6 +97,9 @@ def save_checkpoint(
         "reference_kl_controllers": reference_kl_controller_state or {},
         "reference_kl_recovery_steps": reference_kl_recovery_state or {},
         "best_observed_validation_score": best_observed_validation_score,
+        "best_validation_score": best_validation_score,
+        "best_validation_step": int(best_validation_step),
+        "baseline_validation_score": baseline_validation_score,
         "best_early_stopping_score": best_early_stopping_score,
         "bad_validation_count": int(bad_validation_count),
     }
@@ -144,6 +150,9 @@ def restore_checkpoint(path: Path, *, critic: Any, actor_optimizer: Any, critic_
     restored["best_observed_validation_score"] = state.get(
         "best_observed_validation_score"
     )
+    restored["best_validation_score"] = state.get("best_validation_score")
+    restored["best_validation_step"] = int(state.get("best_validation_step", 0))
+    restored["baseline_validation_score"] = state.get("baseline_validation_score")
     restored["best_early_stopping_score"] = state.get(
         "best_early_stopping_score"
     )
